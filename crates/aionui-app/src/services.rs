@@ -74,6 +74,8 @@ pub struct AppServices {
     pub work_dir: PathBuf,
     /// When `true`, skip JWT authentication and use a fixed default user.
     pub local: bool,
+    /// When `true`, the CSRF middleware is not mounted even in non-local modes.
+    pub disable_csrf: bool,
     pub identity_mode: IdentityMode,
     pub bootstrap_secret: Option<Arc<str>>,
     pub app_version: String,
@@ -452,6 +454,7 @@ impl AppServices {
             dump_prompts,
             work_dir,
             local,
+            disable_csrf: config.disable_csrf,
             identity_mode,
             bootstrap_secret: config.bootstrap_secret.clone().map(Arc::<str>::from),
             app_version,

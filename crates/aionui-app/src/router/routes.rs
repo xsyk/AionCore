@@ -425,7 +425,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     #[cfg(feature = "weixin")]
     let router = router.merge(weixin_login_authenticated);
 
-    let router = if services.identity_mode.is_local() {
+    let router = if services.identity_mode.is_local() || services.disable_csrf {
         router
     } else {
         router.layer(middleware::from_fn_with_state(

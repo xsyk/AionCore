@@ -86,7 +86,11 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         bootstrap_secret,
         dump_prompts: cli.dump_prompts,
         recover_corrupted_database: cli.recover_corrupted_database,
+        disable_csrf: cli.disable_csrf || env_flag_enabled(std::env::var("AIONUI_DISABLE_CSRF").ok().as_deref()),
     };
+    if config.disable_csrf && !config.identity_mode.is_local() {
+        warn!("startup: CSRF protection disabled by --disable-csrf / AIONUI_DISABLE_CSRF");
+    }
     info!(
         identity_mode = config.identity_mode.auth_label(),
         auth = if config.identity_mode.is_local() {
@@ -102,6 +106,11 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         _log_guard: log_guard,
         config,
     })
+}
+
+/// `1` / `true` (case-insensitive) turn a boolean env switch on; anything else is off.
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
 }
 
 fn validate_identity_environment(
@@ -190,6 +199,18 @@ fn database_init_bootstrap_error(error: aionui_db::DatabaseInitError, db_path: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_flag_enabled_accepts_only_one_or_true() {
+        assert!(env_flag_enabled(Some("1")));
+        assert!(env_flag_enabled(Some("true")));
+        assert!(env_flag_enabled(Some(" TRUE ")));
+        assert!(!env_flag_enabled(None));
+        assert!(!env_flag_enabled(Some("")));
+        assert!(!env_flag_enabled(Some("0")));
+        assert!(!env_flag_enabled(Some("false")));
+        assert!(!env_flag_enabled(Some("yes")));
+    }
 
     #[test]
     fn database_stage_comes_from_db_boundary_error() {

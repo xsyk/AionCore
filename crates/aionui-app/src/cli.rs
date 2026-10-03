@@ -61,6 +61,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub recover_corrupted_database: bool,
 
+    /// Skip the CSRF middleware in non-local modes (also enabled by AIONUI_DISABLE_CSRF=1).
+    /// For deployments whose client does not send `x-csrf-token`; auth stays enforced.
+    #[arg(long)]
+    pub disable_csrf: bool,
+
     /// Managed runtime resource source selection.
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
     pub managed_resources_mode: ManagedResourcesModeArg,
@@ -941,6 +946,18 @@ mod tests {
     fn recover_corrupted_database_flag_is_accepted() {
         let cli = Cli::parse_from(["aioncore", "--recover-corrupted-database"]);
         assert!(cli.recover_corrupted_database);
+    }
+
+    #[test]
+    fn disable_csrf_flag_defaults_to_false() {
+        let cli = Cli::parse_from(["aioncore"]);
+        assert!(!cli.disable_csrf);
+    }
+
+    #[test]
+    fn disable_csrf_flag_is_accepted() {
+        let cli = Cli::parse_from(["aioncore", "--disable-csrf"]);
+        assert!(cli.disable_csrf);
     }
 
     #[test]

@@ -202,6 +202,47 @@ async fn t12_2_csrf_allows_post_with_valid_token() {
 }
 
 #[tokio::test]
+async fn t12_2_disable_csrf_skips_csrf_but_keeps_auth() {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = AppConfig {
+        disable_csrf: true,
+        ..Default::default()
+    };
+    let services = AppServices::from_config(db, &config).await.unwrap();
+    let app = aionui_app::create_router(&services).await.expect("build router");
+
+    // Auth is still enforced: no token → 401.
+    let resp = app.clone().oneshot(get_request("/api/conversations")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // The CSRF middleware is not mounted, so no CSRF cookie is minted.
+    assert!(extract_csrf_token(&resp).is_none());
+
+    let hash = aionui_auth::hash_password("StrongP@ss1").unwrap();
+    services
+        .user_repo
+        .set_system_user_credentials("admin", &hash)
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post_json_login("/login", r#"{"username":"admin","password":"StrongP@ss1"}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let token = body_json(resp).await["token"].as_str().unwrap().to_owned();
+
+    // Same request that t12_2_csrf_blocks_post_without_token rejects with 403.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/logout")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn t12_2_csrf_exempt_paths() {
     let (app, _services) = build_app().await;
 

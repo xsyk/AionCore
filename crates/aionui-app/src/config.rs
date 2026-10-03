@@ -41,6 +41,8 @@ pub struct AppConfig {
     pub dump_prompts: bool,
     /// Explicitly authorize backup and rebuild for corruption-like local databases.
     pub recover_corrupted_database: bool,
+    /// Skip the CSRF middleware even in non-local modes. Local mode never mounts it.
+    pub disable_csrf: bool,
 }
 
 impl AppConfig {
@@ -85,6 +87,7 @@ impl Default for AppConfig {
             bootstrap_secret: None,
             dump_prompts: false,
             recover_corrupted_database: false,
+            disable_csrf: false,
         }
     }
 }
