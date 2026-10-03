@@ -272,6 +272,16 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         },
         local: services.local,
         aionpro_mode: services.identity_mode == crate::config::IdentityMode::AionPro,
+        feishu: Some(Arc::new(aionui_auth::FeishuLogin::new(
+            Arc::new(aionui_db::SqliteFeishuLoginRepository::new(
+                services.database.pool().clone(),
+            )),
+            crate::config::derive_encryption_key(&services.encryption_secret_raw),
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
+        ))),
     };
 
     let auth_mw_state = AuthState {

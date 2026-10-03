@@ -91,6 +91,8 @@ pub struct AuthRouterState {
     pub session_revoked_hook: Option<Arc<SessionRevokedHook>>,
     pub local: bool,
     pub aionpro_mode: bool,
+    /// Feishu OAuth web login; `None` disables it (tests, embedded builds).
+    pub feishu: Option<Arc<crate::feishu::FeishuLogin>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,7 +193,7 @@ fn require_bootstrap_secret(headers: &HeaderMap, expected: Option<&str>) -> Resu
     }
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let max_len = left.len().max(right.len());
     let mut diff = left.len() ^ right.len();
     for idx in 0..max_len {
@@ -248,6 +250,8 @@ fn user_context_required() -> ApiError {
 /// - `POST /api/webui/change-username` (local-only)
 /// - `POST /api/webui/reset-password` (local-only)
 /// - `POST /api/webui/generate-qr-token` (local-only)
+/// - `GET /api/auth/feishu/status|start|callback` (non-local only)
+/// - `GET/PUT /api/admin/feishu-login` (super admin)
 pub fn auth_routes(state: AuthRouterState) -> Router {
     let auth_limiter = Arc::new(RateLimiter::auth());
     let api_limiter = Arc::new(RateLimiter::api());
@@ -329,6 +333,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .route("/api/webui/change-username", post(webui_change_username_handler))
         .route("/api/webui/reset-password", post(webui_reset_password_handler))
         .route("/api/webui/generate-qr-token", post(webui_generate_qr_token_handler))
+        .merge(crate::feishu::routes::feishu_public_routes())
         .route_layer(from_fn_with_state(api_limiter.clone(), api_rate_limit_middleware))
         .with_state(state.clone());
 
@@ -336,6 +341,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     // route_layer order: last added = outermost (first to process)
     let authenticated = Router::new()
         .merge(crate::admin_routes::admin_user_routes())
+        .merge(crate::feishu::routes::feishu_admin_routes())
         .route("/logout", post(logout_handler))
         .route("/api/auth/user", get(user_handler))
         .route("/api/auth/change-password", post(change_password_handler))
@@ -520,30 +526,13 @@ async fn login_handler(
         return Err(ApiError::Unauthorized("Invalid username or password".into()));
     }
 
-    let token = state
-        .jwt_service
-        .sign_with_session_generation(
-            &user.id,
-            user.username.as_deref().unwrap_or("external_user"),
-            user.session_generation,
-        )
-        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
-    let refresh_token = state
-        .jwt_service
-        .sign_refresh(
-            &user.id,
-            user.username.as_deref().unwrap_or("external_user"),
-            user.session_generation,
-        )
-        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
+    let (token, [session_cookie, refresh_cookie]) = issue_session_cookies(&state, &user)?;
 
     // Update last login (best-effort)
     if let Err(e) = state.user_repo.update_last_login(&user.id).await {
         tracing::warn!("Failed to update last login for {}: {e}", user.id);
     }
 
-    let session_cookie = state.cookie_config.build_session_cookie(&token);
-    let refresh_cookie = state.cookie_config.build_refresh_cookie(&refresh_token);
     let resp = LoginResponse::new(
         PublicUser {
             id: user.id,
@@ -560,6 +549,25 @@ async fn login_handler(
         Json(resp),
     )
         .into_response())
+}
+
+/// Sign an access/refresh pair for `user` and build both credential cookies.
+/// Shared by password login and Feishu login.
+pub(crate) fn issue_session_cookies(state: &AuthRouterState, user: &User) -> Result<(String, [String; 2]), ApiError> {
+    let name = user.username.as_deref().unwrap_or("external_user");
+    let token = state
+        .jwt_service
+        .sign_with_session_generation(&user.id, name, user.session_generation)
+        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
+    let refresh_token = state
+        .jwt_service
+        .sign_refresh(&user.id, name, user.session_generation)
+        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
+    let cookies = [
+        state.cookie_config.build_session_cookie(&token),
+        state.cookie_config.build_refresh_cookie(&refresh_token),
+    ];
+    Ok((token, cookies))
 }
 
 // ---------------------------------------------------------------------------

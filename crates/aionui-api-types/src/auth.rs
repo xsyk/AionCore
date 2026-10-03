@@ -96,6 +96,44 @@ pub struct AdminUserView {
     pub created_at: aionui_common::TimestampMs,
     pub last_login: Option<aionui_common::TimestampMs>,
     pub is_super_admin: bool,
+    /// How the account signs in: `password` or `feishu`.
+    pub source: String,
+}
+
+/// `GET /api/auth/feishu/status` — whether the login page shows the Feishu button.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeishuLoginStatus {
+    pub enabled: bool,
+}
+
+/// `GET/PUT /api/admin/feishu-login` response. Never carries the app secret.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeishuLoginConfigView {
+    pub enabled: bool,
+    pub app_id: String,
+    pub app_secret_set: bool,
+    pub tenant_key: Option<String>,
+    pub public_base_url: String,
+    pub api_base: Option<String>,
+    pub accounts_base: Option<String>,
+    /// `<public_base_url>/api/auth/feishu/callback`, empty while the base URL is unset.
+    pub callback_url: String,
+}
+
+/// Body of `PUT /api/admin/feishu-login`. An absent/empty `app_secret` keeps the stored one.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FeishuLoginConfigUpdate {
+    pub enabled: bool,
+    pub app_id: String,
+    #[serde(default)]
+    pub app_secret: Option<String>,
+    pub public_base_url: String,
+    #[serde(default)]
+    pub api_base: Option<String>,
+    #[serde(default)]
+    pub accounts_base: Option<String>,
+    #[serde(default)]
+    pub clear_tenant_key: bool,
 }
 
 /// Body of `POST /api/admin/users`.

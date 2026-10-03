@@ -46,8 +46,13 @@ pub(crate) fn admin_user_routes() -> Router<AuthRouterState> {
 }
 
 fn to_view(user: User) -> AdminUserView {
+    let from_feishu = user
+        .external_user_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with(crate::feishu::FEISHU_EXTERNAL_PREFIX));
     AdminUserView {
         is_super_admin: is_super_admin(&user.id),
+        source: if from_feishu { "feishu" } else { "password" }.to_owned(),
         id: user.id,
         username: user.username.unwrap_or_default(),
         status: user.status.as_str().to_owned(),

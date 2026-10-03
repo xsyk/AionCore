@@ -7,6 +7,7 @@ mod cookie;
 mod csrf;
 mod error;
 mod extract;
+pub mod feishu;
 mod jwt;
 pub mod middleware;
 mod password;
@@ -75,6 +76,9 @@ pub use qr_token::QrTokenStore;
 
 // Refresh-storm coalescing (shared into AuthRouterState)
 pub use singleflight::RefreshCoalescer;
+
+// Feishu OAuth web login
+pub use feishu::FeishuLogin;
 
 // Routes
 pub use routes::{AuthRouterState, SessionRevokedHook, auth_routes};
