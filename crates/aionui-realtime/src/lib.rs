@@ -1,12 +1,14 @@
 #![warn(clippy::disallowed_types)]
 
 //! WebSocket connection manager, event broadcasting, and token-validated upgrade handler.
+pub mod admin_mirror;
 pub mod broadcaster;
 pub mod handler;
 pub mod manager;
 pub mod router;
 pub mod types;
 
+pub use admin_mirror::is_conversation_scoped_event;
 pub use broadcaster::{BroadcastEventBus, EventBroadcaster};
 pub use handler::{TokenExtractor, TokenUserResolver, WsHandlerState, ws_upgrade_handler};
 pub use manager::{TokenValidator, WebSocketManager};

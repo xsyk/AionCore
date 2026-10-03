@@ -8,9 +8,9 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MentionableCandidatesParams,
-    MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
-    StaleRuntimeMessageRow,
+    AdminConversationRow, ConversationFilters, ConversationRowUpdate, IConversationRepository,
+    MentionableCandidatesParams, MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult,
+    MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
 };
 
 /// Bump `conversations.updated_at` so the conversation-list sort
@@ -606,6 +606,27 @@ impl IConversationRepository for SqliteConversationRepository {
         .fetch_all(&self.pool)
         .await?;
 
+        Ok(rows)
+    }
+
+    async fn list_all_with_owner(
+        &self,
+        exclude_user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<AdminConversationRow>, DbError> {
+        let rows = sqlx::query_as::<_, AdminConversationRow>(
+            "SELECT c.id, c.name, c.type, c.extra, c.updated_at, \
+                    u.id AS owner_id, u.username AS owner_username, \
+                    (u.deleted_at IS NOT NULL) AS owner_deleted \
+             FROM conversations c JOIN users u ON u.id = c.user_id \
+             WHERE c.user_id != ? \
+             ORDER BY c.updated_at DESC \
+             LIMIT ?",
+        )
+        .bind(exclude_user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 
@@ -2272,6 +2293,40 @@ mod tests {
                 ("user_b".to_owned(), "conv_b".to_owned()),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn list_all_with_owner_excludes_caller_and_reports_owner() {
+        let (repo, db) = setup().await;
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES ('user_b', 'local', 'bob', 'hash', 'active', 0, 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let mut a = sample_conversation(SYSTEM_USER_ID);
+        a.id = "conv_admin".into();
+        repo.create(&a).await.unwrap();
+        let mut b = sample_conversation("user_b");
+        b.id = "conv_bob".into();
+        repo.create(&b).await.unwrap();
+
+        let rows = repo.list_all_with_owner(SYSTEM_USER_ID, 50).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "conv_bob");
+        assert_eq!(rows[0].owner_id, "user_b");
+        assert_eq!(rows[0].owner_username.as_deref(), Some("bob"));
+        assert!(!rows[0].owner_deleted);
+
+        sqlx::query("UPDATE users SET deleted_at = 5 WHERE id = 'user_b'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let rows = repo.list_all_with_owner(SYSTEM_USER_ID, 50).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].owner_deleted);
     }
 
     #[tokio::test]

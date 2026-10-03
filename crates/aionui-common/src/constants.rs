@@ -218,3 +218,23 @@ mod tests {
         assert!(!supports_team_cli_fallback(Some(&json!({"execution": {"cli": false}}))));
     }
 }
+
+/// The built-in local account (login name `admin`) that acts as the super admin.
+pub const SUPER_ADMIN_USER_ID: &str = "system_default_user";
+
+/// Whether `user_id` is the super admin. The single source of that rule.
+pub fn is_super_admin(user_id: &str) -> bool {
+    user_id == SUPER_ADMIN_USER_ID
+}
+
+#[cfg(test)]
+mod super_admin_tests {
+    use super::*;
+
+    #[test]
+    fn only_system_default_user_is_super_admin() {
+        assert!(is_super_admin("system_default_user"));
+        assert!(!is_super_admin("user_x"));
+        assert!(!is_super_admin(""));
+    }
+}

@@ -106,6 +106,11 @@ pub trait IUserRepository: Send + Sync {
     /// existing sessions by incrementing `session_generation`.
     async fn set_status(&self, user_id: &str, status: UserStatus) -> Result<(), DbError>;
 
+    /// Soft-deletes a user: stamps `deleted_at` and bumps `session_generation`
+    /// so live sessions die. The row and everything referencing it are kept.
+    /// Returns `NotFound` when the user is missing or already deleted.
+    async fn soft_delete(&self, user_id: &str) -> Result<(), DbError>;
+
     /// Increments a user's session generation and returns the new value.
     async fn increment_session_generation(&self, user_id: &str) -> Result<i64, DbError>;
 }

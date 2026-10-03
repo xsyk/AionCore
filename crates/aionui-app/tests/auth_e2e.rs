@@ -225,7 +225,10 @@ async fn t12_2_disable_csrf_skips_csrf_but_keeps_auth() {
         .unwrap();
     let resp = app
         .clone()
-        .oneshot(post_json_login("/login", r#"{"username":"admin","password":"StrongP@ss1"}"#))
+        .oneshot(post_json_login(
+            "/login",
+            r#"{"username":"admin","password":"StrongP@ss1"}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

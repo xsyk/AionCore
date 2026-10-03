@@ -64,11 +64,72 @@ pub struct RefreshTokenRequest {
     pub token: String,
 }
 
+/// The signed-in user as returned by `GET /api/auth/user`.
+///
+/// `is_super_admin` is computed from the real caller, so it stays `true` while
+/// the super admin acts as another user.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CurrentUserInfo {
+    pub id: String,
+    pub username: String,
+    pub is_super_admin: bool,
+}
+
 /// User info response for `GET /api/auth/user`.
 #[derive(Debug, Serialize)]
 pub struct UserInfoResponse {
     pub success: bool,
-    pub user: PublicUser,
+    pub user: CurrentUserInfo,
+}
+
+// ---------------------------------------------------------------------------
+// Super-admin user management (`/api/admin/*`)
+// ---------------------------------------------------------------------------
+
+/// One account in `GET /api/admin/users`. Never carries secrets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminUserView {
+    pub id: String,
+    pub username: String,
+    /// `active` or `disabled`.
+    pub status: String,
+    pub created_at: aionui_common::TimestampMs,
+    pub last_login: Option<aionui_common::TimestampMs>,
+    pub is_super_admin: bool,
+}
+
+/// Body of `POST /api/admin/users`.
+#[derive(Debug, Deserialize)]
+pub struct AdminCreateUserRequest {
+    pub username: String,
+    pub password: String,
+}
+
+/// Body of `POST /api/admin/users/{id}/password`.
+#[derive(Debug, Deserialize)]
+pub struct AdminResetPasswordRequest {
+    pub password: String,
+}
+
+/// Owner of a conversation in the super-admin listing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminConversationOwner {
+    pub id: String,
+    pub username: String,
+    pub deleted: bool,
+}
+
+/// One conversation in `GET /api/admin/conversations`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminConversationView {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// `extra.backend` when present (e.g. `claude`, `codex`), for the sider icon.
+    pub backend: Option<String>,
+    pub updated_at: aionui_common::TimestampMs,
+    pub owner: AdminConversationOwner,
 }
 
 /// Refresh token response for `POST /api/auth/refresh`.

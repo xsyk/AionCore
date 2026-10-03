@@ -21,7 +21,8 @@ impl IUserRepository for SqliteUserRepository {
     async fn has_users(&self) -> Result<bool, DbError> {
         let row: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM users \
-             WHERE user_type = 'local' AND password_hash IS NOT NULL AND password_hash != ''",
+             WHERE user_type = 'local' AND password_hash IS NOT NULL AND password_hash != '' \
+             AND deleted_at IS NULL",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -113,13 +114,14 @@ impl IUserRepository for SqliteUserRepository {
             created_at: now,
             updated_at: now,
             last_login: None,
+            deleted_at: None,
         })
     }
 
     async fn find_by_username(&self, username: &str) -> Result<Option<User>, DbError> {
         let user = sqlx::query_as::<_, User>(
             "SELECT * FROM users \
-             WHERE user_type = 'local' AND password_hash IS NOT NULL AND username = ?",
+             WHERE user_type = 'local' AND password_hash IS NOT NULL AND username = ? AND deleted_at IS NULL",
         )
         .bind(username)
         .fetch_optional(&self.pool)
@@ -299,16 +301,17 @@ impl IUserRepository for SqliteUserRepository {
     }
 
     async fn find_active_by_id(&self, id: &str) -> Result<Option<User>, DbError> {
-        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ? AND status = 'active'")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let user =
+            sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ? AND status = 'active' AND deleted_at IS NULL")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
 
         Ok(user)
     }
 
     async fn list_users(&self) -> Result<Vec<User>, DbError> {
-        let users = sqlx::query_as::<_, User>("SELECT * FROM users")
+        let users = sqlx::query_as::<_, User>("SELECT * FROM users WHERE deleted_at IS NULL")
             .fetch_all(&self.pool)
             .await?;
 
@@ -316,7 +319,7 @@ impl IUserRepository for SqliteUserRepository {
     }
 
     async fn count_users(&self) -> Result<i64, DbError> {
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE deleted_at IS NULL")
             .fetch_one(&self.pool)
             .await?;
 
@@ -441,6 +444,26 @@ impl IUserRepository for SqliteUserRepository {
         Ok(())
     }
 
+    async fn soft_delete(&self, user_id: &str) -> Result<(), DbError> {
+        let now = aionui_common::now_ms();
+        let result = sqlx::query(
+            "UPDATE users \
+             SET deleted_at = ?, session_generation = session_generation + 1, updated_at = ? \
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("User '{user_id}' not found")));
+        }
+
+        Ok(())
+    }
+
     async fn increment_session_generation(&self, user_id: &str) -> Result<i64, DbError> {
         let now = aionui_common::now_ms();
         let result = sqlx::query(
@@ -481,6 +504,38 @@ mod tests {
         let db = init_database_memory().await.unwrap();
         let repo = SqliteUserRepository::new(db.pool().clone());
         (repo, db)
+    }
+
+    #[tokio::test]
+    async fn soft_delete_hides_user_and_frees_username() {
+        let (repo, _db) = setup().await;
+        let u = repo.create_user("gina", "h").await.unwrap();
+        repo.soft_delete(&u.id).await.unwrap();
+        assert!(repo.find_by_username("gina").await.unwrap().is_none());
+        assert!(repo.find_active_by_id(&u.id).await.unwrap().is_none());
+        assert!(!repo.list_users().await.unwrap().iter().any(|x| x.id == u.id));
+        let again = repo.create_user("gina", "h2").await.unwrap();
+        assert_ne!(again.id, u.id);
+        // The deleted row is retained and still readable by id.
+        assert!(repo.find_by_id(&u.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn soft_delete_bumps_session_generation() {
+        let (repo, _db) = setup().await;
+        let u = repo.create_user("hank", "h").await.unwrap();
+        repo.soft_delete(&u.id).await.unwrap();
+        let after = repo.find_by_id(&u.id).await.unwrap().unwrap();
+        assert_eq!(after.session_generation, u.session_generation + 1);
+    }
+
+    #[tokio::test]
+    async fn soft_delete_missing_or_already_deleted_is_not_found() {
+        let (repo, _db) = setup().await;
+        assert!(matches!(repo.soft_delete("ghost").await, Err(DbError::NotFound(_))));
+        let u = repo.create_user("ivy", "h").await.unwrap();
+        repo.soft_delete(&u.id).await.unwrap();
+        assert!(matches!(repo.soft_delete(&u.id).await, Err(DbError::NotFound(_))));
     }
 
     // -- Unit tests for is_unique_violation helper --

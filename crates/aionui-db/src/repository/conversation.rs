@@ -264,6 +264,19 @@ pub trait IConversationRepository: Send + Sync {
         msg_type: &str,
     ) -> Result<Option<MessageRow>, DbError>;
 
+    /// Lists conversations of every user except `exclude_user_id`, newest
+    /// first, joined with their owner. Super-admin only (enforced by the route).
+    ///
+    /// Defaults to an empty list so the repository stubs in this workspace need
+    /// no body.
+    async fn list_all_with_owner(
+        &self,
+        _exclude_user_id: &str,
+        _limit: i64,
+    ) -> Result<Vec<AdminConversationRow>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Lists stale assistant-side runtime messages that were left in a
     /// non-terminal state by a previous process.
     async fn list_stale_runtime_messages(&self) -> Result<Vec<StaleRuntimeMessageRow>, DbError> {
@@ -382,6 +395,21 @@ pub struct MessagePageResult {
     pub items: Vec<MessageRow>,
     pub has_more_before: bool,
     pub has_more_after: bool,
+}
+
+/// One conversation joined with its owner, for the super-admin listing that
+/// spans every user (`GET /api/admin/conversations`).
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct AdminConversationRow {
+    pub id: String,
+    pub name: String,
+    #[sqlx(rename = "type")]
+    pub r#type: String,
+    pub extra: String,
+    pub updated_at: TimestampMs,
+    pub owner_id: String,
+    pub owner_username: Option<String>,
+    pub owner_deleted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

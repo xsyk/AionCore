@@ -2,6 +2,7 @@
 
 //! JWT authentication, password hashing, CSRF protection, rate limiting, and auth middleware.
 mod account;
+mod admin_routes;
 mod cookie;
 mod csrf;
 mod error;
@@ -23,6 +24,7 @@ pub use error::AuthError;
 
 // Local-account password provisioning
 pub use account::{AccountError, PasswordOutcome, create_local_user, set_local_password};
+pub use admin_routes::require_super_admin;
 
 // Storage-encryption-secret provisioning and inspection
 pub use secret::{
@@ -64,8 +66,8 @@ pub use csrf::csrf_middleware;
 
 // Auth middleware
 pub use middleware::{
-    AuthIdentityMode, AuthState, CurrentUser, IRuntimeTokenVerifier, RUNTIME_CONVERSATION_ID_HEADER,
-    RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware, local_auth_middleware,
+    ACT_AS_HEADER, AuthIdentityMode, AuthState, CurrentUser, IRuntimeTokenVerifier, RUNTIME_CONVERSATION_ID_HEADER,
+    RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, RealUser, auth_middleware, local_auth_middleware,
 };
 
 // QR token store

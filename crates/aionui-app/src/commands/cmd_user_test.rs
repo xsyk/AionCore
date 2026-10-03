@@ -33,6 +33,7 @@ fn format_user_lines_never_leaks_secrets() {
         created_at: 111,
         updated_at: 222,
         last_login: Some(333),
+        deleted_at: None,
     };
 
     let joined = format_user_lines(&[user]).join("\n");

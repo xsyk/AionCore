@@ -14,7 +14,7 @@ use aionui_api_types::{
     ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
     SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, RealUser, require_super_admin};
 use aionui_common::ApiError;
 
 use crate::ConversationError;
@@ -117,6 +117,7 @@ impl From<ConversationError> for ApiError {
 pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/conversations", post(create).get(list))
+        .route("/api/admin/conversations", get(admin_list_all))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/fork", post(fork))
@@ -166,6 +167,59 @@ async fn list(
 ) -> Result<Json<ApiResponse<ConversationListResponse>>, ApiError> {
     let result = state.service.list(&user.id, query).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AdminListQuery {
+    limit: Option<i64>,
+}
+
+const ADMIN_LIST_DEFAULT_LIMIT: i64 = 500;
+const ADMIN_LIST_MAX_LIMIT: i64 = 2000;
+
+/// `GET /api/admin/conversations` — every other user's conversations with their
+/// owner, for the super admin's sider. Authorized on the real caller.
+async fn admin_list_all(
+    State(state): State<ConversationRouterState>,
+    Extension(real): Extension<RealUser>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<AdminListQuery>,
+) -> Result<Json<ApiResponse<Vec<aionui_api_types::AdminConversationView>>>, ApiError> {
+    require_super_admin(&real, &headers)?;
+    let limit = query
+        .limit
+        .unwrap_or(ADMIN_LIST_DEFAULT_LIMIT)
+        .clamp(1, ADMIN_LIST_MAX_LIMIT);
+    let rows = state
+        .service
+        .conversation_repo()
+        .list_all_with_owner(&real.0.id, limit)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "admin conversation listing failed");
+            ApiError::Internal("Database error".into())
+        })?;
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            let backend = serde_json::from_str::<serde_json::Value>(&row.extra)
+                .ok()
+                .and_then(|extra| extra.get("backend").and_then(|b| b.as_str()).map(str::to_owned));
+            aionui_api_types::AdminConversationView {
+                id: row.id,
+                name: row.name,
+                r#type: row.r#type,
+                backend,
+                updated_at: row.updated_at,
+                owner: aionui_api_types::AdminConversationOwner {
+                    username: row.owner_username.unwrap_or_else(|| row.owner_id.clone()),
+                    id: row.owner_id,
+                    deleted: row.owner_deleted,
+                },
+            }
+        })
+        .collect();
+    Ok(Json(ApiResponse::ok(items)))
 }
 
 async fn clone(

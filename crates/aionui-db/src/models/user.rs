@@ -61,6 +61,11 @@ pub struct User {
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
     pub last_login: Option<TimestampMs>,
+    /// Soft-delete marker (migration 045). `Some` rows are hidden from login,
+    /// listings and username uniqueness but keep their data.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub deleted_at: Option<TimestampMs>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

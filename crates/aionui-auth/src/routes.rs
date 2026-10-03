@@ -13,11 +13,11 @@ use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
 
 use aionui_api_types::{
-    ApiResponse, AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest, EnsureExternalUserRequest,
-    EnsureExternalUserResponse, LoginRequest, LoginResponse, PublicUser, QrLoginRequest, RefreshResponse,
-    RefreshTokenRequest, RevokeExternalSessionRequest, RevokeExternalSessionResponse, UserInfoResponse,
-    WebuiChangePasswordRequest, WebuiChangeUsernameRequest, WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse,
-    WebuiResetPasswordResponse, WsTokenResponse,
+    ApiResponse, AuthStatusResponse, ChangePasswordRequest, CurrentUserInfo, EnsureExternalSessionRequest,
+    EnsureExternalUserRequest, EnsureExternalUserResponse, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
+    RefreshResponse, RefreshTokenRequest, RevokeExternalSessionRequest, RevokeExternalSessionResponse,
+    UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest, WebuiChangeUsernameResponse,
+    WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
 };
 use aionui_common::ApiError;
 use aionui_common::constants::{COOKIE_MAX_AGE_DAYS, REFRESH_COOKIE_NAME};
@@ -25,7 +25,7 @@ use aionui_db::{DbError, IUserRepository, UserStatus, UserType, models::User};
 
 use crate::error::AuthError;
 use crate::extract::{extract_cookie_value, extract_token_from_headers};
-use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
+use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, RealUser, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
 use crate::qr_token::QrTokenStore;
 use crate::rate_limit::{
@@ -335,6 +335,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     // Authenticated routes: api limiter -> auth -> action limiter
     // route_layer order: last added = outermost (first to process)
     let authenticated = Router::new()
+        .merge(crate::admin_routes::admin_user_routes())
         .route("/logout", post(logout_handler))
         .route("/api/auth/user", get(user_handler))
         .route("/api/auth/change-password", post(change_password_handler))
@@ -512,6 +513,12 @@ async fn login_handler(
     }
 
     let user = found_user.ok_or_else(|| ApiError::Unauthorized("Invalid username or password".into()))?;
+
+    // A disabled account must not get a session. Same message as a bad
+    // password so the response does not reveal that the account exists.
+    if user.status != UserStatus::Active {
+        return Err(ApiError::Unauthorized("Invalid username or password".into()));
+    }
 
     let token = state
         .jwt_service
@@ -750,10 +757,14 @@ async fn update_user_last_login_handler(
 // GET /api/auth/user
 // ---------------------------------------------------------------------------
 
-async fn user_handler(Extension(user): Extension<CurrentUser>) -> Json<UserInfoResponse> {
+async fn user_handler(
+    Extension(user): Extension<CurrentUser>,
+    Extension(real): Extension<RealUser>,
+) -> Json<UserInfoResponse> {
     Json(UserInfoResponse {
         success: true,
-        user: PublicUser {
+        user: CurrentUserInfo {
+            is_super_admin: aionui_common::constants::is_super_admin(&real.0.id),
             id: user.id,
             username: user.username,
         },

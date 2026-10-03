@@ -82,6 +82,13 @@ async fn forward_event_bus_to_websocket(
             .and_then(|value| value.as_str())
             .map(str::to_owned)
         {
+            // The super admin sees and can continue every user's conversations,
+            // so it also receives their conversation traffic.
+            if !aionui_common::constants::is_super_admin(&user_id)
+                && aionui_realtime::is_conversation_scoped_event(&event)
+            {
+                ws_manager.broadcast_to_user(aionui_common::constants::SUPER_ADMIN_USER_ID, event.clone());
+            }
             ws_manager.broadcast_to_user(&user_id, event);
         } else if is_global_websocket_event(&event.name) {
             ws_manager.broadcast_all(event);
