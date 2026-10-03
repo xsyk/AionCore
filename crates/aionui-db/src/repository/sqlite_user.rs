@@ -487,6 +487,81 @@ impl IUserRepository for SqliteUserRepository {
 
         Ok(generation)
     }
+
+    async fn find_live_local_by_external_id(&self, external_user_id: &str) -> Result<Option<User>, DbError> {
+        let user = sqlx::query_as::<_, User>(
+            "SELECT * FROM users WHERE user_type = 'local' AND external_user_id = ? AND deleted_at IS NULL",
+        )
+        .bind(external_user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(user)
+    }
+
+    async fn create_external_local_user(
+        &self,
+        external_user_id: &str,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<User, DbError> {
+        let id = aionui_common::generate_prefixed_id("user");
+        let now = aionui_common::now_ms();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, external_user_id, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, ?, ?, 'active', 0, ?, ?)",
+        )
+        .bind(&id)
+        .bind(external_user_id)
+        .bind(username)
+        .bind(password_hash)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
+                DbError::Conflict(format!("User '{username}' or identity already exists"))
+            }
+            _ => DbError::Query(e),
+        })?;
+        self.find_by_id(&id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("User '{id}' not found")))
+    }
+
+    async fn update_profile(
+        &self,
+        user_id: &str,
+        email: Option<&str>,
+        avatar_path: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE users SET email = COALESCE(?, email), avatar_path = COALESCE(?, avatar_path), updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(email)
+        .bind(avatar_path)
+        .bind(aionui_common::now_ms())
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
+                DbError::Conflict("Email already in use".to_owned())
+            }
+            _ => DbError::Query(e),
+        })?;
+        Ok(())
+    }
+
+    async fn email_taken(&self, email: &str, except_user_id: &str) -> Result<bool, DbError> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE email = ? AND id != ?")
+            .bind(email)
+            .bind(except_user_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count > 0)
+    }
 }
 
 /// Checks if a SQLite database error is a UNIQUE constraint violation.
@@ -504,6 +579,65 @@ mod tests {
         let db = init_database_memory().await.unwrap();
         let repo = SqliteUserRepository::new(db.pool().clone());
         (repo, db)
+    }
+
+    #[tokio::test]
+    async fn external_local_user_lifecycle() {
+        let (repo, _db) = setup().await;
+        let u = repo
+            .create_external_local_user("feishu:on_1", "张三", "h")
+            .await
+            .unwrap();
+        assert_eq!(u.user_type, UserType::Local);
+        assert_eq!(u.external_user_id.as_deref(), Some("feishu:on_1"));
+        let found = repo
+            .find_live_local_by_external_id("feishu:on_1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, u.id);
+        // username clash -> Conflict
+        let err = repo
+            .create_external_local_user("feishu:on_2", "张三", "h")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::Conflict(_)));
+        // soft delete frees the external id for a new live row
+        repo.soft_delete(&u.id).await.unwrap();
+        assert!(
+            repo.find_live_local_by_external_id("feishu:on_1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let again = repo
+            .create_external_local_user("feishu:on_1", "张三", "h")
+            .await
+            .unwrap();
+        assert_ne!(again.id, u.id);
+    }
+
+    #[tokio::test]
+    async fn update_profile_and_email_taken() {
+        let (repo, _db) = setup().await;
+        let a = repo.create_external_local_user("feishu:a", "a", "h").await.unwrap();
+        let b = repo.create_external_local_user("feishu:b", "b", "h").await.unwrap();
+        repo.update_profile(&a.id, Some("x@corp.com"), Some("https://img/a.png"))
+            .await
+            .unwrap();
+        let a2 = repo.find_by_id(&a.id).await.unwrap().unwrap();
+        assert_eq!(a2.email.as_deref(), Some("x@corp.com"));
+        assert_eq!(a2.avatar_path.as_deref(), Some("https://img/a.png"));
+        assert!(repo.email_taken("x@corp.com", &b.id).await.unwrap());
+        assert!(!repo.email_taken("x@corp.com", &a.id).await.unwrap());
+        // None keeps existing values
+        repo.update_profile(&a.id, None, None).await.unwrap();
+        assert_eq!(
+            repo.find_by_id(&a.id).await.unwrap().unwrap().email.as_deref(),
+            Some("x@corp.com")
+        );
+        let err = repo.update_profile(&b.id, Some("x@corp.com"), None).await.unwrap_err();
+        assert!(matches!(err, DbError::Conflict(_)));
     }
 
     #[tokio::test]

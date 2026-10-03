@@ -35,6 +35,8 @@ const GLOBAL_TABLES: &[(&str, &str)] = &[
     // Canonical filesystem-path registry shared by all users by design
     // (project-bind: folders are reused globally by resource_canonical).
     ("folders", "global canonical path registry"),
+    // Single-row Feishu web-login settings owned by the super admin, not a user.
+    ("feishu_login_config", "machine-wide feishu login settings"),
 ];
 
 /// Tables whose `user_id` column is NOT a Core-user ownership column — it

@@ -113,4 +113,29 @@ pub trait IUserRepository: Send + Sync {
 
     /// Increments a user's session generation and returns the new value.
     async fn increment_session_generation(&self, user_id: &str) -> Result<i64, DbError>;
+
+    /// Live (not soft-deleted) local user carrying this external identity
+    /// (e.g. `feishu:<union_id>`). Ignores status, so disabled users are returned.
+    async fn find_live_local_by_external_id(&self, external_user_id: &str) -> Result<Option<User>, DbError>;
+
+    /// Creates a local user bound to an external identity. `DbError::Conflict`
+    /// on a username or external-identity clash among live rows.
+    async fn create_external_local_user(
+        &self,
+        external_user_id: &str,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<User, DbError>;
+
+    /// Updates email / avatar; `None` keeps the current value.
+    /// `DbError::Conflict` when the email is already used by another row.
+    async fn update_profile(
+        &self,
+        user_id: &str,
+        email: Option<&str>,
+        avatar_path: Option<&str>,
+    ) -> Result<(), DbError>;
+
+    /// Whether any row other than `except_user_id` (soft-deleted included) owns this email.
+    async fn email_taken(&self, email: &str, except_user_id: &str) -> Result<bool, DbError>;
 }
