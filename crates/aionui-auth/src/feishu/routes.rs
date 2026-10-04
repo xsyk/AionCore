@@ -144,6 +144,8 @@ async fn finish_login(
     let user = account::resolve_account(state.user_repo.as_ref(), &feishu_user, cfg.signup_policy).await?;
     let (_, [session, refresh]) =
         issue_session_cookies(state, &user).map_err(|e| FeishuLoginError::Server(e.to_string()))?;
+    // Best effort: a missing last_login only makes a later disable read as
+    // "pending" instead of "account_disabled"; it never blocks this login.
     if let Err(e) = state.user_repo.update_last_login(&user.id).await {
         tracing::warn!(user_id = %user.id, error = %e, "feishu: failed to update last login");
     }
@@ -184,6 +186,11 @@ async fn put_config(
     require_super_admin(&real, &headers)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let view = admin_service(&state)?.update(req).await.map_err(config_error)?;
-    tracing::info!(admin_user_id = %real.0.id, enabled = view.enabled, "admin: feishu login config updated");
+    tracing::info!(
+        admin_user_id = %real.0.id,
+        enabled = view.enabled,
+        signup_policy = %view.signup_policy,
+        "admin: feishu login config updated"
+    );
     Ok(Json(ApiResponse::ok(view)))
 }

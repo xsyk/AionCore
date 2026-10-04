@@ -199,6 +199,7 @@ async fn disabled_by_default() {
     let status = call(&ctx.app, "GET", "/api/auth/feishu/status", None, None, None).await;
     assert_eq!(status.status, StatusCode::OK);
     assert_eq!(status.json["data"]["enabled"], false);
+    assert!(status.json["data"].as_object().unwrap().contains_key("public_base_url"));
     assert!(status.json["data"]["public_base_url"].is_null());
     let start = call(&ctx.app, "GET", "/api/auth/feishu/start", None, None, None).await;
     assert_eq!(start.status, StatusCode::FOUND);
@@ -348,6 +349,8 @@ async fn first_login_creates_account_and_second_reuses_it() {
         .cloned()
         .expect("listed");
     assert_eq!(row["source"], "feishu");
+    assert_eq!(row["email"], "on_zhang@corp.example.com");
+    assert_eq!(row["avatar_url"], "https://img.example.com/a.png");
     // second login reuses the account
     let cb2 = feishu_login(&ctx, "c1").await;
     assert_eq!(me(&ctx, &cb2).await["id"], id.as_str());
@@ -357,16 +360,20 @@ async fn first_login_creates_account_and_second_reuses_it() {
 async fn rejects_bad_state_missing_code_and_foreign_tenant() {
     let ctx = setup().await;
     configure(&ctx, "open").await;
+    let forged_cookie = format!("aionui-feishu-state=real.{}", "v".repeat(43));
     let forged = call(
         &ctx.app,
         "GET",
         "/api/auth/feishu/callback?code=c1&state=forged",
         None,
-        Some("aionui-feishu-state=real"),
+        Some(&forged_cookie),
         None,
     )
     .await;
-    assert_eq!(forged.location, "/#/login?feishu_error=state");
+    assert_eq!(
+        forged.location, "/#/login?feishu_error=state",
+        "well-formed cookie, wrong state"
+    );
     let no_cookie = call(
         &ctx.app,
         "GET",
@@ -481,7 +488,19 @@ async fn approval_policy_gates_first_login() {
     let first = feishu_login(&ctx, "c1").await;
     assert_eq!(first.location, "/#/login?feishu_error=pending");
     assert!(cookie_value(&first.cookies, "aionui-session").is_none());
+    assert!(
+        first
+            .cookies
+            .iter()
+            .any(|c| c.starts_with("aionui-feishu-state=;") && c.contains("Max-Age=0")),
+        "state cookie cleared on pending: {:?}",
+        first.cookies
+    );
     let row = user_row(&ctx, "新人").await;
+    assert_eq!(
+        row["email"], "on_new@corp.example.com",
+        "admins can tell pending namesakes apart"
+    );
     assert_eq!(row["status"], "disabled");
     assert!(row["last_login"].is_null());
     assert_eq!(row["source"], "feishu");
@@ -553,4 +572,23 @@ async fn signup_policy_is_configurable_and_validated() {
     )
     .await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn token_endpoint_errors_map_to_upstream() {
+    let ctx = setup().await;
+    configure(&ctx, "open").await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/v3/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "code": 20071,
+            "error": "invalid_grant",
+            "error_description": "The provided redirect URI does not match the one used during authorization."
+        })))
+        .mount(&ctx.feishu)
+        .await;
+    assert_eq!(
+        feishu_login(&ctx, "c9").await.location,
+        "/#/login?feishu_error=upstream"
+    );
 }

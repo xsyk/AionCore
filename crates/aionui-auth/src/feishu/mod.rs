@@ -60,7 +60,7 @@ impl FeishuLoginError {
 }
 
 /// Decrypted, defaulted configuration for one login attempt.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedConfig {
     pub app_id: String,
     pub app_secret: String,
@@ -70,6 +70,22 @@ pub struct ResolvedConfig {
     pub accounts_base: String,
     pub public_base_url: String,
     pub signup_policy: FeishuSignupPolicy,
+}
+
+/// Like a derived `Debug`, minus the app secret.
+impl std::fmt::Debug for ResolvedConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedConfig")
+            .field("app_id", &self.app_id)
+            .field("app_secret", &"<redacted>")
+            .field("tenant_key", &self.tenant_key)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("api_base", &self.api_base)
+            .field("accounts_base", &self.accounts_base)
+            .field("public_base_url", &self.public_base_url)
+            .field("signup_policy", &self.signup_policy)
+            .finish()
+    }
 }
 
 /// Feishu login service: config persistence (secret encrypted at rest),

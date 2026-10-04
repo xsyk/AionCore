@@ -27,7 +27,7 @@ pub fn encode_state_cookie(state: &str, verifier: &str) -> String {
 /// [`encode_state_cookie`], including the pre-PKCE single-token cookie.
 pub fn decode_state_cookie(value: &str) -> Option<(&str, &str)> {
     let (state, verifier) = value.split_once('.')?;
-    if state.is_empty() || verifier.len() < 43 || verifier.contains('.') {
+    if state.is_empty() || verifier.len() != 43 || verifier.contains('.') {
         return None;
     }
     Some((state, verifier))

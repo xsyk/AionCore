@@ -58,6 +58,10 @@ fn to_view(user: User) -> AdminUserView {
         status: user.status.as_str().to_owned(),
         created_at: user.created_at,
         last_login: user.last_login,
+        email: user.email,
+        avatar_url: user
+            .avatar_path
+            .filter(|path| path.starts_with("https://") || path.starts_with("http://")),
     }
 }
 

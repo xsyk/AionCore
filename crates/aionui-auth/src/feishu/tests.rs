@@ -137,6 +137,10 @@ async fn config_secret_is_encrypted_and_kept_when_blank() {
     let cfg = svc.resolved().await.unwrap();
     assert_eq!(cfg.public_base_url, "https://aidi.example.com");
     assert_eq!(cfg.app_secret, "s3cret");
+    assert!(
+        !format!("{cfg:?}").contains("s3cret"),
+        "Debug must not print the secret"
+    );
     assert_eq!(cfg.api_base, "https://open.feishu.cn");
     assert_eq!(cfg.accounts_base, "https://accounts.feishu.cn");
     assert_eq!(
@@ -199,6 +203,11 @@ fn state_cookie_round_trip_and_rejects_legacy_values() {
     assert_eq!(pkce::decode_state_cookie(""), None);
     assert_eq!(pkce::decode_state_cookie(&format!(".{verifier}")), None);
     assert_eq!(pkce::decode_state_cookie(&format!("{state}.short")), None);
+    assert_eq!(
+        pkce::decode_state_cookie(&format!("{state}.{verifier}x")),
+        None,
+        "verifier is always exactly 43 chars"
+    );
     assert_eq!(pkce::decode_state_cookie(&format!("{state}.{verifier}.x")), None);
 }
 

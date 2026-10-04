@@ -77,7 +77,10 @@ pub async fn resolve_account(
         .ok_or_else(|| server("account vanished"))?;
     match (account.status, account.last_login) {
         (UserStatus::Active, _) => Ok(account),
-        (UserStatus::Disabled, None) => Err(FeishuLoginError::PendingApproval),
+        (UserStatus::Disabled, None) => {
+            tracing::info!(user_id = %account.id, "feishu: account pending approval");
+            Err(FeishuLoginError::PendingApproval)
+        }
         (UserStatus::Disabled, Some(_)) => Err(FeishuLoginError::AccountDisabled),
     }
 }
@@ -108,7 +111,7 @@ async fn create(
             .await
         {
             Ok(created) => {
-                tracing::info!(user_id = %created.id, "feishu: account created");
+                tracing::info!(user_id = %created.id, status = status.as_str(), "feishu: account created");
                 return Ok(created);
             }
             Err(DbError::Conflict(_)) => {

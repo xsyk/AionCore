@@ -98,6 +98,10 @@ pub struct AdminUserView {
     pub is_super_admin: bool,
     /// How the account signs in: `password` or `feishu`.
     pub source: String,
+    /// Contact email (synced from Feishu when available); tells namesakes apart.
+    pub email: Option<String>,
+    /// Feishu avatar; `None` unless the stored value is an http(s) URL.
+    pub avatar_url: Option<String>,
 }
 
 /// `GET /api/auth/feishu/status` — whether the login page shows the Feishu
