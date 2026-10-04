@@ -100,10 +100,14 @@ pub struct AdminUserView {
     pub source: String,
 }
 
-/// `GET /api/auth/feishu/status` — whether the login page shows the Feishu button.
+/// `GET /api/auth/feishu/status` — whether the login page shows the Feishu
+/// button, and the site URL the login has to start from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeishuLoginStatus {
     pub enabled: bool,
+    /// Configured site URL while enabled, `None` otherwise. A login page served
+    /// from another address starts the flow there.
+    pub public_base_url: Option<String>,
 }
 
 /// `GET/PUT /api/admin/feishu-login` response. Never carries the app secret.
@@ -116,6 +120,8 @@ pub struct FeishuLoginConfigView {
     pub public_base_url: String,
     pub api_base: Option<String>,
     pub accounts_base: Option<String>,
+    /// `approval` (new Feishu users wait for a super admin) or `open`.
+    pub signup_policy: String,
     /// `<public_base_url>/api/auth/feishu/callback`, empty while the base URL is unset.
     pub callback_url: String,
 }
@@ -132,6 +138,9 @@ pub struct FeishuLoginConfigUpdate {
     pub api_base: Option<String>,
     #[serde(default)]
     pub accounts_base: Option<String>,
+    /// `approval` or `open`; absent keeps the stored policy.
+    #[serde(default)]
+    pub signup_policy: Option<String>,
     #[serde(default)]
     pub clear_tenant_key: bool,
 }

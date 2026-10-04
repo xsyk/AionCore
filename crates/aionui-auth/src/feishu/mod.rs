@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use aionui_api_types::{FeishuLoginConfigUpdate, FeishuLoginConfigView};
 use aionui_common::{decrypt_string, encrypt_string};
-use aionui_db::{FeishuLoginConfigRow, IFeishuLoginRepository};
+use aionui_db::{FeishuLoginConfigRow, FeishuSignupPolicy, IFeishuLoginRepository};
 
 pub const FEISHU_EXTERNAL_PREFIX: &str = "feishu:";
 pub const FEISHU_STATE_COOKIE: &str = "aionui-feishu-state";
@@ -34,6 +34,8 @@ pub enum FeishuLoginError {
     Tenant,
     #[error("account disabled")]
     AccountDisabled,
+    #[error("account pending approval")]
+    PendingApproval,
     #[error("feishu upstream: {0}")]
     Upstream(String),
     #[error("server: {0}")]
@@ -50,6 +52,7 @@ impl FeishuLoginError {
             Self::Cancelled => "cancelled",
             Self::Tenant => "tenant",
             Self::AccountDisabled => "account_disabled",
+            Self::PendingApproval => "pending",
             Self::Upstream(_) => "upstream",
             Self::Server(_) | Self::Invalid(_) => "server",
         }
@@ -65,6 +68,8 @@ pub struct ResolvedConfig {
     pub redirect_uri: String,
     pub api_base: String,
     pub accounts_base: String,
+    pub public_base_url: String,
+    pub signup_policy: FeishuSignupPolicy,
 }
 
 /// Feishu login service: config persistence (secret encrypted at rest),
@@ -121,6 +126,7 @@ impl FeishuLogin {
             public_base_url: row.public_base_url.clone(),
             api_base: row.api_base.clone(),
             accounts_base: row.accounts_base.clone(),
+            signup_policy: row.signup_policy.as_str().to_owned(),
             callback_url: callback_url(&row.public_base_url),
         }
     }
@@ -136,6 +142,11 @@ impl FeishuLogin {
             None => current.app_secret_enc.clone(),
         };
         let public_base_url = normalize_url("public_base_url", Some(&req.public_base_url))?.unwrap_or_default();
+        let signup_policy = match req.signup_policy.as_deref().map(str::trim) {
+            None => current.signup_policy,
+            Some(value) => FeishuSignupPolicy::parse(value)
+                .ok_or_else(|| FeishuLoginError::Invalid("signup_policy must be \"approval\" or \"open\"".into()))?,
+        };
         let row = FeishuLoginConfigRow {
             enabled: req.enabled,
             app_id: req.app_id.trim().to_owned(),
@@ -148,7 +159,7 @@ impl FeishuLogin {
             public_base_url,
             api_base: normalize_url("api_base", req.api_base.as_deref())?,
             accounts_base: normalize_url("accounts_base", req.accounts_base.as_deref())?,
-            signup_policy: current.signup_policy,
+            signup_policy,
             updated_at: 0,
         };
         if row.enabled && (row.app_id.is_empty() || row.app_secret_enc.is_none() || row.public_base_url.is_empty()) {
@@ -179,6 +190,8 @@ impl FeishuLogin {
             redirect_uri: callback_url(&row.public_base_url),
             api_base: row.api_base.unwrap_or_else(|| DEFAULT_API_BASE.to_owned()),
             accounts_base: row.accounts_base.unwrap_or_else(|| DEFAULT_ACCOUNTS_BASE.to_owned()),
+            signup_policy: row.signup_policy,
+            public_base_url: row.public_base_url,
             app_id: row.app_id,
         })
     }

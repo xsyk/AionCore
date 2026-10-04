@@ -112,7 +112,7 @@ async fn setup() -> Ctx {
     }
 }
 
-async fn configure(ctx: &Ctx) -> Resp {
+async fn configure(ctx: &Ctx, signup_policy: &str) -> Resp {
     call(
         &ctx.app,
         "PUT",
@@ -126,6 +126,7 @@ async fn configure(ctx: &Ctx) -> Resp {
             "public_base_url": "https://aidi.example.com",
             "api_base": ctx.feishu.uri(),
             "accounts_base": ctx.feishu.uri(),
+            "signup_policy": signup_policy,
         })),
     )
     .await
@@ -198,6 +199,7 @@ async fn disabled_by_default() {
     let status = call(&ctx.app, "GET", "/api/auth/feishu/status", None, None, None).await;
     assert_eq!(status.status, StatusCode::OK);
     assert_eq!(status.json["data"]["enabled"], false);
+    assert!(status.json["data"]["public_base_url"].is_null());
     let start = call(&ctx.app, "GET", "/api/auth/feishu/start", None, None, None).await;
     assert_eq!(start.status, StatusCode::FOUND);
     assert_eq!(start.location, "/#/login?feishu_error=disabled");
@@ -206,7 +208,7 @@ async fn disabled_by_default() {
 #[tokio::test]
 async fn admin_config_hides_secret_and_requires_super_admin() {
     let ctx = setup().await;
-    let put = configure(&ctx).await;
+    let put = configure(&ctx, "open").await;
     assert_eq!(put.status, StatusCode::OK, "{}", put.json);
     let get = call(&ctx.app, "GET", "/api/admin/feishu-login", Some(&ctx.admin), None, None).await;
     assert_eq!(get.json["data"]["app_secret_set"], true);
@@ -262,7 +264,10 @@ async fn admin_config_hides_secret_and_requires_super_admin() {
 #[tokio::test]
 async fn start_uses_pkce_and_callback_posts_v3_form() {
     let ctx = setup().await;
-    configure(&ctx).await;
+    configure(&ctx, "open").await;
+    let status = call(&ctx.app, "GET", "/api/auth/feishu/status", None, None, None).await;
+    assert_eq!(status.json["data"]["enabled"], true);
+    assert_eq!(status.json["data"]["public_base_url"], "https://aidi.example.com");
     let start = call(&ctx.app, "GET", "/api/auth/feishu/start", None, None, None).await;
     let cookie = cookie_value(&start.cookies, "aionui-feishu-state").unwrap();
     let (state, verifier) = cookie.split_once('.').expect("state.verifier cookie");
@@ -320,7 +325,7 @@ async fn start_uses_pkce_and_callback_posts_v3_form() {
 #[tokio::test]
 async fn first_login_creates_account_and_second_reuses_it() {
     let ctx = setup().await;
-    configure(&ctx).await;
+    configure(&ctx, "open").await;
     mock_feishu(&ctx, "c1", "on_zhang", "张三", "tenant_a").await;
     let cb = feishu_login(&ctx, "c1").await;
     assert_eq!(cb.status, StatusCode::FOUND);
@@ -351,7 +356,7 @@ async fn first_login_creates_account_and_second_reuses_it() {
 #[tokio::test]
 async fn rejects_bad_state_missing_code_and_foreign_tenant() {
     let ctx = setup().await;
-    configure(&ctx).await;
+    configure(&ctx, "open").await;
     let forged = call(
         &ctx.app,
         "GET",
@@ -402,7 +407,7 @@ async fn rejects_bad_state_missing_code_and_foreign_tenant() {
 #[tokio::test]
 async fn disabled_and_deleted_accounts() {
     let ctx = setup().await;
-    configure(&ctx).await;
+    configure(&ctx, "open").await;
     mock_feishu(&ctx, "c1", "on_li", "李四", "t").await;
     let cb = feishu_login(&ctx, "c1").await;
     let id = me(&ctx, &cb).await["id"].as_str().unwrap().to_owned();
@@ -442,7 +447,7 @@ async fn disabled_and_deleted_accounts() {
 #[tokio::test]
 async fn namesakes_get_distinct_usernames_and_upstream_errors_map() {
     let ctx = setup().await;
-    configure(&ctx).await;
+    configure(&ctx, "open").await;
     mock_feishu(&ctx, "c1", "on_w0001", "王五", "t").await;
     mock_feishu(&ctx, "c2", "on_w0002", "王五", "t").await;
     let first = feishu_login(&ctx, "c1").await;
@@ -454,4 +459,98 @@ async fn namesakes_get_distinct_usernames_and_upstream_errors_map() {
         feishu_login(&ctx, "nope").await.location,
         "/#/login?feishu_error=upstream"
     );
+}
+
+async fn user_row(ctx: &Ctx, username: &str) -> serde_json::Value {
+    let users = call(&ctx.app, "GET", "/api/admin/users", Some(&ctx.admin), None, None).await;
+    users.json["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["username"] == username)
+        .cloned()
+        .expect("listed")
+}
+
+#[tokio::test]
+async fn approval_policy_gates_first_login() {
+    let ctx = setup().await;
+    let put = configure(&ctx, "approval").await;
+    assert_eq!(put.json["data"]["signup_policy"], "approval");
+    mock_feishu(&ctx, "c1", "on_new", "新人", "t").await;
+    let first = feishu_login(&ctx, "c1").await;
+    assert_eq!(first.location, "/#/login?feishu_error=pending");
+    assert!(cookie_value(&first.cookies, "aionui-session").is_none());
+    let row = user_row(&ctx, "新人").await;
+    assert_eq!(row["status"], "disabled");
+    assert!(row["last_login"].is_null());
+    assert_eq!(row["source"], "feishu");
+    assert_eq!(feishu_login(&ctx, "c1").await.location, "/#/login?feishu_error=pending");
+    let id = row["id"].as_str().unwrap().to_owned();
+    let enabled = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/admin/users/{id}/enable"),
+        Some(&ctx.admin),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(enabled.status, StatusCode::OK);
+    let ok = feishu_login(&ctx, "c1").await;
+    assert_eq!(ok.location, "/#/guid");
+    assert_eq!(me(&ctx, &ok).await["id"], id.as_str());
+    let disabled = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/admin/users/{id}/disable"),
+        Some(&ctx.admin),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(disabled.status, StatusCode::OK);
+    assert_eq!(
+        feishu_login(&ctx, "c1").await.location,
+        "/#/login?feishu_error=account_disabled"
+    );
+}
+
+#[tokio::test]
+async fn signup_policy_is_configurable_and_validated() {
+    let ctx = setup().await;
+    let get = call(&ctx.app, "GET", "/api/admin/feishu-login", Some(&ctx.admin), None, None).await;
+    assert_eq!(get.json["data"]["signup_policy"], "approval");
+    assert_eq!(configure(&ctx, "open").await.json["data"]["signup_policy"], "open");
+    let base = serde_json::json!({
+        "enabled": true,
+        "app_id": "cli_test",
+        "public_base_url": "https://aidi.example.com",
+    });
+    let kept = call(
+        &ctx.app,
+        "PUT",
+        "/api/admin/feishu-login",
+        Some(&ctx.admin),
+        None,
+        Some(base.clone()),
+    )
+    .await;
+    assert_eq!(kept.status, StatusCode::OK, "{}", kept.json);
+    assert_eq!(
+        kept.json["data"]["signup_policy"], "open",
+        "absent keeps the stored policy"
+    );
+    let mut bad = base;
+    bad["signup_policy"] = serde_json::json!("anyone");
+    let bad = call(
+        &ctx.app,
+        "PUT",
+        "/api/admin/feishu-login",
+        Some(&ctx.admin),
+        None,
+        Some(bad),
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
 }

@@ -77,11 +77,14 @@ fn login_error(state: &AuthRouterState, err: &FeishuLoginError) -> Response {
 }
 
 async fn status(State(state): State<AuthRouterState>) -> Json<ApiResponse<FeishuLoginStatus>> {
-    let enabled = match service(&state) {
-        Some(svc) => svc.resolved().await.is_ok(),
-        None => false,
+    let public_base_url = match service(&state) {
+        Some(svc) => svc.resolved().await.ok().map(|cfg| cfg.public_base_url),
+        None => None,
     };
-    Json(ApiResponse::ok(FeishuLoginStatus { enabled }))
+    Json(ApiResponse::ok(FeishuLoginStatus {
+        enabled: public_base_url.is_some(),
+        public_base_url,
+    }))
 }
 
 async fn start(State(state): State<AuthRouterState>) -> Response {
@@ -138,7 +141,7 @@ async fn finish_login(
     let code = q.code.filter(|c| !c.is_empty()).ok_or(FeishuLoginError::Cancelled)?;
     let feishu_user = svc.exchange_and_fetch(&cfg, &code, verifier).await?;
     svc.check_tenant(&cfg, &feishu_user.tenant_key).await?;
-    let user = account::resolve_account(state.user_repo.as_ref(), &feishu_user).await?;
+    let user = account::resolve_account(state.user_repo.as_ref(), &feishu_user, cfg.signup_policy).await?;
     let (_, [session, refresh]) =
         issue_session_cookies(state, &user).map_err(|e| FeishuLoginError::Server(e.to_string()))?;
     if let Err(e) = state.user_repo.update_last_login(&user.id).await {

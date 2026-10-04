@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_api_types::FeishuLoginConfigUpdate;
-use aionui_db::{IUserRepository, SqliteFeishuLoginRepository, SqliteUserRepository, UserStatus};
+use aionui_db::{FeishuSignupPolicy, IUserRepository, SqliteFeishuLoginRepository, SqliteUserRepository, UserStatus};
 
 use super::account::{resolve_account, truncate_bytes, username_candidates};
 use super::client::FeishuUser;
@@ -37,6 +37,7 @@ fn update(enabled: bool, secret: Option<&str>) -> FeishuLoginConfigUpdate {
         public_base_url: "https://aidi.example.com/".into(),
         api_base: None,
         accounts_base: None,
+        signup_policy: None,
         clear_tenant_key: false,
     }
 }
@@ -74,24 +75,33 @@ fn username_candidates_fallbacks() {
 #[tokio::test]
 async fn resolve_account_creates_reuses_and_rejects() {
     let (users, _svc, _db) = repos().await;
-    let a = resolve_account(users.as_ref(), &user("on_1111", "张三")).await.unwrap();
+    let a = resolve_account(users.as_ref(), &user("on_1111", "张三"), FeishuSignupPolicy::Open)
+        .await
+        .unwrap();
     assert_eq!(a.username.as_deref(), Some("张三"));
     assert_eq!(a.external_user_id.as_deref(), Some("feishu:on_1111"));
     // same person again -> same account
-    let again = resolve_account(users.as_ref(), &user("on_1111", "张三")).await.unwrap();
+    let again = resolve_account(users.as_ref(), &user("on_1111", "张三"), FeishuSignupPolicy::Open)
+        .await
+        .unwrap();
     assert_eq!(again.id, a.id);
     // namesake -> suffixed username
-    let b = resolve_account(users.as_ref(), &user("on_2222", "张三")).await.unwrap();
+    let b = resolve_account(users.as_ref(), &user("on_2222", "张三"), FeishuSignupPolicy::Open)
+        .await
+        .unwrap();
     assert_eq!(b.username.as_deref(), Some("张三-2222"));
-    // disabled -> rejected
+    // disabled after a successful login -> rejected
+    users.update_last_login(&a.id).await.unwrap();
     users.set_status(&a.id, UserStatus::Disabled).await.unwrap();
-    let err = resolve_account(users.as_ref(), &user("on_1111", "张三"))
+    let err = resolve_account(users.as_ref(), &user("on_1111", "张三"), FeishuSignupPolicy::Open)
         .await
         .unwrap_err();
     assert!(matches!(err, FeishuLoginError::AccountDisabled));
     // soft-deleted -> fresh account
     users.soft_delete(&a.id).await.unwrap();
-    let c = resolve_account(users.as_ref(), &user("on_1111", "张三")).await.unwrap();
+    let c = resolve_account(users.as_ref(), &user("on_1111", "张三"), FeishuSignupPolicy::Open)
+        .await
+        .unwrap();
     assert_ne!(c.id, a.id);
     assert_eq!(c.status, UserStatus::Active);
 }
@@ -101,11 +111,15 @@ async fn resolve_account_skips_taken_email() {
     let (users, _svc, _db) = repos().await;
     let mut first = user("on_a", "A");
     first.email = Some("same@corp.com".into());
-    let a = resolve_account(users.as_ref(), &first).await.unwrap();
+    let a = resolve_account(users.as_ref(), &first, FeishuSignupPolicy::Open)
+        .await
+        .unwrap();
     assert_eq!(a.email.as_deref(), Some("same@corp.com"));
     let mut second = user("on_b", "B");
     second.email = Some("same@corp.com".into());
-    let b = resolve_account(users.as_ref(), &second).await.unwrap();
+    let b = resolve_account(users.as_ref(), &second, FeishuSignupPolicy::Open)
+        .await
+        .unwrap();
     assert!(b.email.is_none(), "taken email must not block login");
 }
 
@@ -121,6 +135,7 @@ async fn config_secret_is_encrypted_and_kept_when_blank() {
     // blank secret keeps the stored one
     svc.update(update(true, Some(""))).await.unwrap();
     let cfg = svc.resolved().await.unwrap();
+    assert_eq!(cfg.public_base_url, "https://aidi.example.com");
     assert_eq!(cfg.app_secret, "s3cret");
     assert_eq!(cfg.api_base, "https://open.feishu.cn");
     assert_eq!(cfg.accounts_base, "https://accounts.feishu.cn");
@@ -185,4 +200,55 @@ fn state_cookie_round_trip_and_rejects_legacy_values() {
     assert_eq!(pkce::decode_state_cookie(&format!(".{verifier}")), None);
     assert_eq!(pkce::decode_state_cookie(&format!("{state}.short")), None);
     assert_eq!(pkce::decode_state_cookie(&format!("{state}.{verifier}.x")), None);
+}
+
+#[tokio::test]
+async fn approval_policy_creates_pending_accounts() {
+    let (users, _svc, _db) = repos().await;
+    let mut newbie = user("on_new", "新人");
+    newbie.email = Some("new@corp.com".into());
+    let err = resolve_account(users.as_ref(), &newbie, FeishuSignupPolicy::Approval)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FeishuLoginError::PendingApproval));
+    let created = users
+        .find_live_local_by_external_id("feishu:on_new")
+        .await
+        .unwrap()
+        .expect("account created");
+    assert_eq!(created.status, UserStatus::Disabled);
+    assert_eq!(
+        created.email.as_deref(),
+        Some("new@corp.com"),
+        "profile refreshed while pending"
+    );
+    // still pending on the next attempt, whatever the current policy
+    let err = resolve_account(users.as_ref(), &newbie, FeishuSignupPolicy::Open)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FeishuLoginError::PendingApproval));
+    // enabled by the admin -> admitted
+    users.set_status(&created.id, UserStatus::Active).await.unwrap();
+    let ok = resolve_account(users.as_ref(), &newbie, FeishuSignupPolicy::Approval)
+        .await
+        .unwrap();
+    assert_eq!(ok.id, created.id);
+}
+
+#[tokio::test]
+async fn signup_policy_defaults_to_approval_and_validates() {
+    let (_users, svc, _db) = repos().await;
+    assert_eq!(svc.view().await.unwrap().signup_policy, "approval");
+    let mut open = update(true, Some("s"));
+    open.signup_policy = Some("open".into());
+    assert_eq!(svc.update(open).await.unwrap().signup_policy, "open");
+    assert_eq!(svc.resolved().await.unwrap().signup_policy, FeishuSignupPolicy::Open);
+    // absent keeps the stored policy
+    assert_eq!(svc.update(update(true, None)).await.unwrap().signup_policy, "open");
+    let mut bad = update(true, None);
+    bad.signup_policy = Some("anyone".into());
+    assert!(matches!(
+        svc.update(bad).await.unwrap_err(),
+        FeishuLoginError::Invalid(_)
+    ));
 }

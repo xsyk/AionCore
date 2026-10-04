@@ -1,6 +1,6 @@
 //! Feishu identity → local account mapping.
 
-use aionui_db::{DbError, IUserRepository, UserStatus, models::User};
+use aionui_db::{DbError, FeishuSignupPolicy, IUserRepository, UserStatus, models::User};
 
 use super::client::FeishuUser;
 use super::{FEISHU_EXTERNAL_PREFIX, FeishuLoginError};
@@ -50,10 +50,16 @@ fn server(e: impl std::fmt::Display) -> FeishuLoginError {
     FeishuLoginError::Server(e.to_string())
 }
 
-/// Find the live account for this Feishu identity or create one; refresh profile.
+/// Find the live account for this Feishu identity or create one under
+/// `policy`; refresh the profile, then admit only active accounts.
 ///
 /// A soft-deleted account is never revived: the identity gets a fresh account.
-pub async fn resolve_account(repo: &dyn IUserRepository, user: &FeishuUser) -> Result<User, FeishuLoginError> {
+/// A disabled account that never logged in is still waiting for approval.
+pub async fn resolve_account(
+    repo: &dyn IUserRepository,
+    user: &FeishuUser,
+    policy: FeishuSignupPolicy,
+) -> Result<User, FeishuLoginError> {
     let external_id = format!("{FEISHU_EXTERNAL_PREFIX}{}", user.union_id);
     let account = match repo
         .find_live_local_by_external_id(&external_id)
@@ -61,19 +67,34 @@ pub async fn resolve_account(repo: &dyn IUserRepository, user: &FeishuUser) -> R
         .map_err(server)?
     {
         Some(existing) => existing,
-        None => create(repo, &external_id, user).await?,
+        None => create(repo, &external_id, user, initial_status(policy)).await?,
     };
-    if account.status != UserStatus::Active {
-        return Err(FeishuLoginError::AccountDisabled);
-    }
     refresh_profile(repo, &account, user).await;
-    repo.find_by_id(&account.id)
+    let account = repo
+        .find_by_id(&account.id)
         .await
         .map_err(server)?
-        .ok_or_else(|| server("account vanished"))
+        .ok_or_else(|| server("account vanished"))?;
+    match (account.status, account.last_login) {
+        (UserStatus::Active, _) => Ok(account),
+        (UserStatus::Disabled, None) => Err(FeishuLoginError::PendingApproval),
+        (UserStatus::Disabled, Some(_)) => Err(FeishuLoginError::AccountDisabled),
+    }
 }
 
-async fn create(repo: &dyn IUserRepository, external_id: &str, user: &FeishuUser) -> Result<User, FeishuLoginError> {
+fn initial_status(policy: FeishuSignupPolicy) -> UserStatus {
+    match policy {
+        FeishuSignupPolicy::Approval => UserStatus::Disabled,
+        FeishuSignupPolicy::Open => UserStatus::Active,
+    }
+}
+
+async fn create(
+    repo: &dyn IUserRepository,
+    external_id: &str,
+    user: &FeishuUser,
+    status: UserStatus,
+) -> Result<User, FeishuLoginError> {
     // Nobody knows this password: Feishu users sign in through Feishu only,
     // unless the super admin later resets a password for them.
     let secret = generate_password(32);
@@ -83,7 +104,7 @@ async fn create(repo: &dyn IUserRepository, external_id: &str, user: &FeishuUser
         .map_err(server)?;
     for candidate in username_candidates(user) {
         match repo
-            .create_external_local_user(external_id, &candidate, &hash, UserStatus::Active)
+            .create_external_local_user(external_id, &candidate, &hash, status)
             .await
         {
             Ok(created) => {
