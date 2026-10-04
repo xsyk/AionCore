@@ -21,6 +21,7 @@ struct TokenResponse {
     #[serde(default)]
     code: i64,
     access_token: Option<String>,
+    error: Option<String>,
     error_description: Option<String>,
 }
 
@@ -51,24 +52,31 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
-/// `POST {api_base}/open-apis/authen/v2/oauth/token` → user access token.
+/// Form fields for the v3 token endpoint.
+pub struct TokenRequest<'a> {
+    pub app_id: &'a str,
+    pub app_secret: &'a str,
+    pub code: &'a str,
+    pub redirect_uri: &'a str,
+    pub code_verifier: &'a str,
+}
+
+/// `POST {accounts_base}/oauth/v3/token` (form-encoded, PKCE) → user access token.
 pub async fn exchange_code(
     http: &reqwest::Client,
-    api_base: &str,
-    app_id: &str,
-    app_secret: &str,
-    code: &str,
-    redirect_uri: &str,
+    accounts_base: &str,
+    req: &TokenRequest<'_>,
 ) -> Result<String, FeishuLoginError> {
     let resp = http
-        .post(format!("{api_base}/open-apis/authen/v2/oauth/token"))
-        .json(&serde_json::json!({
-            "grant_type": "authorization_code",
-            "client_id": app_id,
-            "client_secret": app_secret,
-            "code": code,
-            "redirect_uri": redirect_uri,
-        }))
+        .post(format!("{accounts_base}/oauth/v3/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", req.app_id),
+            ("client_secret", req.app_secret),
+            ("code", req.code),
+            ("redirect_uri", req.redirect_uri),
+            ("code_verifier", req.code_verifier),
+        ])
         .send()
         .await
         .map_err(|e| FeishuLoginError::Upstream(format!("token request failed: {e}")))?;
@@ -80,8 +88,9 @@ pub async fn exchange_code(
     match body.access_token {
         Some(token) if body.code == 0 && !token.is_empty() => Ok(token),
         _ => Err(FeishuLoginError::Upstream(format!(
-            "token rejected ({status}, code {}): {}",
+            "token rejected ({status}, code {}, {}): {}",
             body.code,
+            body.error.unwrap_or_default(),
             body.error_description.unwrap_or_default()
         ))),
     }

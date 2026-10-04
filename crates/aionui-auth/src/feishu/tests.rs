@@ -5,7 +5,7 @@ use aionui_db::{IUserRepository, SqliteFeishuLoginRepository, SqliteUserReposito
 
 use super::account::{resolve_account, truncate_bytes, username_candidates};
 use super::client::FeishuUser;
-use super::{FeishuLogin, FeishuLoginError};
+use super::{FeishuLogin, FeishuLoginError, pkce};
 
 fn user(union_id: &str, name: &str) -> FeishuUser {
     FeishuUser {
@@ -125,8 +125,8 @@ async fn config_secret_is_encrypted_and_kept_when_blank() {
     assert_eq!(cfg.api_base, "https://open.feishu.cn");
     assert_eq!(cfg.accounts_base, "https://accounts.feishu.cn");
     assert_eq!(
-        FeishuLogin::authorize_url(&cfg, "st"),
-        "https://accounts.feishu.cn/open-apis/authen/v1/authorize?client_id=cli_a&response_type=code&redirect_uri=https%3A%2F%2Faidi.example.com%2Fapi%2Fauth%2Ffeishu%2Fcallback&state=st"
+        FeishuLogin::authorize_url(&cfg, "st", "ch"),
+        "https://accounts.feishu.cn/open-apis/authen/v1/authorize?client_id=cli_a&response_type=code&redirect_uri=https%3A%2F%2Faidi.example.com%2Fapi%2Fauth%2Ffeishu%2Fcallback&state=st&code_challenge=ch&code_challenge_method=S256"
     );
 }
 
@@ -159,4 +159,30 @@ async fn tenant_locks_on_first_login() {
     let mut clear = update(true, None);
     clear.clear_tenant_key = true;
     assert!(svc.update(clear).await.unwrap().tenant_key.is_none());
+}
+
+#[test]
+fn pkce_challenge_matches_rfc7636_appendix_b() {
+    assert_eq!(
+        pkce::challenge_s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    );
+}
+
+#[test]
+fn state_cookie_round_trip_and_rejects_legacy_values() {
+    let state = pkce::random_token().unwrap();
+    let verifier = pkce::random_token().unwrap();
+    assert_eq!(state.len(), 43);
+    assert_eq!(verifier.len(), 43);
+    let cookie = pkce::encode_state_cookie(&state, &verifier);
+    assert_eq!(
+        pkce::decode_state_cookie(&cookie),
+        Some((state.as_str(), verifier.as_str()))
+    );
+    assert_eq!(pkce::decode_state_cookie(&state), None, "pre-PKCE cookie");
+    assert_eq!(pkce::decode_state_cookie(""), None);
+    assert_eq!(pkce::decode_state_cookie(&format!(".{verifier}")), None);
+    assert_eq!(pkce::decode_state_cookie(&format!("{state}.short")), None);
+    assert_eq!(pkce::decode_state_cookie(&format!("{state}.{verifier}.x")), None);
 }

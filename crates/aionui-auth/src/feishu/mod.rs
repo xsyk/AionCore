@@ -3,6 +3,7 @@
 
 pub mod account;
 pub mod client;
+pub mod pkce;
 pub(crate) mod routes;
 #[cfg(test)]
 mod tests;
@@ -182,7 +183,7 @@ impl FeishuLogin {
         })
     }
 
-    pub fn authorize_url(cfg: &ResolvedConfig, state: &str) -> String {
+    pub fn authorize_url(cfg: &ResolvedConfig, state: &str, code_challenge: &str) -> String {
         let base = format!("{}/open-apis/authen/v1/authorize", cfg.accounts_base);
         reqwest::Url::parse_with_params(
             &base,
@@ -191,6 +192,8 @@ impl FeishuLogin {
                 ("response_type", "code"),
                 ("redirect_uri", cfg.redirect_uri.as_str()),
                 ("state", state),
+                ("code_challenge", code_challenge),
+                ("code_challenge_method", "S256"),
             ],
         )
         .map(String::from)
@@ -201,14 +204,18 @@ impl FeishuLogin {
         &self,
         cfg: &ResolvedConfig,
         code: &str,
+        code_verifier: &str,
     ) -> Result<client::FeishuUser, FeishuLoginError> {
         let token = client::exchange_code(
             &self.http,
-            &cfg.api_base,
-            &cfg.app_id,
-            &cfg.app_secret,
-            code,
-            &cfg.redirect_uri,
+            &cfg.accounts_base,
+            &client::TokenRequest {
+                app_id: &cfg.app_id,
+                app_secret: &cfg.app_secret,
+                code,
+                redirect_uri: &cfg.redirect_uri,
+                code_verifier,
+            },
         )
         .await?;
         client::fetch_user(&self.http, &cfg.api_base, &token).await

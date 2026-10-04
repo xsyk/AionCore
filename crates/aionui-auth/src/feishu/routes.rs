@@ -11,13 +11,12 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use base64::Engine;
 use serde::Deserialize;
 
 use aionui_api_types::{ApiResponse, FeishuLoginConfigUpdate, FeishuLoginConfigView, FeishuLoginStatus};
 use aionui_common::ApiError;
 
-use super::{FEISHU_STATE_COOKIE, FeishuLogin, FeishuLoginError, account};
+use super::{FEISHU_STATE_COOKIE, FeishuLogin, FeishuLoginError, account, pkce};
 use crate::admin_routes::require_super_admin;
 use crate::extract::extract_cookie_value;
 use crate::middleware::RealUser;
@@ -93,14 +92,16 @@ async fn start(State(state): State<AuthRouterState>) -> Response {
         Ok(cfg) => cfg,
         Err(err) => return login_error(&state, &err),
     };
-    let mut raw = [0u8; 32];
-    if getrandom::getrandom(&mut raw).is_err() {
+    let (Some(nonce), Some(verifier)) = (pkce::random_token(), pkce::random_token()) else {
         return login_error(&state, &FeishuLoginError::Server("entropy unavailable".into()));
-    }
-    let nonce = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
+    };
     redirect(
-        &FeishuLogin::authorize_url(&cfg, &nonce),
-        &[state_cookie(&state, &nonce, STATE_MAX_AGE_SECS)],
+        &FeishuLogin::authorize_url(&cfg, &nonce, &pkce::challenge_s256(&verifier)),
+        &[state_cookie(
+            &state,
+            &pkce::encode_state_cookie(&nonce, &verifier),
+            STATE_MAX_AGE_SECS,
+        )],
     )
 }
 
@@ -128,13 +129,14 @@ async fn finish_login(
 ) -> Result<Vec<String>, FeishuLoginError> {
     let svc = service(state).ok_or(FeishuLoginError::Disabled)?;
     let cfg = svc.resolved().await?;
-    let expected = extract_cookie_value(headers, FEISHU_STATE_COOKIE).unwrap_or_default();
+    let raw = extract_cookie_value(headers, FEISHU_STATE_COOKIE).unwrap_or_default();
+    let (expected, verifier) = pkce::decode_state_cookie(&raw).ok_or(FeishuLoginError::State)?;
     let got = q.state.unwrap_or_default();
-    if expected.is_empty() || !constant_time_eq(expected.as_bytes(), got.as_bytes()) {
+    if !constant_time_eq(expected.as_bytes(), got.as_bytes()) {
         return Err(FeishuLoginError::State);
     }
     let code = q.code.filter(|c| !c.is_empty()).ok_or(FeishuLoginError::Cancelled)?;
-    let feishu_user = svc.exchange_and_fetch(&cfg, &code).await?;
+    let feishu_user = svc.exchange_and_fetch(&cfg, &code, verifier).await?;
     svc.check_tenant(&cfg, &feishu_user.tenant_key).await?;
     let user = account::resolve_account(state.user_repo.as_ref(), &feishu_user).await?;
     let (_, [session, refresh]) =

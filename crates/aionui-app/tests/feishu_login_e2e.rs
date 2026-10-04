@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
-use wiremock::matchers::{body_partial_json, header as has_header, method, path};
+use wiremock::matchers::{body_string_contains, header as has_header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use aionui_app::{AppConfig, AppServices};
@@ -135,10 +135,12 @@ async fn configure(ctx: &Ctx) -> Resp {
 async fn mock_feishu(ctx: &Ctx, code: &str, union_id: &str, name: &str, tenant: &str) {
     let token = format!("u-token-{code}");
     Mock::given(method("POST"))
-        .and(path("/open-apis/authen/v2/oauth/token"))
-        .and(body_partial_json(
-            serde_json::json!({"code": code, "client_id": "cli_test", "client_secret": "sec_test"}),
-        ))
+        .and(path("/oauth/v3/token"))
+        .and(has_header("content-type", "application/x-www-form-urlencoded"))
+        .and(body_string_contains(format!("&code={code}&")))
+        .and(body_string_contains("client_id=cli_test"))
+        .and(body_string_contains("client_secret=sec_test"))
+        .and(body_string_contains("code_verifier="))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"code": 0, "access_token": token, "expires_in": 7200})),
@@ -169,13 +171,14 @@ async fn mock_feishu(ctx: &Ctx, code: &str, union_id: &str, name: &str, tenant: 
 async fn feishu_login(ctx: &Ctx, code: &str) -> Resp {
     let start = call(&ctx.app, "GET", "/api/auth/feishu/start", None, None, None).await;
     assert_eq!(start.status, StatusCode::FOUND);
-    let state = cookie_value(&start.cookies, "aionui-feishu-state").expect("state cookie");
+    let cookie = cookie_value(&start.cookies, "aionui-feishu-state").expect("state cookie");
+    let (state, _verifier) = cookie.split_once('.').expect("state.verifier cookie");
     call(
         &ctx.app,
         "GET",
         &format!("/api/auth/feishu/callback?code={code}&state={state}"),
         None,
-        Some(&format!("aionui-feishu-state={state}")),
+        Some(&format!("aionui-feishu-state={cookie}")),
         None,
     )
     .await
@@ -257,13 +260,12 @@ async fn admin_config_hides_secret_and_requires_super_admin() {
 }
 
 #[tokio::test]
-async fn start_redirects_to_feishu_with_state() {
+async fn start_uses_pkce_and_callback_posts_v3_form() {
     let ctx = setup().await;
     configure(&ctx).await;
-    let status = call(&ctx.app, "GET", "/api/auth/feishu/status", None, None, None).await;
-    assert_eq!(status.json["data"]["enabled"], true);
     let start = call(&ctx.app, "GET", "/api/auth/feishu/start", None, None, None).await;
-    let state = cookie_value(&start.cookies, "aionui-feishu-state").unwrap();
+    let cookie = cookie_value(&start.cookies, "aionui-feishu-state").unwrap();
+    let (state, verifier) = cookie.split_once('.').expect("state.verifier cookie");
     assert!(
         start.location.starts_with(&format!(
             "{}/open-apis/authen/v1/authorize?client_id=cli_test",
@@ -278,12 +280,41 @@ async fn start_redirects_to_feishu_with_state() {
             .location
             .contains("redirect_uri=https%3A%2F%2Faidi.example.com%2Fapi%2Fauth%2Ffeishu%2Fcallback")
     );
+    assert!(start.location.contains(&format!(
+        "code_challenge={}",
+        aionui_auth::feishu::pkce::challenge_s256(verifier)
+    )));
+    assert!(start.location.contains("code_challenge_method=S256"));
     let raw = start
         .cookies
         .iter()
         .find(|c| c.starts_with("aionui-feishu-state="))
         .unwrap();
     assert!(raw.contains("HttpOnly") && raw.contains("SameSite=Lax") && raw.contains("Path=/api/auth/feishu"));
+
+    mock_feishu(&ctx, "c1", "on_pk", "PK", "t").await;
+    let cb = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/auth/feishu/callback?code=c1&state={state}"),
+        None,
+        Some(&format!("aionui-feishu-state={cookie}")),
+        None,
+    )
+    .await;
+    assert_eq!(cb.location, "/#/guid");
+    let requests = ctx.feishu.received_requests().await.unwrap();
+    let token_req = requests
+        .iter()
+        .find(|r| r.url.path() == "/oauth/v3/token")
+        .expect("token request");
+    let body = String::from_utf8(token_req.body.clone()).unwrap();
+    assert!(body.contains("grant_type=authorization_code"), "{body}");
+    assert!(body.contains(&format!("code_verifier={verifier}")), "{body}");
+    assert!(
+        body.contains("redirect_uri=https%3A%2F%2Faidi.example.com%2Fapi%2Fauth%2Ffeishu%2Fcallback"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -341,16 +372,27 @@ async fn rejects_bad_state_missing_code_and_foreign_tenant() {
     )
     .await;
     assert_eq!(no_cookie.location, "/#/login?feishu_error=state");
+    let well_formed = format!("aionui-feishu-state=s.{}", "v".repeat(43));
     let cancelled = call(
         &ctx.app,
         "GET",
         "/api/auth/feishu/callback?state=s",
         None,
-        Some("aionui-feishu-state=s"),
+        Some(&well_formed),
         None,
     )
     .await;
     assert_eq!(cancelled.location, "/#/login?feishu_error=cancelled");
+    let legacy = call(
+        &ctx.app,
+        "GET",
+        "/api/auth/feishu/callback?code=c1&state=s",
+        None,
+        Some("aionui-feishu-state=s"),
+        None,
+    )
+    .await;
+    assert_eq!(legacy.location, "/#/login?feishu_error=state", "pre-PKCE cookie");
     mock_feishu(&ctx, "c1", "on_a", "A", "tenant_a").await;
     mock_feishu(&ctx, "c2", "on_b", "B", "tenant_other").await;
     assert_eq!(feishu_login(&ctx, "c1").await.location, "/#/guid");
