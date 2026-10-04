@@ -503,17 +503,19 @@ impl IUserRepository for SqliteUserRepository {
         external_user_id: &str,
         username: &str,
         password_hash: &str,
+        status: UserStatus,
     ) -> Result<User, DbError> {
         let id = aionui_common::generate_prefixed_id("user");
         let now = aionui_common::now_ms();
         sqlx::query(
             "INSERT INTO users (id, user_type, external_user_id, username, password_hash, status, session_generation, created_at, updated_at) \
-             VALUES (?, 'local', ?, ?, ?, 'active', 0, ?, ?)",
+             VALUES (?, 'local', ?, ?, ?, ?, 0, ?, ?)",
         )
         .bind(&id)
         .bind(external_user_id)
         .bind(username)
         .bind(password_hash)
+        .bind(status.as_str())
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -585,7 +587,7 @@ mod tests {
     async fn external_local_user_lifecycle() {
         let (repo, _db) = setup().await;
         let u = repo
-            .create_external_local_user("feishu:on_1", "张三", "h")
+            .create_external_local_user("feishu:on_1", "张三", "h", UserStatus::Active)
             .await
             .unwrap();
         assert_eq!(u.user_type, UserType::Local);
@@ -598,7 +600,7 @@ mod tests {
         assert_eq!(found.id, u.id);
         // username clash -> Conflict
         let err = repo
-            .create_external_local_user("feishu:on_2", "张三", "h")
+            .create_external_local_user("feishu:on_2", "张三", "h", UserStatus::Active)
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::Conflict(_)));
@@ -611,17 +613,34 @@ mod tests {
                 .is_none()
         );
         let again = repo
-            .create_external_local_user("feishu:on_1", "张三", "h")
+            .create_external_local_user("feishu:on_1", "张三", "h", UserStatus::Active)
             .await
             .unwrap();
         assert_ne!(again.id, u.id);
     }
 
     #[tokio::test]
+    async fn external_local_user_can_start_disabled() {
+        let (repo, _db) = setup().await;
+        let u = repo
+            .create_external_local_user("feishu:on_p", "待开通", "h", UserStatus::Disabled)
+            .await
+            .unwrap();
+        assert_eq!(u.status, UserStatus::Disabled);
+        assert!(u.last_login.is_none());
+    }
+
+    #[tokio::test]
     async fn update_profile_and_email_taken() {
         let (repo, _db) = setup().await;
-        let a = repo.create_external_local_user("feishu:a", "a", "h").await.unwrap();
-        let b = repo.create_external_local_user("feishu:b", "b", "h").await.unwrap();
+        let a = repo
+            .create_external_local_user("feishu:a", "a", "h", UserStatus::Active)
+            .await
+            .unwrap();
+        let b = repo
+            .create_external_local_user("feishu:b", "b", "h", UserStatus::Active)
+            .await
+            .unwrap();
         repo.update_profile(&a.id, Some("x@corp.com"), Some("https://img/a.png"))
             .await
             .unwrap();

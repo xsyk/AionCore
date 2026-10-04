@@ -147,6 +147,7 @@ impl FeishuLogin {
             public_base_url,
             api_base: normalize_url("api_base", req.api_base.as_deref())?,
             accounts_base: normalize_url("accounts_base", req.accounts_base.as_deref())?,
+            signup_policy: current.signup_policy,
             updated_at: 0,
         };
         if row.enabled && (row.app_id.is_empty() || row.app_secret_enc.is_none() || row.public_base_url.is_empty()) {

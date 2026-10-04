@@ -118,13 +118,15 @@ pub trait IUserRepository: Send + Sync {
     /// (e.g. `feishu:<union_id>`). Ignores status, so disabled users are returned.
     async fn find_live_local_by_external_id(&self, external_user_id: &str) -> Result<Option<User>, DbError>;
 
-    /// Creates a local user bound to an external identity. `DbError::Conflict`
-    /// on a username or external-identity clash among live rows.
+    /// Creates a local user bound to an external identity with the given
+    /// status. `DbError::Conflict` on a username or external-identity clash
+    /// among live rows.
     async fn create_external_local_user(
         &self,
         external_user_id: &str,
         username: &str,
         password_hash: &str,
+        status: UserStatus,
     ) -> Result<User, DbError>;
 
     /// Updates email / avatar; `None` keeps the current value.

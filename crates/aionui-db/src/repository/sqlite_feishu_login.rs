@@ -4,8 +4,8 @@ use crate::error::DbError;
 use crate::models::FeishuLoginConfigRow;
 use crate::repository::feishu_login::IFeishuLoginRepository;
 
-const COLUMNS: &str =
-    "enabled, app_id, app_secret_enc, tenant_key, public_base_url, api_base, accounts_base, updated_at";
+const COLUMNS: &str = "enabled, app_id, app_secret_enc, tenant_key, public_base_url, api_base, accounts_base, \
+     signup_policy, updated_at";
 
 /// SQLite-backed implementation of [`IFeishuLoginRepository`].
 #[derive(Clone, Debug)]
@@ -33,12 +33,14 @@ impl IFeishuLoginRepository for SqliteFeishuLoginRepository {
     async fn save(&self, row: &FeishuLoginConfigRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO feishu_login_config \
-                (id, enabled, app_id, app_secret_enc, tenant_key, public_base_url, api_base, accounts_base, updated_at) \
-             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?) \
+                (id, enabled, app_id, app_secret_enc, tenant_key, public_base_url, api_base, accounts_base, \
+                 signup_policy, updated_at) \
+             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
                 enabled = excluded.enabled, app_id = excluded.app_id, app_secret_enc = excluded.app_secret_enc, \
                 tenant_key = excluded.tenant_key, public_base_url = excluded.public_base_url, \
-                api_base = excluded.api_base, accounts_base = excluded.accounts_base, updated_at = excluded.updated_at",
+                api_base = excluded.api_base, accounts_base = excluded.accounts_base, \
+                signup_policy = excluded.signup_policy, updated_at = excluded.updated_at",
         )
         .bind(row.enabled)
         .bind(&row.app_id)
@@ -47,6 +49,7 @@ impl IFeishuLoginRepository for SqliteFeishuLoginRepository {
         .bind(&row.public_base_url)
         .bind(&row.api_base)
         .bind(&row.accounts_base)
+        .bind(row.signup_policy.as_str())
         .bind(aionui_common::now_ms())
         .execute(&self.pool)
         .await?;
@@ -96,5 +99,29 @@ mod tests {
         .unwrap();
         repo.set_tenant_key(None).await.unwrap();
         assert!(repo.get().await.unwrap().unwrap().tenant_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn signup_policy_defaults_to_approval_and_round_trips() {
+        use crate::models::FeishuSignupPolicy;
+        let db = init_database_memory().await.unwrap();
+        // a row written before migration 047 knew about the column
+        sqlx::query("INSERT INTO feishu_login_config (id, updated_at) VALUES (1, 0)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let repo = SqliteFeishuLoginRepository::new(db.pool().clone());
+        let mut row = repo.get().await.unwrap().unwrap();
+        assert_eq!(row.signup_policy, FeishuSignupPolicy::Approval);
+        row.signup_policy = FeishuSignupPolicy::Open;
+        repo.save(&row).await.unwrap();
+        assert_eq!(
+            repo.get().await.unwrap().unwrap().signup_policy,
+            FeishuSignupPolicy::Open
+        );
+        let bad = sqlx::query("UPDATE feishu_login_config SET signup_policy = 'anyone' WHERE id = 1")
+            .execute(db.pool())
+            .await;
+        assert!(bad.is_err(), "CHECK constraint rejects unknown policies");
     }
 }

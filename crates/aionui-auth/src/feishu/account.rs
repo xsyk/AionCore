@@ -82,7 +82,10 @@ async fn create(repo: &dyn IUserRepository, external_id: &str, user: &FeishuUser
         .map_err(server)?
         .map_err(server)?;
     for candidate in username_candidates(user) {
-        match repo.create_external_local_user(external_id, &candidate, &hash).await {
+        match repo
+            .create_external_local_user(external_id, &candidate, &hash, UserStatus::Active)
+            .await
+        {
             Ok(created) => {
                 tracing::info!(user_id = %created.id, "feishu: account created");
                 return Ok(created);
