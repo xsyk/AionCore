@@ -40,6 +40,12 @@ pub trait IFileService: Send + Sync {
     /// of depth. `root` is the workspace root used to compute relative paths.
     async fn get_files_by_dir(&self, dir: &str, root: &str) -> Result<Vec<DirOrFile>, FileError>;
 
+    /// Create the single folder `name` inside the existing directory `parent`
+    /// and return the new folder's absolute path. `parent` is validated like
+    /// [`get_files_by_dir`](Self::get_files_by_dir)'s `dir`; `name` must be
+    /// one plain path component. A taken name fails with `Conflict`.
+    async fn create_dir(&self, parent: &str, name: &str) -> Result<String, FileError>;
+
     /// Recursively list all files under `root` as a flat list.
     /// Returns at most 20,000 entries.
     async fn list_workspace_files(&self, root: &str) -> Result<Vec<WorkspaceFlatFile>, FileError>;

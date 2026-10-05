@@ -366,6 +366,8 @@ fn file_error_to_api_error(error: FileError) -> ApiError {
             operation,
         },
         FileError::NotFound(message) => ApiError::NotFound(message),
+        // Not reachable from office path-validation; the mapping must be total.
+        FileError::Conflict(message) => ApiError::Conflict(message),
         FileError::Internal(message) => ApiError::Internal(message),
         // Not reachable from office path-validation; the mapping must be total.
         // Mirrors the file crate: the cause is logged at its origin, not forwarded.

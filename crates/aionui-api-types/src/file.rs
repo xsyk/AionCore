@@ -99,6 +99,15 @@ pub struct GetFilesByDirRequest {
     pub root: String,
 }
 
+/// Request body for `POST /api/fs/mkdir` — create one folder.
+#[derive(Debug, Deserialize)]
+pub struct CreateDirRequest {
+    /// Existing directory to create the folder in.
+    pub parent: String,
+    /// Name of the new folder: a single path component.
+    pub name: String,
+}
+
 /// Request body for `POST /api/fs/list` — list workspace files.
 #[derive(Debug, Deserialize)]
 pub struct ListWorkspaceFilesRequest {
@@ -210,6 +219,13 @@ pub struct DirOrFileResponse {
     pub is_file: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub children: Option<Vec<DirOrFileResponse>>,
+}
+
+/// Response for `POST /api/fs/mkdir`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CreateDirResponse {
+    /// Absolute path of the created folder.
+    pub path: String,
 }
 
 /// A flat file entry returned by `listWorkspaceFiles`.

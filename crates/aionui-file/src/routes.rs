@@ -12,8 +12,8 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeFile;
 
 use aionui_api_types::{
-    ApiResponse, ContentMetadataRequest, CopyFilesRequest, CopyFilesResponse, DirOrFileResponse,
-    FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, GetFileMetadataRequest,
+    ApiResponse, ContentMetadataRequest, CopyFilesRequest, CopyFilesResponse, CreateDirRequest, CreateDirResponse,
+    DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, GetFileMetadataRequest,
     GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest, OpenSystemFileRequest, ReadContentRequest,
     ReadFileRequest, RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest,
     SnapshotInfoResponse, SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery, WorkspaceFlatFileResponse,
@@ -48,6 +48,7 @@ impl From<FileError> for ApiError {
                 operation,
             },
             FileError::NotFound(message) => ApiError::NotFound(message),
+            FileError::Conflict(message) => ApiError::Conflict(message),
             FileError::Internal(message) => ApiError::Internal(message),
             // The cause was logged where it arose; it is not forwarded because it
             // comes from the shell layer and can quote subprocess stderr or a path.
@@ -131,6 +132,7 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/content/metadata", post(content_metadata))
         .route("/api/fs/stream", get(stream_file))
         .route("/api/fs/dir", post(get_files_by_dir))
+        .route("/api/fs/mkdir", post(create_directory))
         .route("/api/fs/list", post(list_workspace_files))
         .route("/api/fs/metadata", post(get_file_metadata))
         .route("/api/fs/read", post(read_file))
@@ -171,6 +173,17 @@ async fn get_files_by_dir(
     let items = state.file_service.get_files_by_dir(&req.dir, &req.root).await?;
     let response: Vec<DirOrFileResponse> = items.into_iter().map(to_dir_or_file_response).collect();
     Ok(Json(ApiResponse::ok(response)))
+}
+
+async fn create_directory(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<CreateDirRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<CreateDirResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let path = state.file_service.create_dir(&req.parent, &req.name).await?;
+    tracing::info!(user_id = %user.id, path = %path, "fs: folder created");
+    Ok(Json(ApiResponse::ok(CreateDirResponse { path })))
 }
 
 async fn list_workspace_files(

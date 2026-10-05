@@ -17,6 +17,10 @@ pub enum FileError {
     #[error("{0}")]
     NotFound(String),
 
+    /// The target already exists — e.g. creating a folder whose name is taken.
+    #[error("{0}")]
+    Conflict(String),
+
     #[error("{0}")]
     Internal(String),
 

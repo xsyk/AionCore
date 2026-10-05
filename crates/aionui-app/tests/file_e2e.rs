@@ -20,6 +20,7 @@ async fn fs_endpoints_require_auth() {
         "/api/fs/content",
         "/api/fs/content/metadata",
         "/api/fs/dir",
+        "/api/fs/mkdir",
         "/api/fs/list",
         "/api/fs/metadata",
         "/api/fs/read",
@@ -61,6 +62,63 @@ async fn fs_endpoints_require_auth() {
 // ===========================================================================
 // Directory browsing
 // ===========================================================================
+
+#[tokio::test]
+async fn mkdir_rejects_a_session_without_csrf_token() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/fs/mkdir")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "parent": dir.path().to_str().unwrap(), "name": "x" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["code"], "CSRF_INVALID");
+    assert!(!dir.path().join("x").exists(), "nothing may be created");
+}
+
+#[tokio::test]
+async fn mkdir_creates_a_folder_and_maps_errors_to_statuses() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().to_str().unwrap();
+    let mkdir = |parent: &str, name: &str| {
+        json_with_token(
+            "POST",
+            "/api/fs/mkdir",
+            json!({ "parent": parent, "name": name }),
+            &token,
+            &csrf,
+        )
+    };
+
+    let resp = app.clone().oneshot(mkdir(parent, "new-folder")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["success"], true);
+    let created = body["data"]["path"].as_str().unwrap().to_owned();
+    assert!(created.ends_with("new-folder"), "{created}");
+    assert!(std::path::Path::new(&created).is_dir());
+
+    let dup = app.clone().oneshot(mkdir(parent, "new-folder")).await.unwrap();
+    assert_eq!(dup.status(), StatusCode::CONFLICT);
+
+    let bad = app.clone().oneshot(mkdir(parent, "a/b")).await.unwrap();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+    let gone = dir.path().join("gone");
+    let missing = app.oneshot(mkdir(gone.to_str().unwrap(), "x")).await.unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
 
 #[tokio::test]
 async fn get_files_by_dir_returns_directory_contents() {

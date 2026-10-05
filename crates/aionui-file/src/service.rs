@@ -318,6 +318,47 @@ fn write_file_sync(path: &Path, data: &[u8]) -> Result<bool, FileError> {
     Ok(true)
 }
 
+/// Longest folder name `create_dir` accepts, in UTF-8 bytes — the usual
+/// filesystem limit for one path component.
+const MAX_DIR_NAME_BYTES: usize = 255;
+
+/// A new folder name must be exactly one plain path component, with no
+/// control characters (they make unreadable names and split log lines).
+fn validate_new_dir_name(raw: &str) -> Result<&str, FileError> {
+    let name = raw.trim();
+    let invalid = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.len() > MAX_DIR_NAME_BYTES
+        || name.contains(['/', '\\'])
+        || name.chars().any(char::is_control);
+    if invalid {
+        return Err(FileError::BadRequest("invalid folder name".to_owned()));
+    }
+    Ok(name)
+}
+
+/// Create one folder (not its parents) and return its absolute path.
+fn create_dir_sync(target: &Path) -> Result<String, FileError> {
+    match std::fs::create_dir(target) {
+        Ok(()) => Ok(strip_verbatim_prefix(&target.to_string_lossy())),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(FileError::Conflict(
+            "a file or folder with this name already exists".to_owned(),
+        )),
+        // The parent can vanish between the check and the create.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(FileError::NotFound("folder not found".to_owned())),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            Err(FileError::Forbidden("permission denied".to_owned()))
+        }
+        Err(e) => Err(FileError::Internal(format!("create directory failed: {e}"))),
+    }
+}
+
 /// Split a file name into `(base, ext)` where `ext` includes the leading dot.
 ///
 /// Uses the **last** `.` as the extension boundary (matching macOS Finder and
@@ -634,6 +675,19 @@ impl crate::traits::IFileService for FileService {
         let canonical_root = validate_path_with_extra_root(root, &roots, Some(extra_root))?;
 
         self.build_dir_tree(&canonical_dir, &canonical_root).await
+    }
+
+    async fn create_dir(&self, parent: &str, name: &str) -> Result<String, FileError> {
+        let name = validate_new_dir_name(name)?;
+        if !Path::new(parent).is_dir() {
+            return Err(FileError::NotFound("folder not found".to_owned()));
+        }
+        let roots = self.allowed_roots_refs();
+        let canonical_parent = validate_path_with_extra_root(parent, &roots, Some(Path::new(parent)))?;
+        let target = canonical_parent.join(name);
+        tokio::task::spawn_blocking(move || create_dir_sync(&target))
+            .await
+            .map_err(|e| FileError::Internal(format!("create directory task failed: {e}")))?
     }
 
     async fn list_workspace_files(&self, root: &str) -> Result<Vec<WorkspaceFlatFile>, FileError> {

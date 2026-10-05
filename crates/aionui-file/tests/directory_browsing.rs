@@ -353,3 +353,90 @@ async fn get_file_metadata_json_file() {
 
     assert_eq!(meta.mime_type, "application/json");
 }
+
+// -----------------------------------------------------------------------
+// createDir
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_dir_creates_one_folder_and_returns_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = make_service(dir.path());
+    let parent = dir.path().to_str().unwrap();
+
+    let created = svc.create_dir(parent, "  reports  ").await.unwrap();
+
+    let expected = fs::canonicalize(dir.path()).unwrap().join("reports");
+    assert_eq!(created, expected.to_string_lossy());
+    assert!(expected.is_dir());
+}
+
+#[tokio::test]
+async fn create_dir_rejects_a_taken_name() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("taken")).unwrap();
+    fs::write(dir.path().join("file.txt"), "x").unwrap();
+    let svc = make_service(dir.path());
+    let parent = dir.path().to_str().unwrap();
+
+    for name in ["taken", "file.txt"] {
+        let err = svc.create_dir(parent, name).await.unwrap_err();
+        assert!(matches!(err, aionui_file::FileError::Conflict(_)), "{name}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn create_dir_rejects_names_that_are_not_one_component() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = make_service(dir.path());
+    let parent = dir.path().to_str().unwrap();
+    let too_long = "a".repeat(256);
+
+    for name in [
+        "",
+        "   ",
+        ".",
+        "..",
+        "a/b",
+        "a\\b",
+        "nul\0byte",
+        "line\nbreak",
+        "tab\tname",
+        too_long.as_str(),
+    ] {
+        let err = svc.create_dir(parent, name).await.unwrap_err();
+        assert!(
+            matches!(err, aionui_file::FileError::BadRequest(_)),
+            "{name:?}: {err:?}"
+        );
+    }
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0, "nothing may be created");
+}
+
+#[tokio::test]
+async fn create_dir_reports_a_missing_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = make_service(dir.path());
+    let missing = dir.path().join("gone");
+
+    let err = svc.create_dir(missing.to_str().unwrap(), "new").await.unwrap_err();
+    assert!(matches!(err, aionui_file::FileError::NotFound(_)), "{err:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn create_dir_reports_permission_denied() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+    let svc = make_service(dir.path());
+
+    let result = svc.create_dir(locked.to_str().unwrap(), "new").await;
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    // Root ignores directory permissions; only assert when the OS enforced them.
+    if let Err(err) = result {
+        assert!(matches!(err, aionui_file::FileError::Forbidden(_)), "{err:?}");
+    }
+}
