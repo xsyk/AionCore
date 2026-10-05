@@ -237,7 +237,7 @@ impl FeishuLogin {
     ) -> Result<client::FeishuUser, FeishuLoginError> {
         let token = client::exchange_code(
             &self.http,
-            &cfg.accounts_base,
+            &cfg.api_base,
             &client::TokenRequest {
                 app_id: &cfg.app_id,
                 app_secret: &cfg.app_secret,

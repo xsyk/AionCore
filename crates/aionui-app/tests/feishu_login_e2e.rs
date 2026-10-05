@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
-use wiremock::matchers::{body_string_contains, header as has_header, method, path};
+use wiremock::matchers::{body_partial_json, header as has_header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use aionui_app::{AppConfig, AppServices};
@@ -136,12 +136,14 @@ async fn configure(ctx: &Ctx, signup_policy: &str) -> Resp {
 async fn mock_feishu(ctx: &Ctx, code: &str, union_id: &str, name: &str, tenant: &str) {
     let token = format!("u-token-{code}");
     Mock::given(method("POST"))
-        .and(path("/oauth/v3/token"))
-        .and(has_header("content-type", "application/x-www-form-urlencoded"))
-        .and(body_string_contains(format!("&code={code}&")))
-        .and(body_string_contains("client_id=cli_test"))
-        .and(body_string_contains("client_secret=sec_test"))
-        .and(body_string_contains("code_verifier="))
+        .and(path("/open-apis/authen/v2/oauth/token"))
+        .and(has_header("content-type", "application/json"))
+        .and(body_partial_json(serde_json::json!({
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": "cli_test",
+            "client_secret": "sec_test",
+        })))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"code": 0, "access_token": token, "expires_in": 7200})),
@@ -263,7 +265,7 @@ async fn admin_config_hides_secret_and_requires_super_admin() {
 }
 
 #[tokio::test]
-async fn start_uses_pkce_and_callback_posts_v3_form() {
+async fn start_uses_pkce_and_callback_exchanges_on_v2() {
     let ctx = setup().await;
     configure(&ctx, "open").await;
     let status = call(&ctx.app, "GET", "/api/auth/feishu/status", None, None, None).await;
@@ -312,13 +314,13 @@ async fn start_uses_pkce_and_callback_posts_v3_form() {
     let requests = ctx.feishu.received_requests().await.unwrap();
     let token_req = requests
         .iter()
-        .find(|r| r.url.path() == "/oauth/v3/token")
-        .expect("token request");
-    let body = String::from_utf8(token_req.body.clone()).unwrap();
-    assert!(body.contains("grant_type=authorization_code"), "{body}");
-    assert!(body.contains(&format!("code_verifier={verifier}")), "{body}");
-    assert!(
-        body.contains("redirect_uri=https%3A%2F%2Faidi.example.com%2Fapi%2Fauth%2Ffeishu%2Fcallback"),
+        .find(|r| r.url.path() == "/open-apis/authen/v2/oauth/token")
+        .expect("token request on the v2 endpoint");
+    let body: serde_json::Value = serde_json::from_slice(&token_req.body).unwrap();
+    assert_eq!(body["grant_type"], "authorization_code", "{body}");
+    assert_eq!(body["code_verifier"], verifier, "{body}");
+    assert_eq!(
+        body["redirect_uri"], "https://aidi.example.com/api/auth/feishu/callback",
         "{body}"
     );
 }
@@ -579,11 +581,11 @@ async fn token_endpoint_errors_map_to_upstream() {
     let ctx = setup().await;
     configure(&ctx, "open").await;
     Mock::given(method("POST"))
-        .and(path("/oauth/v3/token"))
+        .and(path("/open-apis/authen/v2/oauth/token"))
         .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
-            "code": 20071,
+            "code": 20049,
             "error": "invalid_grant",
-            "error_description": "The provided redirect URI does not match the one used during authorization."
+            "error_description": "PKCE code challenge failed."
         })))
         .mount(&ctx.feishu)
         .await;
