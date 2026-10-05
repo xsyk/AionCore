@@ -95,22 +95,21 @@ pub fn classify(reported: &str, verified: &str) -> VersionVerdict {
     }
 }
 
-/// i18n codes, resolved on the frontend under
-/// `conversation.agentTip.codes.<code>.body`. Both interpolate `{{cli}}` /
-/// `{{reported}}` / `{{verified}}`, so one pair of strings covers every
-/// direct-CLI backend instead of one pair per CLI.
+/// i18n code, resolved on the frontend under
+/// `conversation.agentTip.codes.<code>.body`. It interpolates `{{cli}}` /
+/// `{{reported}}` / `{{verified}}`, so one string covers every direct-CLI
+/// backend instead of one per CLI.
 pub const CODE_CLI_VERSION_OLDER: &str = "CLI_VERSION_OLDER";
-pub const CODE_CLI_VERSION_NEWER: &str = "CLI_VERSION_NEWER";
 
 /// The user-facing warning for a drifting install, or `None` when there is
 /// nothing worth saying.
 ///
-/// A NEWER CLI is not treated as broken: it usually works, and blocking it
-/// would strand users on an old release. It is reported once so that, if the
-/// session then misbehaves, the cause is already on screen.
+/// Only an OLDER CLI is reported. A NEWER one usually works, and its notice
+/// only asked users to report anything odd — a channel this build no longer
+/// has — so it stays silent (2026-10-06).
 ///
-/// Both directions are `Info`, which is a statement about PRESENTATION, not
-/// about how much the two verdicts matter. `Warning` renders as a filled card
+/// The notice is `Info`, which is a statement about PRESENTATION, not about
+/// how much the verdict matters. `Warning` renders as a filled card
 /// with the same alarm glyph an error uses, and a drifting install is not an
 /// error: nothing has failed, the turn is running, and the user is being told
 /// something about their environment. Reported live 2026-08-11 — an `Older`
@@ -118,12 +117,9 @@ pub const CODE_CLI_VERSION_NEWER: &str = "CLI_VERSION_NEWER";
 /// quiet centred line, and `MessageTips` documents it as the tier a backend
 /// picks when it deliberately wants a notice to be unobtrusive.
 ///
-/// The severity difference survives where it is acted on rather than merely
-/// read: the two verdicts keep distinct i18n codes, distinct prose ("some
-/// features may be missing. Consider upgrading" vs "should still work"), and
-/// distinct diagnostic codes on the availability probe — which is the surface
-/// that reaches the user BEFORE a conversation exists, when they are still
-/// deciding whether to rely on this agent, and which keeps its own weight.
+/// The availability probe reports the same verdict with its own diagnostic
+/// code — that surface reaches the user BEFORE a conversation exists, when
+/// they are still deciding whether to rely on this agent.
 ///
 /// Returns the English text AND its translation handle: the text is the
 /// fallback shown when the locale has no entry for the code, so both travel
@@ -136,7 +132,7 @@ pub fn drift_notice(cli: &str, reported: &str, verified: &str) -> Option<(Notice
             .with("verified", verified)
     };
     match classify(reported, verified) {
-        VersionVerdict::Verified | VersionVerdict::Unknown => None,
+        VersionVerdict::Verified | VersionVerdict::Unknown | VersionVerdict::Newer => None,
         VersionVerdict::Older => Some((
             NoticeLevel::Info,
             format!(
@@ -146,22 +142,12 @@ pub fn drift_notice(cli: &str, reported: &str, verified: &str) -> Option<(Notice
             ),
             localized(CODE_CLI_VERSION_OLDER),
         )),
-        VersionVerdict::Newer => Some((
-            NoticeLevel::Info,
-            format!(
-                "The installed {cli} is newer than the version AionUi verified. \
-                 It should still work; report anything that behaves oddly. \
-                 (installed {reported} / verified by AionUi: {verified})"
-            ),
-            localized(CODE_CLI_VERSION_NEWER),
-        )),
     }
 }
 
-/// Diagnostic codes the availability probe persists (it has no notice channel
+/// Diagnostic code the availability probe persists (it has no notice channel
 /// and no structured params column, so the numbers travel in `detail`).
 pub const DIAGNOSTIC_VERSION_DRIFT_OLDER: &str = "version_drift_older";
-pub const DIAGNOSTIC_VERSION_DRIFT_NEWER: &str = "version_drift_newer";
 
 /// What the availability probe reports for a CLI whose version drifted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,8 +175,7 @@ pub fn version_drift(cli: &str, reported: &str) -> Option<VersionDrift> {
     let verified = verified_version(cli)?;
     let code = match classify(reported, verified) {
         VersionVerdict::Older => DIAGNOSTIC_VERSION_DRIFT_OLDER,
-        VersionVerdict::Newer => DIAGNOSTIC_VERSION_DRIFT_NEWER,
-        VersionVerdict::Verified | VersionVerdict::Unknown => return None,
+        VersionVerdict::Newer | VersionVerdict::Verified | VersionVerdict::Unknown => return None,
     };
     let (_, guidance, _) = drift_notice(cli, reported, verified)?;
     Some(VersionDrift {
@@ -502,10 +487,17 @@ mod tests {
         assert!(text.contains("2.1.100") && text.contains(VERIFIED_CLAUDE_VERSION));
         assert_eq!(localized.code, CODE_CLI_VERSION_OLDER);
         assert_eq!(localized.params.get("cli").and_then(|v| v.as_str()), Some("claude"));
+    }
 
-        let (level, _, localized) = drift_notice("codex", "0.200.0", VERIFIED_CODEX_VERSION).expect("newer drifts");
-        assert_eq!(level, NoticeLevel::Info, "a newer CLI must not be treated as broken");
-        assert_eq!(localized.code, CODE_CLI_VERSION_NEWER);
+    /// A newer CLI usually works, and the hint only told users to report
+    /// problems nobody collects any more — so a newer install says nothing,
+    /// neither in a conversation nor on the availability probe.
+    #[test]
+    fn a_newer_install_is_not_reported() {
+        assert_eq!(classify("9.9.9", VERIFIED_CLAUDE_VERSION), VersionVerdict::Newer);
+        assert!(drift_notice("claude", "9.9.9", VERIFIED_CLAUDE_VERSION).is_none());
+        assert_eq!(version_drift("claude", "9.9.9"), None);
+        assert!(drift_notice("codex", "0.200.0", VERIFIED_CODEX_VERSION).is_none());
     }
 
     #[test]
@@ -531,10 +523,6 @@ mod tests {
         // The detail is what survives translation, so both numbers must be in it.
         assert!(older.detail.contains("1.1.8") && older.detail.contains(VERIFIED_AGY_VERSION));
         assert!(older.guidance.contains("1.1.8"));
-
-        let newer = version_drift("claude", "9.9.9").expect("newer must be reported");
-        assert_eq!(newer.code, DIAGNOSTIC_VERSION_DRIFT_NEWER);
-        assert!(newer.detail.contains("claude") && newer.detail.contains("9.9.9"));
     }
 
     #[test]
@@ -571,10 +559,14 @@ mod tests {
         // Real `codex --version` output shape, one release above the verified
         // one so the newer path is what gets exercised.
         assert_eq!(parse_version("codex-cli 0.152.0"), Some(vec![0, 152, 0]));
-        let (level, _, localized) = drift_notice("codex", "codex-cli 0.152.0", VERIFIED_CODEX_VERSION)
-            .expect("0.152.0 drifts from the verified release");
-        assert_eq!(level, NoticeLevel::Info);
-        assert_eq!(localized.code, CODE_CLI_VERSION_NEWER);
+        assert_eq!(
+            classify("codex-cli 0.152.0", VERIFIED_CODEX_VERSION),
+            VersionVerdict::Newer
+        );
+        assert!(
+            drift_notice("codex", "codex-cli 0.152.0", VERIFIED_CODEX_VERSION).is_none(),
+            "a newer CLI is not reported"
+        );
 
         // Literal on purpose, same as the claude case: a user actually on the
         // verified release is told nothing, and this breaks if a bump lands
