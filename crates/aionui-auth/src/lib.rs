@@ -17,6 +17,7 @@ mod routes;
 mod secret;
 mod security;
 mod service;
+mod shared_config;
 mod singleflight;
 mod validation;
 
@@ -26,6 +27,9 @@ pub use error::AuthError;
 // Local-account password provisioning
 pub use account::{AccountError, PasswordOutcome, create_local_user, set_local_password};
 pub use admin_routes::require_super_admin;
+
+// Shared (server-wide) configuration write guard
+pub use shared_config::{can_manage_shared_config, require_shared_config_admin};
 
 // Storage-encryption-secret provisioning and inspection
 pub use secret::{
