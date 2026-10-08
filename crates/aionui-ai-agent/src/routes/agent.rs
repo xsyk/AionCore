@@ -82,14 +82,13 @@ async fn health_check_by_id(
 
 async fn provider_health_check(
     State(state): State<AgentRouterState>,
-    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ProviderHealthCheckRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderHealthCheckResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
             .service
-            .provider_health_check(&user.id, req)
+            .provider_health_check(req)
             .await
             .map_err(agent_error_to_api_error)?,
     )))

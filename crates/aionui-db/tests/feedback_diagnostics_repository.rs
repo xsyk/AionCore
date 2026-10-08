@@ -886,6 +886,67 @@ async fn conversation_profile_is_scoped_to_current_user() {
     assert!(conversation.data["conversation"].is_null());
 }
 
+/// Conversations stay private to their owner (test above), but model providers
+/// are shared by every user since 1.0.1: another user's diagnostics must list
+/// the provider the fixture's owner added.
+#[tokio::test]
+async fn provider_diagnostics_are_shared_across_users() {
+    let db = init_database_memory().await.unwrap();
+    insert_feedback_fixture(&db).await;
+    let repo = SqliteFeedbackDiagnosticsRepository::new(db.pool().clone());
+
+    let result = repo
+        .collect_feedback_diagnostics(&FeedbackDiagnosticsRequest {
+            user_id: "other-user".to_owned(),
+            profiles: vec![
+                FeedbackDiagnosticsProfile::ModelAuth,
+                FeedbackDiagnosticsProfile::GlobalSummary,
+            ],
+            context: FeedbackDiagnosticsDbContext::default(),
+        })
+        .await
+        .unwrap();
+
+    let model_auth = result
+        .profiles
+        .iter()
+        .find(|profile| profile.name == "model-auth")
+        .expect("model auth profile should exist");
+    assert_eq!(model_auth.mode, "summary");
+    assert_eq!(model_auth.data["providers"][0]["id"], "prov-secret");
+    assert_eq!(model_auth.data["providers"][0]["api_key_configured"], true);
+
+    let global = result
+        .profiles
+        .iter()
+        .find(|profile| profile.name == "global-summary")
+        .expect("global summary profile should exist");
+    assert_eq!(global.data["provider_count"], 1);
+    assert_eq!(global.data["provider_health"]["items"][0]["id"], "prov-secret");
+    // The same user still sees none of the owner's conversations.
+    assert_eq!(global.data["conversation_count"], 0);
+
+    // Asking for one provider by id works for any user too.
+    let detail = repo
+        .collect_feedback_diagnostics(&FeedbackDiagnosticsRequest {
+            user_id: "other-user".to_owned(),
+            profiles: vec![FeedbackDiagnosticsProfile::ModelAuth],
+            context: FeedbackDiagnosticsDbContext {
+                provider_id: Some("prov-secret".to_owned()),
+                ..FeedbackDiagnosticsDbContext::default()
+            },
+        })
+        .await
+        .unwrap();
+    let detail_auth = detail
+        .profiles
+        .iter()
+        .find(|profile| profile.name == "model-auth")
+        .expect("model auth profile should exist");
+    assert_eq!(detail_auth.mode, "detail");
+    assert_eq!(detail_auth.data["providers"][0]["id"], "prov-secret");
+}
+
 #[tokio::test]
 async fn conversation_profile_rejects_foreign_context_agent_metadata() {
     let db = init_database_memory().await.unwrap();

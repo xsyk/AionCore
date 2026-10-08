@@ -330,7 +330,7 @@ pub struct ConversationService {
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     /// Only the agent-facing `conversation create` path reads this, to match an
-    /// aionrs assistant's default model to one of the user's providers.
+    /// aionrs assistant's default model to one of the server's shared providers.
     provider_repo: Arc<RwLock<Option<Arc<dyn IProviderRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,

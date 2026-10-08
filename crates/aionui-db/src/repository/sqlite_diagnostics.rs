@@ -537,24 +537,22 @@ impl SqliteFeedbackDiagnosticsRepository {
         request: &FeedbackDiagnosticsRequest,
     ) -> Result<FeedbackDiagnosticsProfileResult, DbError> {
         let provider_id = self.resolve_provider_id(request).await?;
+        // Providers are shared by every user (since 1.0.1), so this query has
+        // no user filter; only the conversation lookup behind
+        // `resolve_provider_id` stays scoped to the requesting user.
         let mut query = "SELECT id, platform, name, base_url, api_key_encrypted, models, enabled, capabilities, \
                             context_limit, model_enabled, model_health, is_full_url, created_at, updated_at \
-                         FROM providers \
-                         WHERE user_id = ?"
+                         FROM providers"
             .to_owned();
         if provider_id.is_some() {
-            query.push_str(" AND id = ?");
+            query.push_str(" WHERE id = ?");
         }
         query.push_str(" ORDER BY updated_at DESC LIMIT 20");
 
         let rows = if let Some(provider_id) = provider_id.as_deref() {
-            sqlx::query(&query)
-                .bind(&request.user_id)
-                .bind(provider_id)
-                .fetch_all(&self.pool)
-                .await?
+            sqlx::query(&query).bind(provider_id).fetch_all(&self.pool).await?
         } else {
-            sqlx::query(&query).bind(&request.user_id).fetch_all(&self.pool).await?
+            sqlx::query(&query).fetch_all(&self.pool).await?
         };
 
         let providers = rows
@@ -985,8 +983,8 @@ impl SqliteFeedbackDiagnosticsRepository {
         .bind(&request.user_id)
         .fetch_one(&self.pool)
         .await?;
-        let provider_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM providers WHERE user_id = ?")
-            .bind(&request.user_id)
+        // Providers are shared by every user (since 1.0.1): count them all.
+        let provider_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM providers")
             .fetch_one(&self.pool)
             .await?;
         let agent_count: i64 =
@@ -1013,7 +1011,7 @@ impl SqliteFeedbackDiagnosticsRepository {
                 "recent_conversations": self.collect_global_recent_conversations(&request.user_id).await?,
                 "recent_errors": self.collect_global_recent_errors(&request.user_id).await?,
                 "agent_health": self.collect_global_agent_health(&request.user_id).await?,
-                "provider_health": self.collect_global_provider_health(&request.user_id).await?,
+                "provider_health": self.collect_global_provider_health().await?,
             }),
         ))
     }
@@ -1489,16 +1487,16 @@ impl SqliteFeedbackDiagnosticsRepository {
         }))
     }
 
-    async fn collect_global_provider_health(&self, user_id: &str) -> Result<Value, DbError> {
+    /// Providers are shared by every user (since 1.0.1), so unlike the other
+    /// `collect_global_*` helpers this one takes no user id.
+    async fn collect_global_provider_health(&self) -> Result<Value, DbError> {
         let rows = sqlx::query(
             "SELECT id, platform, name, base_url, api_key_encrypted, models, enabled, capabilities, \
                     context_limit, model_enabled, model_health, is_full_url, created_at, updated_at \
              FROM providers \
-             WHERE user_id = ? \
              ORDER BY updated_at DESC, id DESC \
              LIMIT ?",
         )
-        .bind(user_id)
         .bind(GLOBAL_HEALTH_LIMIT)
         .fetch_all(&self.pool)
         .await?;

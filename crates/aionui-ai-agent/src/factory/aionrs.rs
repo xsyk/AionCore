@@ -123,10 +123,12 @@ pub(super) async fn build(
         );
     }
 
+    // The provider is looked up by id alone: model providers are shared by
+    // every user (since 1.0.1), so a conversation may use one another user added.
     let provider_id = &model.provider_id;
     let row = deps
         .provider_repo
-        .find_by_id(&ctx.user_id, provider_id)
+        .find_by_id(provider_id)
         .await
         .map_err(|e| AgentError::internal(format!("Failed to load provider config: {e}")))?
         .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;

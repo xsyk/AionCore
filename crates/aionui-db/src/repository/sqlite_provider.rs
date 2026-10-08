@@ -19,18 +19,16 @@ impl SqliteProviderRepository {
 
 #[async_trait::async_trait]
 impl IProviderRepository for SqliteProviderRepository {
-    async fn list(&self, user_id: &str) -> Result<Vec<Provider>, DbError> {
-        let rows = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE user_id = ? ORDER BY created_at ASC")
-            .bind(user_id)
+    async fn list(&self) -> Result<Vec<Provider>, DbError> {
+        let rows = sqlx::query_as::<_, Provider>("SELECT * FROM providers ORDER BY created_at ASC")
             .fetch_all(&self.pool)
             .await?;
 
         Ok(rows)
     }
 
-    async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<Provider>, DbError> {
-        let row = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE user_id = ? AND id = ?")
-            .bind(user_id)
+    async fn find_by_id(&self, id: &str) -> Result<Option<Provider>, DbError> {
+        let row = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -101,9 +99,9 @@ impl IProviderRepository for SqliteProviderRepository {
         })
     }
 
-    async fn update(&self, user_id: &str, id: &str, params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+    async fn update(&self, id: &str, params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
         let existing = self
-            .find_by_id(user_id, id)
+            .find_by_id(id)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("Provider '{id}' not found")))?;
 
@@ -115,7 +113,7 @@ impl IProviderRepository for SqliteProviderRepository {
                 models = ?, enabled = ?, capabilities = ?, context_limit = ?, \
                 model_protocols = ?, model_enabled = ?, model_health = ?, \
                 model_settings = ?, bedrock_config = ?, is_full_url = ?, updated_at = ? \
-             WHERE user_id = ? AND id = ?",
+             WHERE id = ?",
         )
         .bind(&merged.platform)
         .bind(&merged.name)
@@ -132,7 +130,6 @@ impl IProviderRepository for SqliteProviderRepository {
         .bind(&merged.bedrock_config)
         .bind(merged.is_full_url)
         .bind(merged.updated_at)
-        .bind(user_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -140,9 +137,8 @@ impl IProviderRepository for SqliteProviderRepository {
         Ok(merged)
     }
 
-    async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM providers WHERE user_id = ? AND id = ?")
-            .bind(user_id)
+    async fn delete(&self, id: &str) -> Result<(), DbError> {
+        let result = sqlx::query("DELETE FROM providers WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -243,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn list_empty() {
         let (repo, _db) = setup().await;
-        let providers = repo.list(USER_A).await.unwrap();
+        let providers = repo.list().await.unwrap();
         assert!(providers.is_empty());
     }
 
@@ -279,7 +275,7 @@ mod tests {
         assert_eq!(p.id, "my-custom-id-1");
         assert_eq!(p.platform, "anthropic");
 
-        let found = repo.find_by_id(USER_A, "my-custom-id-1").await.unwrap().unwrap();
+        let found = repo.find_by_id("my-custom-id-1").await.unwrap().unwrap();
         assert_eq!(found.id, "my-custom-id-1");
     }
 
@@ -308,7 +304,7 @@ mod tests {
         let (repo, _db) = setup().await;
         let created = repo.create(sample_params()).await.unwrap();
 
-        let found = repo.find_by_id(USER_A, &created.id).await.unwrap().unwrap();
+        let found = repo.find_by_id(&created.id).await.unwrap().unwrap();
         assert_eq!(found.id, created.id);
         assert_eq!(found.platform, "anthropic");
         assert_eq!(found.models, r#"["claude-sonnet-4-20250514"]"#);
@@ -317,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn find_by_id_nonexistent() {
         let (repo, _db) = setup().await;
-        assert!(repo.find_by_id(USER_A, "no_such_id").await.unwrap().is_none());
+        assert!(repo.find_by_id("no_such_id").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -334,7 +330,7 @@ mod tests {
             .await
             .unwrap();
 
-        let all = repo.list(USER_A).await.unwrap();
+        let all = repo.list().await.unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].id, p1.id);
         assert_eq!(all[1].id, p2.id);
@@ -347,7 +343,6 @@ mod tests {
 
         let updated = repo
             .update(
-                USER_A,
                 &created.id,
                 UpdateProviderParams {
                     name: Some("Anthropic Updated"),
@@ -373,7 +368,6 @@ mod tests {
 
         let updated = repo
             .update(
-                USER_A,
                 &created.id,
                 UpdateProviderParams {
                     api_key_encrypted: Some("new_encrypted_key"),
@@ -389,10 +383,7 @@ mod tests {
     #[tokio::test]
     async fn update_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo
-            .update(USER_A, "no_id", UpdateProviderParams::default())
-            .await
-            .unwrap_err();
+        let err = repo.update("no_id", UpdateProviderParams::default()).await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -405,7 +396,6 @@ mod tests {
         // Set optional field
         let updated = repo
             .update(
-                USER_A,
                 &created.id,
                 UpdateProviderParams {
                     model_protocols: Some(Some(r#"{"model1":"openai"}"#)),
@@ -422,7 +412,6 @@ mod tests {
         // Clear optional field
         let cleared = repo
             .update(
-                USER_A,
                 &created.id,
                 UpdateProviderParams {
                     model_protocols: Some(None),
@@ -442,14 +431,14 @@ mod tests {
         let (repo, _db) = setup().await;
         let created = repo.create(sample_params()).await.unwrap();
 
-        repo.delete(USER_A, &created.id).await.unwrap();
-        assert!(repo.find_by_id(USER_A, &created.id).await.unwrap().is_none());
+        repo.delete(&created.id).await.unwrap();
+        assert!(repo.find_by_id(&created.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn delete_nonexistent_returns_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.delete(USER_A, "no_id").await.unwrap_err();
+        let err = repo.delete("no_id").await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -465,20 +454,44 @@ mod tests {
             .await
             .unwrap();
 
-        repo.delete(USER_A, &p1.id).await.unwrap();
+        repo.delete(&p1.id).await.unwrap();
 
-        let all = repo.list(USER_A).await.unwrap();
+        let all = repo.list().await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, p2.id);
     }
 
     #[tokio::test]
-    async fn provider_operations_are_scoped_by_user() {
+    async fn providers_are_shared_by_every_user() {
         let (repo, _db) = setup().await;
-        let provider_a = repo.create(sample_params()).await.unwrap();
-        let provider_b = repo
+        let created = repo.create(sample_params()).await.unwrap(); // created by USER_A
+        let listed = repo.list().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(repo.find_by_id(&created.id).await.unwrap().unwrap().user_id, USER_A);
+        let updated = repo
+            .update(
+                &created.id,
+                UpdateProviderParams {
+                    name: Some("renamed"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.name, "renamed");
+        repo.delete(&created.id).await.unwrap();
+        assert!(repo.list().await.unwrap().is_empty());
+    }
+
+    /// The creator column only records who added the row: a provider added by
+    /// one user is listed, edited and removed exactly like one added by another.
+    #[tokio::test]
+    async fn providers_added_by_different_users_share_one_list() {
+        let (repo, _db) = setup().await;
+        let from_a = repo.create(sample_params()).await.unwrap();
+        let from_b = repo
             .create(CreateProviderParams {
-                id: Some("same-visible-provider-id"),
+                id: Some("provider-from-user-b"),
                 user_id: USER_B,
                 name: "Other User Provider",
                 ..sample_params()
@@ -486,25 +499,32 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(repo.list(USER_A).await.unwrap().len(), 1);
-        assert_eq!(repo.list(USER_B).await.unwrap().len(), 1);
-        assert!(repo.find_by_id(USER_B, &provider_a.id).await.unwrap().is_none());
+        let mut listed_ids: Vec<String> = repo.list().await.unwrap().into_iter().map(|p| p.id).collect();
+        listed_ids.sort();
+        let mut expected_ids = vec![from_a.id.clone(), from_b.id.clone()];
+        expected_ids.sort();
+        assert_eq!(listed_ids, expected_ids);
 
-        let err = repo
+        assert_eq!(repo.find_by_id(&from_b.id).await.unwrap().unwrap().user_id, USER_B);
+        let updated = repo
             .update(
-                USER_B,
-                &provider_a.id,
+                &from_b.id,
                 UpdateProviderParams {
-                    name: Some("cross-user update"),
+                    name: Some("edited by anyone"),
                     ..Default::default()
                 },
             )
             .await
-            .unwrap_err();
-        assert!(matches!(err, DbError::NotFound(_)));
+            .unwrap();
+        assert_eq!(updated.user_id, USER_B, "editing never changes the recorded creator");
+        // Re-read the row: the edit must have reached the table, not only the returned value.
+        let reread = repo.find_by_id(&from_b.id).await.unwrap().unwrap();
+        assert_eq!(reread.name, "edited by anyone");
+        assert_eq!(reread.user_id, USER_B);
 
-        repo.delete(USER_B, &provider_b.id).await.unwrap();
-        assert_eq!(repo.list(USER_A).await.unwrap().len(), 1);
-        assert!(repo.list(USER_B).await.unwrap().is_empty());
+        repo.delete(&from_b.id).await.unwrap();
+        let remaining = repo.list().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, from_a.id);
     }
 }

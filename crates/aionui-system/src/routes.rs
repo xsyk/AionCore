@@ -194,11 +194,13 @@ async fn update_client_preferences(
 // Provider handlers
 // ===========================================================================
 
+// Providers are shared by every user (since 1.0.1): the list is not scoped to
+// the caller. Keys are revealed to every caller for now; restricting them to
+// the administrator is a separate permission step.
 async fn list_providers(
     State(state): State<SystemRouterState>,
-    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<ProviderResponse>>>, ApiError> {
-    let providers = state.provider_service.list(&user.id).await.map_err(ApiError::from)?;
+    let providers = state.provider_service.list(true).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(providers)))
 }
 
@@ -218,42 +220,31 @@ async fn create_provider(
 
 async fn update_provider(
     State(state): State<SystemRouterState>,
-    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<UpdateProviderRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let provider = state
-        .provider_service
-        .update(&user.id, &id, req)
-        .await
-        .map_err(ApiError::from)?;
+    let provider = state.provider_service.update(&id, req).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(provider)))
 }
 
 async fn delete_provider(
     State(state): State<SystemRouterState>,
-    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state
-        .provider_service
-        .delete(&user.id, &id)
-        .await
-        .map_err(ApiError::from)?;
+    state.provider_service.delete(&id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn fetch_models(
     State(state): State<SystemRouterState>,
-    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<FetchModelsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FetchModelsResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .model_fetch_service
-        .fetch_models(&user.id, &id, &req)
+        .fetch_models(&id, &req)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))

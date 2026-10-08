@@ -45,7 +45,7 @@ pub enum ConversationCreateError {
 
     /// `model_id` is `None` when the assistant resolves to no model at all
     /// (auto mode with no preference yet), `Some` when a model id exists but
-    /// no provider of this user lists it.
+    /// no provider on this server lists it.
     #[error("assistant {assistant_id} has no usable aionrs model{}", model_id.as_deref().map(|m| format!(": `{m}` is not offered by any enabled provider")).unwrap_or_default())]
     AssistantModelUnresolved {
         assistant_id: String,
@@ -368,8 +368,8 @@ impl ConversationService {
 
     /// "Explicit" branch: the definition must exist and be enabled; aionrs
     /// assistants additionally need their default model matched to one of the
-    /// user's providers — NO fallback to the caller's model, which may belong
-    /// to a provider the chosen assistant was never meant to use.
+    /// server's shared providers — NO fallback to the caller's model, which may
+    /// belong to a provider the chosen assistant was never meant to use.
     async fn override_plan(&self, user_id: &str, assistant_id: &str) -> Result<CreatePlan, ConversationCreateError> {
         let (Some(definition_repo), Some(state_repo)) = (self.assistant_definition_repo(), self.assistant_state_repo())
         else {
@@ -421,19 +421,16 @@ impl ConversationService {
                     model_id: None,
                 }
             })?;
-            let provider_id = self
-                .match_provider_for_model(user_id, &model_id)
-                .await?
-                .ok_or_else(|| {
-                    warn!(
-                        assistant_id,
-                        "aionrs assistant default model is not offered by any enabled provider"
-                    );
-                    ConversationCreateError::AssistantModelUnresolved {
-                        assistant_id: assistant_id.to_owned(),
-                        model_id: Some(model_id.clone()),
-                    }
-                })?;
+            let provider_id = self.match_provider_for_model(&model_id).await?.ok_or_else(|| {
+                warn!(
+                    assistant_id,
+                    "aionrs assistant default model is not offered by any enabled provider"
+                );
+                ConversationCreateError::AssistantModelUnresolved {
+                    assistant_id: assistant_id.to_owned(),
+                    model_id: Some(model_id.clone()),
+                }
+            })?;
             (
                 Some(ProviderWithModel {
                     provider_id,
@@ -459,20 +456,15 @@ impl ConversationService {
     /// First ENABLED provider whose `models` JSON array lists `model_id` — the
     /// same rule as team provisioning's `resolve_provider_for_model` and the
     /// picker's `modelList[0]` default. `None` when no provider matches.
-    async fn match_provider_for_model(
-        &self,
-        user_id: &str,
-        model_id: &str,
-    ) -> Result<Option<String>, ConversationCreateError> {
+    /// Providers are shared by every user (since 1.0.1), so every provider on
+    /// the server is a candidate, whoever added it.
+    async fn match_provider_for_model(&self, model_id: &str) -> Result<Option<String>, ConversationCreateError> {
         let Some(provider_repo) = self.provider_repo() else {
             return Err(ConversationCreateError::TransportUnavailable {
                 reason: "provider repository is not configured".to_owned(),
             });
         };
-        let providers = provider_repo
-            .list(user_id)
-            .await
-            .map_err(ConversationCreateError::transport)?;
+        let providers = provider_repo.list().await.map_err(ConversationCreateError::transport)?;
         Ok(providers
             .into_iter()
             .filter(|provider| provider.enabled)

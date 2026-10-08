@@ -248,13 +248,16 @@ async fn create_provider_ignores_body_user_id() {
         .unwrap();
     assert_eq!(owner, TEST_USER_ID);
 
+    // Providers are shared by every user: the creator column only records who
+    // added the row, so the other user sees the provider all the same.
     let other_app = system_routes(build_state(&db));
     let resp = other_app
         .oneshot(get_request_for_user(OTHER_USER_ID, "/api/providers"))
         .await
         .unwrap();
     let json = body_json(resp).await;
-    assert_eq!(json["data"], json!([]));
+    assert_eq!(json["data"].as_array().unwrap().len(), 1);
+    assert_eq!(json["data"][0]["id"], id);
 }
 
 #[tokio::test]
@@ -521,10 +524,24 @@ async fn update_provider_nonexistent() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// Providers are shared by every user (since 1.0.1): the creator is only
+/// recorded, so listing, editing and deleting go by id alone. Who may write is
+/// a separate route-level decision (the administrator guard); this pins only
+/// that the creator no longer matters.
 #[tokio::test]
-async fn cross_user_provider_update_delete_are_not_found() {
+async fn providers_added_by_one_user_are_listed_and_editable_by_another() {
     let (_app, db) = setup().await;
-    let (_, id) = create_one(&db).await;
+    let (_, id) = create_one(&db).await; // added by TEST_USER_ID
+
+    let list_app = system_routes(build_state(&db));
+    let resp = list_app
+        .oneshot(get_request_for_user(OTHER_USER_ID, "/api/providers"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"].as_array().unwrap().len(), 1);
+    assert_eq!(json["data"][0]["id"], id);
 
     let update_app = system_routes(build_state(&db));
     let resp = update_app
@@ -532,24 +549,29 @@ async fn cross_user_provider_update_delete_are_not_found() {
             OTHER_USER_ID,
             "PUT",
             &format!("/api/providers/{id}"),
-            json!({"name": "Other User Update"}),
+            json!({"name": "Renamed by another user"}),
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let creator_app = system_routes(build_state(&db));
+    let resp = creator_app.oneshot(get_request("/api/providers")).await.unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["data"][0]["id"], id);
+    assert_eq!(json["data"][0]["name"], "Renamed by another user");
 
     let delete_app = system_routes(build_state(&db));
     let resp = delete_app
         .oneshot(delete_request_for_user(OTHER_USER_ID, &format!("/api/providers/{id}")))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    let owner_app = system_routes(build_state(&db));
-    let resp = owner_app.oneshot(get_request("/api/providers")).await.unwrap();
+    let creator_app = system_routes(build_state(&db));
+    let resp = creator_app.oneshot(get_request("/api/providers")).await.unwrap();
     let json = body_json(resp).await;
-    assert_eq!(json["data"][0]["id"], id);
-    assert_eq!(json["data"][0]["name"], "Anthropic");
+    assert_eq!(json["data"], json!([]));
 }
 
 // ===========================================================================

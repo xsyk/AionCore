@@ -1687,10 +1687,10 @@ struct EmptyProviderRepo;
 
 #[async_trait::async_trait]
 impl IProviderRepository for EmptyProviderRepo {
-    async fn list(&self, _user_id: &str) -> Result<Vec<aionui_db::models::Provider>, DbError> {
+    async fn list(&self) -> Result<Vec<aionui_db::models::Provider>, DbError> {
         Ok(vec![])
     }
-    async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<aionui_db::models::Provider>, DbError> {
+    async fn find_by_id(&self, _id: &str) -> Result<Option<aionui_db::models::Provider>, DbError> {
         Ok(None)
     }
     async fn create(
@@ -1701,13 +1701,12 @@ impl IProviderRepository for EmptyProviderRepo {
     }
     async fn update(
         &self,
-        _user_id: &str,
         _id: &str,
         _params: aionui_db::UpdateProviderParams<'_>,
     ) -> Result<aionui_db::models::Provider, DbError> {
         Err(DbError::NotFound("not implemented".into()))
     }
-    async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
+    async fn delete(&self, _id: &str) -> Result<(), DbError> {
         Err(DbError::NotFound("not implemented".into()))
     }
 }

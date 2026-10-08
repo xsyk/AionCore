@@ -156,10 +156,7 @@ async fn assert_provider_decrypts(services: &AppServices) {
     let key = aionui_app::derive_encryption_key(&services.encryption_secret_raw);
     let repo = Arc::new(SqliteProviderRepository::new(services.database.pool().clone()));
     let svc = aionui_system::ProviderService::new(repo, key);
-    let list = svc
-        .list("system_default_user")
-        .await
-        .expect("provider list must not fail");
+    let list = svc.list(true).await.expect("provider list must not fail");
     let p = list
         .iter()
         .find(|p| p.id == "upgrade-prov-1")

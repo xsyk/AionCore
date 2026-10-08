@@ -328,13 +328,22 @@ async fn upsert_assistant_with_fixed_model(
 /// A provider repo over its own in-memory DB (the assistant helper does not
 /// expose its pool). `models` is the JSON array the row stores.
 async fn provider_repo_with(models_by_provider: &[(&str, &str, bool)]) -> Arc<dyn IProviderRepository> {
+    provider_repo_added_by(USER, models_by_provider).await
+}
+
+/// Like [`provider_repo_with`], with `creator` recorded as who added each
+/// provider (providers are shared, so it must not change what matches).
+async fn provider_repo_added_by(
+    creator: &str,
+    models_by_provider: &[(&str, &str, bool)],
+) -> Arc<dyn IProviderRepository> {
     let db = init_database_memory().await.unwrap();
     seed_test_user(db.pool(), USER).await;
     let repo = SqliteProviderRepository::new(db.pool().clone());
     for (id, models, enabled) in models_by_provider {
         repo.create(CreateProviderParams {
             id: Some(id),
-            user_id: USER,
+            user_id: creator,
             platform: "openai",
             name: id,
             base_url: "https://example.invalid",
@@ -429,6 +438,42 @@ async fn an_explicit_aionrs_assistant_gets_the_first_enabled_provider_that_offer
     );
     assert_eq!(model.model, "model-b");
     assert_eq!(model.use_model.as_deref(), Some("model-b"));
+}
+
+/// Providers are shared by every user (since 1.0.1): the model match covers
+/// every provider on the server, not only the ones the caller added.
+#[tokio::test]
+async fn an_explicit_aionrs_assistant_can_use_a_provider_another_user_added() {
+    let (svc, _broadcaster, repo, definition_repo, _overlay_repo, _preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(Arc::new(MockTaskManager::new())).await;
+    upsert_assistant_with_fixed_model(
+        &definition_repo,
+        "def-shared",
+        "asst-shared",
+        "632f31d2",
+        Some("model-b"),
+    )
+    .await;
+    svc.with_provider_repo(provider_repo_added_by("another_user", &[("prov-shared", r#"["model-b"]"#, true)]).await);
+    insert_caller(
+        &repo,
+        "caller-shared",
+        "acp",
+        json!({ "workspace": ensure_test_workspace_path(), "backend": "claude" }),
+        None,
+    )
+    .await;
+
+    let created = svc
+        .create_for_conversation_helper(USER, "caller-shared", &create_req("rs", None, Some("asst-shared")))
+        .await
+        .unwrap();
+
+    let row = repo.get(USER, &created.id).await.unwrap().unwrap();
+    assert_eq!(row.r#type, "aionrs");
+    let model: ProviderWithModel = serde_json::from_str(row.model.as_deref().unwrap()).unwrap();
+    assert_eq!(model.provider_id, "prov-shared");
+    assert_eq!(model.model, "model-b");
 }
 
 #[tokio::test]

@@ -170,8 +170,10 @@ impl TeamSessionService {
 
     /// Collect all enabled provider model IDs grouped by provider name.
     /// Returns a flat list of model IDs for use by internal agents (aionrs).
-    async fn collect_provider_models(&self, user_id: &str) -> Vec<String> {
-        let Ok(providers) = self.provider_repo.list(user_id).await else {
+    /// Providers are shared by every user (since 1.0.1), so this covers every
+    /// provider on the server.
+    async fn collect_provider_models(&self) -> Vec<String> {
+        let Ok(providers) = self.provider_repo.list().await else {
             return vec![];
         };
         providers
@@ -183,7 +185,7 @@ impl TeamSessionService {
 
     pub(crate) async fn default_model_for_backend(&self, user_id: &str, backend: &str) -> Option<String> {
         if backend == "aionrs" {
-            return self.collect_provider_models(user_id).await.into_iter().next();
+            return self.collect_provider_models().await.into_iter().next();
         }
         let row = self
             .agent_metadata_repo
@@ -629,11 +631,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IProviderRepository for SingleProviderRepo {
-        async fn list(&self, _user_id: &str) -> Result<Vec<Provider>, DbError> {
+        async fn list(&self) -> Result<Vec<Provider>, DbError> {
             Ok(self.rows.clone())
         }
 
-        async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<Provider>, DbError> {
+        async fn find_by_id(&self, _id: &str) -> Result<Option<Provider>, DbError> {
             Ok(None)
         }
 
@@ -641,16 +643,11 @@ mod tests {
             Err(DbError::NotFound("not implemented".into()))
         }
 
-        async fn update(
-            &self,
-            _user_id: &str,
-            _id: &str,
-            _params: aionui_db::UpdateProviderParams<'_>,
-        ) -> Result<Provider, DbError> {
+        async fn update(&self, _id: &str, _params: aionui_db::UpdateProviderParams<'_>) -> Result<Provider, DbError> {
             Err(DbError::NotFound("not implemented".into()))
         }
 
-        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
+        async fn delete(&self, _id: &str) -> Result<(), DbError> {
             Err(DbError::NotFound("not implemented".into()))
         }
     }

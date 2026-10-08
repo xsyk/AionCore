@@ -42,7 +42,7 @@ fn sample_params() -> CreateProviderParams<'static> {
 #[tokio::test]
 async fn list_returns_empty_when_no_providers() {
     let r = repo().await;
-    assert!(r.list(USER_ID).await.unwrap().is_empty());
+    assert!(r.list().await.unwrap().is_empty());
 }
 
 // -- Create --
@@ -99,7 +99,7 @@ async fn find_by_id_existing_returns_provider() {
     let r = repo().await;
     let created = r.create(sample_params()).await.unwrap();
 
-    let found = r.find_by_id(USER_ID, &created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
     assert_eq!(found.id, created.id);
     assert_eq!(found.name, "Anthropic");
 }
@@ -107,7 +107,7 @@ async fn find_by_id_existing_returns_provider() {
 #[tokio::test]
 async fn find_by_id_nonexistent_returns_none() {
     let r = repo().await;
-    assert!(r.find_by_id(USER_ID, "no_such_id").await.unwrap().is_none());
+    assert!(r.find_by_id("no_such_id").await.unwrap().is_none());
 }
 
 // -- List --
@@ -125,7 +125,7 @@ async fn list_returns_all_providers_in_creation_order() {
         .await
         .unwrap();
 
-    let all = r.list(USER_ID).await.unwrap();
+    let all = r.list().await.unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].id, first.id);
     assert_eq!(all[1].id, second.id);
@@ -140,7 +140,6 @@ async fn update_partial_fields_preserves_others() {
 
     let updated = r
         .update(
-            USER_ID,
             &created.id,
             UpdateProviderParams {
                 name: Some("New Name"),
@@ -164,7 +163,6 @@ async fn update_api_key_changes_encrypted_value() {
 
     let updated = r
         .update(
-            USER_ID,
             &created.id,
             UpdateProviderParams {
                 api_key_encrypted: Some("new_encrypted"),
@@ -184,7 +182,6 @@ async fn update_model_settings_replaces_per_model_overrides() {
 
     let updated = r
         .update(
-            USER_ID,
             &created.id,
             UpdateProviderParams {
                 model_settings: Some(r#"{"gpt-5.6-sol":{"openai_api_mode":"responses"}}"#),
@@ -209,7 +206,6 @@ async fn update_optional_fields_can_be_set_and_cleared() {
     // Set
     let with_config = r
         .update(
-            USER_ID,
             &created.id,
             UpdateProviderParams {
                 bedrock_config: Some(Some(r#"{"region":"eu-west-1"}"#)),
@@ -223,7 +219,6 @@ async fn update_optional_fields_can_be_set_and_cleared() {
     // Clear
     let cleared = r
         .update(
-            USER_ID,
             &created.id,
             UpdateProviderParams {
                 bedrock_config: Some(None),
@@ -239,7 +234,7 @@ async fn update_optional_fields_can_be_set_and_cleared() {
 async fn update_nonexistent_returns_not_found() {
     let r = repo().await;
     let err = r
-        .update(USER_ID, "nonexistent", UpdateProviderParams::default())
+        .update("nonexistent", UpdateProviderParams::default())
         .await
         .unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)), "expected NotFound, got: {err:?}");
@@ -252,7 +247,6 @@ async fn update_advances_updated_at() {
 
     let updated = r
         .update(
-            USER_ID,
             &created.id,
             UpdateProviderParams {
                 name: Some("Changed"),
@@ -273,14 +267,14 @@ async fn delete_removes_provider() {
     let r = repo().await;
     let created = r.create(sample_params()).await.unwrap();
 
-    r.delete(USER_ID, &created.id).await.unwrap();
-    assert!(r.find_by_id(USER_ID, &created.id).await.unwrap().is_none());
+    r.delete(&created.id).await.unwrap();
+    assert!(r.find_by_id(&created.id).await.unwrap().is_none());
 }
 
 #[tokio::test]
 async fn delete_nonexistent_returns_not_found() {
     let r = repo().await;
-    let err = r.delete(USER_ID, "nonexistent").await.unwrap_err();
+    let err = r.delete("nonexistent").await.unwrap_err();
     assert!(matches!(err, DbError::NotFound(_)), "expected NotFound, got: {err:?}");
 }
 
@@ -296,9 +290,9 @@ async fn delete_does_not_affect_other_providers() {
         .await
         .unwrap();
 
-    r.delete(USER_ID, &p1.id).await.unwrap();
+    r.delete(&p1.id).await.unwrap();
 
-    let all = r.list(USER_ID).await.unwrap();
+    let all = r.list().await.unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].id, p2.id);
 }

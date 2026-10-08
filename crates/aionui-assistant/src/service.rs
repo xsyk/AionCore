@@ -992,10 +992,13 @@ impl AssistantService {
         self.resolve_default_agent_id_for_user(DEFAULT_USER_ID).await
     }
 
+    /// `user_id` only selects whose `aionrs` agent binding is returned: model
+    /// providers are shared by every user (since 1.0.1), so an enabled provider
+    /// added by anyone satisfies the inference.
     pub async fn resolve_default_agent_id_for_user(&self, user_id: &str) -> Result<String, AssistantError> {
         let providers = self
             .provider_repo
-            .list(user_id)
+            .list()
             .await
             .map_err(|e| AssistantError::Internal(format!("failed to list providers: {e}")))?;
 
@@ -3762,13 +3765,9 @@ mod tests {
     }
 
     async fn seed_provider(repo: &dyn IProviderRepository, platform: &str) {
-        seed_provider_for_user(repo, DEFAULT_USER_ID, platform).await;
-    }
-
-    async fn seed_provider_for_user(repo: &dyn IProviderRepository, user_id: &str, platform: &str) {
         repo.create(CreateProviderParams {
             id: None,
-            user_id,
+            user_id: DEFAULT_USER_ID,
             platform,
             name: "Test Provider",
             base_url: "https://example.invalid",
@@ -4174,8 +4173,8 @@ mod tests {
     #[tokio::test]
     async fn list_for_user_isolates_user_authored_assistants() {
         let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
+        // No provider is seeded for user B: the fixture's provider is shared by every user.
         let user_b = create_test_user(&fx._db, "assistant_user_b").await;
-        seed_provider_for_user(&*fx.provider_repo, &user_b, "openai").await;
 
         fx.service
             .create_for_user(
@@ -6796,6 +6795,19 @@ mod tests {
         })
         .await;
         let resolved = fx.service.resolve_default_agent_id().await.unwrap();
+        assert_eq!(resolved, "632f31d2");
+    }
+
+    /// Providers are shared by every user (since 1.0.1): the fixture's provider
+    /// was added by the default user, and another user gets the same answer
+    /// instead of the "no providers configured" error.
+    #[tokio::test]
+    async fn resolve_default_agent_id_for_user_sees_providers_added_by_other_users() {
+        let fx = fixture().await;
+        let user_b = create_test_user(&fx._db, "assistant_provider_user_b").await;
+
+        let resolved = fx.service.resolve_default_agent_id_for_user(&user_b).await.unwrap();
+
         assert_eq!(resolved, "632f31d2");
     }
 

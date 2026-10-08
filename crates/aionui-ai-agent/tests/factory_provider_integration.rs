@@ -40,11 +40,15 @@ async fn setup() -> (
 }
 
 async fn insert_test_provider(repo: &dyn IProviderRepository, id: &str, platform: &str) {
+    insert_test_provider_added_by(repo, TEST_USER_ID, id, platform).await;
+}
+
+async fn insert_test_provider_added_by(repo: &dyn IProviderRepository, creator: &str, id: &str, platform: &str) {
     let key = test_encryption_key();
     let encrypted_api_key = encrypt_string("sk-test-key-12345", &key).unwrap();
     repo.create(CreateProviderParams {
         id: Some(id),
-        user_id: TEST_USER_ID,
+        user_id: creator,
         platform,
         name: "Test Provider",
         base_url: "https://api.example.com/v1",
@@ -192,6 +196,30 @@ async fn aionrs_factory_respects_use_model_override() {
             provider_id: "prov-002".into(),
             model: "gpt-4o".into(),
             use_model: Some("gpt-5.4".into()),
+        },
+        AionrsBuildExtra::default(),
+    );
+
+    let result = factory(options).await;
+    assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+}
+
+/// Providers are shared by every user (since 1.0.1): a conversation resolves
+/// its provider by id alone, even when a different user added it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aionrs_factory_resolves_a_provider_added_by_another_user() {
+    let (provider_repo, agent_registry, acp_agent_service) = setup().await;
+    insert_test_provider_added_by(&*provider_repo, "another_user", "prov-shared", "openai").await;
+    let factory = make_factory(provider_repo, agent_registry, acp_agent_service);
+
+    // `make_aionrs_options` builds the conversation for TEST_USER_ID, not the creator.
+    let options = make_aionrs_options(
+        "conv-test-shared",
+        "/tmp/test-workspace",
+        ProviderWithModel {
+            provider_id: "prov-shared".into(),
+            model: "gpt-4o".into(),
+            use_model: None,
         },
         AionrsBuildExtra::default(),
     );

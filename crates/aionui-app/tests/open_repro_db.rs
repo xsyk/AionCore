@@ -17,7 +17,7 @@ async fn open_old_db_and_decrypt_provider() {
     eprintln!("[cur] secret prefix: {}", &services.encryption_secret_raw[..12]);
     let repo = Arc::new(SqliteProviderRepository::new(services.database.pool().clone()));
     let svc = aionui_system::ProviderService::new(repo, key);
-    let list = svc.list("system_default_user").await.expect("list must not fail");
+    let list = svc.list(true).await.expect("list must not fail");
     let p = list.iter().find(|p| p.id == "repro-prov-1").expect("provider present");
     assert_eq!(
         p.api_key, "sk-repro-XYZ-123",

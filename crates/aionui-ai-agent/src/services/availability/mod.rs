@@ -44,7 +44,8 @@ struct AvailabilitySnapshot {
 pub struct AgentAvailabilityService {
     registry: Arc<AgentRegistry>,
     // Used to decide aionrs (built-in, no external CLI) availability: it is
-    // usable only when at least one model provider is configured & enabled.
+    // usable only when at least one model provider is configured & enabled
+    // (providers are shared by every user since 1.0.1).
     provider_repo: Arc<dyn IProviderRepository>,
 }
 
@@ -320,8 +321,10 @@ async fn run_probe(
         // aionrs is the built-in Rust agent: there is no external CLI to probe,
         // so its usability hinges entirely on having a configured model. It is
         // online only when at least one model provider is enabled — otherwise
-        // it cannot run a single turn.
-        probe_aionrs_provider_readiness(provider_repo, user_id).await
+        // it cannot run a single turn. Model providers are shared by every
+        // user (since 1.0.1), so any enabled provider on the server counts,
+        // whoever added it.
+        probe_aionrs_provider_readiness(provider_repo).await
     } else {
         (AgentSnapshotCheckStatus::Online, None, None)
     };
@@ -363,14 +366,15 @@ fn explicit_probe_args(meta: &AgentMetadata) -> Result<Vec<String>, String> {
 ///
 /// aionrs has no external CLI; it runs models through configured providers.
 /// Mirrors `AssistantService::resolve_default_agent_type`, which treats aionrs
-/// as usable exactly when at least one provider is enabled. With no enabled
-/// provider it cannot complete a turn, so we report it offline with a
-/// `no_provider` code the UI maps to "configure a model" guidance.
+/// as usable exactly when at least one provider is enabled. Providers are
+/// shared by every user (since 1.0.1), so having any enabled provider on the
+/// server is enough. With none it cannot complete a turn, so we report it
+/// offline with a `no_provider` code the UI maps to "configure a model"
+/// guidance.
 async fn probe_aionrs_provider_readiness(
     provider_repo: &Arc<dyn IProviderRepository>,
-    user_id: &str,
 ) -> (AgentSnapshotCheckStatus, Option<String>, Option<String>) {
-    match provider_repo.list(user_id).await {
+    match provider_repo.list().await {
         Ok(providers) if providers.iter().any(|p| p.enabled) => (AgentSnapshotCheckStatus::Online, None, None),
         Ok(_) => (
             AgentSnapshotCheckStatus::Offline,
@@ -446,7 +450,7 @@ mod tests {
         let db = init_database_memory().await.unwrap();
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
 
-        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo, TEST_USER_ID).await;
+        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo).await;
 
         assert_eq!(status, AgentSnapshotCheckStatus::Offline);
         assert_eq!(code.as_deref(), Some("no_provider"));
@@ -458,7 +462,27 @@ mod tests {
         let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
         provider_repo.create(enabled_provider_params()).await.unwrap();
 
-        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo, TEST_USER_ID).await;
+        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo).await;
+
+        assert_eq!(status, AgentSnapshotCheckStatus::Online);
+        assert!(code.is_none());
+    }
+
+    /// Providers are shared by every user, so the readiness verdict must not
+    /// depend on who added the enabled provider.
+    #[tokio::test]
+    async fn aionrs_is_online_when_another_user_added_the_enabled_provider() {
+        let db = init_database_memory().await.unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        provider_repo
+            .create(CreateProviderParams {
+                user_id: "another_user",
+                ..enabled_provider_params()
+            })
+            .await
+            .unwrap();
+
+        let (status, code, _msg) = probe_aionrs_provider_readiness(&provider_repo).await;
 
         assert_eq!(status, AgentSnapshotCheckStatus::Online);
         assert!(code.is_none());
