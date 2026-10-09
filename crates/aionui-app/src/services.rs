@@ -9,9 +9,12 @@ use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
 };
+use aionui_api_types::SessionMcpServer;
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
-use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
+use aionui_conversation::{
+    ConversationService, SharedSessionMcpSource, runtime_state::ConversationRuntimeStateService,
+};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
     IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository, SqliteAcpSessionRepository,
@@ -38,6 +41,20 @@ const IMAGE_GEN_MCP_SCRIPT_ENV: &str = "AIONUI_IMAGE_GEN_MCP_SCRIPT";
 /// The image generation script path out of the environment value, if any.
 fn image_generation_script_path(value: Option<OsString>) -> Option<PathBuf> {
     value.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+/// Hands the conversation service the server-wide MCP servers every session
+/// gets: today the image generation server, present while the administrator
+/// has it switched on and the server can run it.
+struct SharedSessionMcp {
+    image_generation: ImageGenerationService,
+}
+
+#[async_trait::async_trait]
+impl SharedSessionMcpSource for SharedSessionMcp {
+    async fn shared_servers(&self) -> Vec<SessionMcpServer> {
+        self.image_generation.session_server().await.into_iter().collect()
+    }
 }
 
 pub struct AppServices {
@@ -151,7 +168,21 @@ impl AppServices {
             runtime_token_service: self.runtime_token_service.clone(),
             project_service: self.project_service.clone(),
             user_order_store: self.user_order_store.clone(),
+            image_generation: self.image_generation_service.clone(),
         });
+        self
+    }
+
+    /// Replace the image generation service after construction.
+    ///
+    /// Primarily used by tests to inject a Node lookup. Sessions assembled from
+    /// now on get their image generation server from the new service.
+    pub fn with_image_generation_service(mut self, service: ImageGenerationService) -> Self {
+        self.conversation_service
+            .with_shared_session_mcp(Arc::new(SharedSessionMcp {
+                image_generation: service.clone(),
+            }));
+        self.image_generation_service = service;
         self
     }
 
@@ -438,6 +469,7 @@ impl AppServices {
             runtime_token_service: runtime_token_service.clone(),
             project_service: project_service.clone(),
             user_order_store: user_order_store.clone(),
+            image_generation: image_generation_service.clone(),
         });
 
         let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
@@ -518,6 +550,8 @@ struct ConversationServiceDeps<'a> {
     /// conversation cascades away its `user_order` rows (sidebar design §4.3,
     /// path 1).
     user_order_store: Arc<dyn IUserOrderStore>,
+    /// Source of the image generation server every session gets.
+    image_generation: ImageGenerationService,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -548,6 +582,9 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         deps.database.pool().clone(),
     )));
     service.with_provider_repo(Arc::new(SqliteProviderRepository::new(deps.database.pool().clone())));
+    service.with_shared_session_mcp(Arc::new(SharedSessionMcp {
+        image_generation: deps.image_generation,
+    }));
     if let Some(hook) = deps.task_manager_delete_hook {
         service.with_delete_hook(hook);
     }
@@ -630,6 +667,19 @@ mod tests {
             "backend binary path must stay cmd.exe-launchable, got {}",
             resolved.display()
         );
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn sessions_get_no_shared_mcp_server_while_image_generation_is_off() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+        let shared = SharedSessionMcp {
+            image_generation: services.image_generation_service.clone(),
+        };
+
+        assert!(shared.shared_servers().await.is_empty());
 
         services.database.close().await;
     }

@@ -60,6 +60,7 @@ use crate::convert::{
 use crate::error::ConversationError;
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
 use crate::session_mentions;
+use crate::shared_session_mcp::{SharedSessionMcpSource, merge_shared_session_mcp};
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
@@ -332,6 +333,10 @@ pub struct ConversationService {
     /// Only the agent-facing `conversation create` path reads this, to match an
     /// aionrs assistant's default model to one of the server's shared providers.
     provider_repo: Arc<RwLock<Option<Arc<dyn IProviderRepository>>>>,
+    /// Where the server-wide MCP servers (today: image generation) come from;
+    /// every session this service assembles gets them. `None` leaves the
+    /// session options exactly as the conversation stored them.
+    shared_session_mcp: Arc<RwLock<Option<Arc<dyn SharedSessionMcpSource>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
     /// Project-bind side branch (optional). `None` → binding is a no-op, so
@@ -418,6 +423,7 @@ impl ConversationService {
             assistant_state_repo: Arc::new(RwLock::new(None)),
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             provider_repo: Arc::new(RwLock::new(None)),
+            shared_session_mcp: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
@@ -617,6 +623,14 @@ impl ConversationService {
         }
     }
 
+    /// Register where the server-wide MCP servers come from. Every session
+    /// assembled from now on gets whatever the source answers at that moment.
+    pub fn with_shared_session_mcp(&self, source: Arc<dyn SharedSessionMcpSource>) {
+        if let Ok(mut guard) = self.shared_session_mcp.write() {
+            *guard = Some(source);
+        }
+    }
+
     pub fn with_assistant_dispatcher(&self, dispatcher: Arc<dyn AssistantRuleDispatcher>) {
         if let Ok(mut guard) = self.assistant_dispatcher.write() {
             *guard = Some(dispatcher);
@@ -776,6 +790,13 @@ impl ConversationService {
 
     pub(crate) fn provider_repo(&self) -> Option<Arc<dyn IProviderRepository>> {
         self.provider_repo.read().ok().and_then(|guard| guard.as_ref().cloned())
+    }
+
+    fn shared_session_mcp(&self) -> Option<Arc<dyn SharedSessionMcpSource>> {
+        self.shared_session_mcp
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
     }
 
     fn assistant_dispatcher(&self) -> Option<Arc<dyn AssistantRuleDispatcher>> {
@@ -4808,9 +4829,12 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options(row, seed)
-            .await
+        let mut options =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .build_options(row, seed)
+                .await?;
+        self.apply_shared_session_mcp(&mut options).await;
+        Ok(options)
     }
 
     pub async fn build_task_options_for_runtime(
@@ -4820,15 +4844,42 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options_with_workspace_override(row, workspace_override, seed)
-            .await
+        let mut options =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .build_options_with_workspace_override(row, workspace_override, seed)
+                .await?;
+        self.apply_shared_session_mcp(&mut options).await;
+        Ok(options)
+    }
+
+    /// Give a freshly assembled session the server-wide MCP servers.
+    ///
+    /// Runs on every assembly rather than once when the conversation is
+    /// created, so a setting the administrator changed reaches the next session
+    /// of an old conversation, and a snapshot stored with the conversation can
+    /// never keep a server the setting has since turned off. A service without a
+    /// source leaves the options as the conversation stored them.
+    async fn apply_shared_session_mcp(&self, options: &mut BuildTaskOptions) {
+        let Some(source) = self.shared_session_mcp() else {
+            return;
+        };
+        let shared = source.shared_servers().await;
+        let servers = match &mut options.context.kind {
+            AgentSessionKind::Acp(ctx) => &mut ctx.config.session_mcp_servers,
+            AgentSessionKind::Antigravity(ctx) => &mut ctx.config.session_mcp_servers,
+            AgentSessionKind::Aionrs(ctx) => &mut ctx.config.session_mcp_servers,
+        };
+        merge_shared_session_mcp(servers, shared);
     }
 
     /// Re-read the persisted resume anchor into a turn's `BuildTaskOptions`
     /// before an auto-replay (see `SessionContextBuilder::refresh_resume_anchor`).
     /// Best-effort: a refresh failure keeps the turn-start snapshot (= the
     /// pre-fix behavior) and warns, so the replay itself still runs.
+    ///
+    /// The options were assembled by `build_task_options` earlier in the same
+    /// turn, so they already carry the server-wide MCP servers; only the resume
+    /// anchor is re-read here.
     pub(crate) async fn refresh_resume_anchor_for_replay(&self, conv_id: &str, options: &mut BuildTaskOptions) {
         let builder =
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo);

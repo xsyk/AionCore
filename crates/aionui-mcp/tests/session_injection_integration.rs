@@ -352,12 +352,11 @@ fn si_7_builtin_image_gen_injection() {
     };
 
     let img_config = ImageGenConfig {
-        model: Some("dall-e-3".into()),
-        api_url: Some("https://api.openai.com/v1".into()),
+        provider_id: Some("prov_1".into()),
+        platform: Some("openai".into()),
+        base_url: Some("https://api.openai.com/v1".into()),
         api_key: Some("sk-test-key".into()),
-        size: Some("1024x1024".into()),
-        quality: Some("hd".into()),
-        style: Some("natural".into()),
+        model: Some("dall-e-3".into()),
     };
 
     // Build user servers
@@ -387,16 +386,15 @@ fn si_7_builtin_image_gen_injection() {
             assert_eq!(name, "aionui-image-generation");
             assert_eq!(command, "/usr/local/bin/aionui-img-gen");
 
-            // Verify all 6 env vars are present
-            assert_eq!(env.len(), 6);
+            // Exactly the five variables the image generation script reads
+            assert_eq!(env.len(), 5);
 
             let env_map: HashMap<&str, &str> = env.iter().map(|p| (p.name.as_str(), p.value.as_str())).collect();
-            assert_eq!(env_map["AIONUI_IMG_MODEL"], "dall-e-3");
-            assert_eq!(env_map["AIONUI_IMG_API_URL"], "https://api.openai.com/v1");
+            assert_eq!(env_map["AIONUI_IMG_PROVIDER_ID"], "prov_1");
+            assert_eq!(env_map["AIONUI_IMG_PLATFORM"], "openai");
+            assert_eq!(env_map["AIONUI_IMG_BASE_URL"], "https://api.openai.com/v1");
             assert_eq!(env_map["AIONUI_IMG_API_KEY"], "sk-test-key");
-            assert_eq!(env_map["AIONUI_IMG_SIZE"], "1024x1024");
-            assert_eq!(env_map["AIONUI_IMG_QUALITY"], "hd");
-            assert_eq!(env_map["AIONUI_IMG_STYLE"], "natural");
+            assert_eq!(env_map["AIONUI_IMG_MODEL"], "dall-e-3");
         }
         _ => panic!("expected Stdio variant for builtin"),
     }

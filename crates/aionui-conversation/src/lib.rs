@@ -20,6 +20,7 @@ pub mod service;
 mod service_ops;
 pub(crate) mod session_context;
 pub mod session_mentions;
+mod shared_session_mcp;
 pub mod skill_resolver;
 pub mod skill_snapshot;
 mod startup_recovery;
@@ -43,6 +44,7 @@ pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
 };
+pub use shared_session_mcp::{SharedSessionMcpSource, merge_shared_session_mcp};
 pub use state::ConversationRouterState;
 
 #[cfg(test)]

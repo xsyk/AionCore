@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use aionui_api_types::IMAGE_GENERATION_MCP_NAME;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{McpServer, McpServerTransport};
@@ -90,16 +91,17 @@ impl Default for AcpMcpCapabilities {
 
 /// Configuration for the builtin image generation MCP server.
 ///
-/// Values are injected as environment variables when building
-/// the builtin MCP server config for ACP sessions.
+/// Values are injected as the environment variables the image generation
+/// script reads (`AIONUI_IMG_PROVIDER_ID`, `_PLATFORM`, `_BASE_URL`,
+/// `_API_KEY` and `_MODEL`) when building the builtin MCP server config for
+/// ACP sessions.
 #[derive(Debug, Clone, Default)]
 pub struct ImageGenConfig {
-    pub model: Option<String>,
-    pub api_url: Option<String>,
+    pub provider_id: Option<String>,
+    pub platform: Option<String>,
+    pub base_url: Option<String>,
     pub api_key: Option<String>,
-    pub size: Option<String>,
-    pub quality: Option<String>,
-    pub style: Option<String>,
+    pub model: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +158,7 @@ pub fn build_builtin_image_gen_server(
     let env = build_image_gen_env(config);
 
     Some(AcpSessionMcpServer::Stdio {
-        name: "aionui-image-generation".into(),
+        name: IMAGE_GENERATION_MCP_NAME.into(),
         command: command.to_owned(),
         args: Vec::new(),
         env,
@@ -217,13 +219,12 @@ fn hashmap_to_pairs(map: &HashMap<String, String>) -> Vec<NameValuePair> {
 ///
 /// Sorted by name for deterministic output, consistent with `hashmap_to_pairs`.
 fn build_image_gen_env(config: &ImageGenConfig) -> Vec<NameValuePair> {
-    let entries: [(&str, &Option<String>); 6] = [
+    let entries: [(&str, &Option<String>); 5] = [
         ("AIONUI_IMG_API_KEY", &config.api_key),
-        ("AIONUI_IMG_API_URL", &config.api_url),
+        ("AIONUI_IMG_BASE_URL", &config.base_url),
         ("AIONUI_IMG_MODEL", &config.model),
-        ("AIONUI_IMG_QUALITY", &config.quality),
-        ("AIONUI_IMG_SIZE", &config.size),
-        ("AIONUI_IMG_STYLE", &config.style),
+        ("AIONUI_IMG_PLATFORM", &config.platform),
+        ("AIONUI_IMG_PROVIDER_ID", &config.provider_id),
     ];
 
     entries
@@ -520,12 +521,11 @@ mod tests {
     fn builtin_image_gen_with_full_config() {
         let caps = all_caps();
         let config = ImageGenConfig {
-            model: Some("dall-e-3".into()),
-            api_url: Some("https://api.openai.com".into()),
+            provider_id: Some("prov_1".into()),
+            platform: Some("openai".into()),
+            base_url: Some("https://api.openai.com".into()),
             api_key: Some("sk-test".into()),
-            size: Some("1024x1024".into()),
-            quality: Some("hd".into()),
-            style: Some("natural".into()),
+            model: Some("dall-e-3".into()),
         };
         let result = build_builtin_image_gen_server(&caps, "/usr/bin/img-gen", &config);
         assert!(result.is_some());
@@ -539,9 +539,18 @@ mod tests {
                 assert_eq!(name, "aionui-image-generation");
                 assert_eq!(command, "/usr/bin/img-gen");
                 assert!(args.is_empty());
-                assert_eq!(env.len(), 6);
-                assert_eq!(env[0].name, "AIONUI_IMG_API_KEY");
-                assert_eq!(env[0].value, "sk-test");
+                // Sorted by name: exactly the five variables the script reads.
+                let pairs: Vec<(&str, &str)> = env.iter().map(|p| (p.name.as_str(), p.value.as_str())).collect();
+                assert_eq!(
+                    pairs,
+                    [
+                        ("AIONUI_IMG_API_KEY", "sk-test"),
+                        ("AIONUI_IMG_BASE_URL", "https://api.openai.com"),
+                        ("AIONUI_IMG_MODEL", "dall-e-3"),
+                        ("AIONUI_IMG_PLATFORM", "openai"),
+                        ("AIONUI_IMG_PROVIDER_ID", "prov_1"),
+                    ]
+                );
             }
             _ => panic!("expected Stdio"),
         }
@@ -552,7 +561,7 @@ mod tests {
         let caps = all_caps();
         let config = ImageGenConfig {
             model: Some("dall-e-3".into()),
-            api_url: Some("https://api.openai.com".into()),
+            base_url: Some("https://api.openai.com".into()),
             ..Default::default()
         };
         let result = build_builtin_image_gen_server(&caps, "img-gen", &config);
@@ -560,8 +569,8 @@ mod tests {
         match result.unwrap() {
             AcpSessionMcpServer::Stdio { env, .. } => {
                 assert_eq!(env.len(), 2);
-                // Sorted alphabetically: API_URL before MODEL
-                assert_eq!(env[0].name, "AIONUI_IMG_API_URL");
+                // Sorted alphabetically: BASE_URL before MODEL
+                assert_eq!(env[0].name, "AIONUI_IMG_BASE_URL");
                 assert_eq!(env[0].value, "https://api.openai.com");
                 assert_eq!(env[1].name, "AIONUI_IMG_MODEL");
                 assert_eq!(env[1].value, "dall-e-3");
