@@ -24,6 +24,7 @@ const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
 
 pub(crate) struct SessionContextBuilder<'a> {
     workspace_root: &'a Path,
+    legacy_workspace_roots: &'a [PathBuf],
     agent_metadata_repo: &'a Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: &'a Arc<dyn IAcpSessionRepository>,
 }
@@ -36,9 +37,17 @@ impl<'a> SessionContextBuilder<'a> {
     ) -> Self {
         Self {
             workspace_root,
+            legacy_workspace_roots: &[],
             agent_metadata_repo,
             acp_session_repo,
         }
+    }
+
+    /// Also recognize auto workspaces under these earlier roots. New
+    /// workspaces are still provisioned under `workspace_root` only.
+    pub(crate) fn with_legacy_workspace_roots(mut self, roots: &'a [PathBuf]) -> Self {
+        self.legacy_workspace_roots = roots;
+        self
     }
 
     pub(crate) async fn build_options(
@@ -154,11 +163,14 @@ impl<'a> SessionContextBuilder<'a> {
             });
         };
 
+        // An auto workspace may sit under the current root or under a legacy one
+        // (the work dir moved after the conversation was created).
+        let auto_roots = self.recognized_workspace_roots();
         let normalized = match validate_workspace_path_availability(stored_path) {
             Ok(normalized) => normalized,
             Err(WorkspacePathValidationError::DoesNotExist(path))
                 if is_auto_workspace(
-                    self.workspace_root,
+                    &auto_roots,
                     &row.id,
                     agent_type,
                     extra.get("backend"),
@@ -175,7 +187,7 @@ impl<'a> SessionContextBuilder<'a> {
 
         Ok(WorkspaceContext {
             is_custom: !is_auto_workspace(
-                self.workspace_root,
+                &auto_roots,
                 &row.id,
                 agent_type,
                 extra.get("backend"),
@@ -184,6 +196,10 @@ impl<'a> SessionContextBuilder<'a> {
             stored_path: stored_path.to_owned(),
             path: normalized,
         })
+    }
+
+    fn recognized_workspace_roots(&self) -> Vec<&Path> {
+        recognized_roots(self.workspace_root, self.legacy_workspace_roots)
     }
 
     async fn build_kind(
@@ -596,6 +612,15 @@ fn decode_persisted_session_state(state: aionui_db::PersistedSessionState) -> Pe
     decoded
 }
 
+/// The current root first, then the legacy ones: every root under which an auto
+/// workspace of this server may already exist. New workspaces are provisioned
+/// under the current root only.
+pub(crate) fn recognized_roots<'a>(current: &'a Path, legacy: &'a [PathBuf]) -> Vec<&'a Path> {
+    std::iter::once(current)
+        .chain(legacy.iter().map(PathBuf::as_path))
+        .collect()
+}
+
 fn expected_auto_workspace_path(
     workspace_root: &Path,
     user_id: &str,
@@ -636,14 +661,24 @@ fn auto_workspace_parent(workspace_root: &Path, user_id: &str) -> PathBuf {
 /// under `users/system_default_user/` after an account adoption. Structural
 /// matching fixes both. Mirrors the delete-side
 /// `is_dated_auto_workspace_relative_path` in `service.rs`.
+///
+/// `workspace_roots` is the current root plus any legacy ones; the candidate
+/// counts as auto when it sits in that layout under `conversations/` of any of
+/// them, so a work dir that moved does not turn old temp workspaces "custom".
 fn is_auto_workspace(
-    workspace_root: &Path,
+    workspace_roots: &[&Path],
     conversation_id: &str,
     agent_type: &AgentType,
     backend: Option<&serde_json::Value>,
     candidate: &Path,
 ) -> bool {
     let expected_leaf = format!("{}-temp-{conversation_id}", conversation_label(agent_type, backend));
+    workspace_roots
+        .iter()
+        .any(|root| is_auto_workspace_under_root(root, &expected_leaf, candidate))
+}
+
+fn is_auto_workspace_under_root(workspace_root: &Path, expected_leaf: &str, candidate: &Path) -> bool {
     let Ok(relative) = candidate.strip_prefix(workspace_root.join("conversations")) else {
         return false;
     };
@@ -1258,6 +1293,122 @@ mod tests {
         assert_eq!(context.workspace.path, custom.to_string_lossy());
     }
 
+    // The work dir moved (data dir -> a dedicated dir) after this conversation
+    // was created: its stored workspace still sits under the previous root.
+    fn legacy_auto_workspace(legacy_root: &Path) -> PathBuf {
+        legacy_root.join("conversations/users/user-1/2026/10/01/aionrs-temp-conv-1")
+    }
+
+    #[tokio::test]
+    async fn existing_workspace_under_a_legacy_root_is_still_an_auto_workspace() {
+        let repos = setup().await;
+        let legacy_root = repos.workspace_root.join("legacy-data");
+        let workspace = legacy_auto_workspace(&legacy_root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let row = row(
+            "aionrs",
+            serde_json::json!({ "workspace": workspace.to_string_lossy() }),
+            None,
+        );
+
+        // Without the legacy root the same directory is somebody's own folder.
+        let unaware = repos.builder().build(&row).await.unwrap();
+        assert!(unaware.workspace.is_custom);
+
+        let legacy_roots = vec![legacy_root];
+        let context = repos
+            .builder()
+            .with_legacy_workspace_roots(&legacy_roots)
+            .build(&row)
+            .await
+            .unwrap();
+        assert!(!context.workspace.is_custom);
+        assert_eq!(context.workspace.path, workspace.to_string_lossy());
+        assert_eq!(context.workspace.stored_path, workspace.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn missing_workspace_under_a_legacy_root_is_a_temp_workspace_not_an_error() {
+        let repos = setup().await;
+        let legacy_root = repos.workspace_root.join("legacy-data");
+        let workspace = legacy_auto_workspace(&legacy_root);
+        assert!(!workspace.exists());
+        let row = row(
+            "aionrs",
+            serde_json::json!({ "workspace": workspace.to_string_lossy() }),
+            None,
+        );
+
+        // Without the legacy root a vanished directory is an unavailable custom path.
+        let err = repos.builder().build(&row).await.unwrap_err();
+        assert!(matches!(err, ConversationError::WorkspacePathRuntimeUnavailable { .. }));
+
+        let legacy_roots = vec![legacy_root];
+        let context = repos
+            .builder()
+            .with_legacy_workspace_roots(&legacy_roots)
+            .build(&row)
+            .await
+            .unwrap();
+        assert!(!context.workspace.is_custom);
+        assert_eq!(context.workspace.path, workspace.to_string_lossy());
+        assert!(
+            !workspace.exists(),
+            "reading the context must not recreate the directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_roots_do_not_turn_other_directories_into_auto_workspaces() {
+        let repos = setup().await;
+        let legacy_root = repos.workspace_root.join("legacy-data");
+        let legacy_roots = vec![legacy_root.clone()];
+
+        // Another conversation's leaf under the legacy root is not this one's.
+        let other = legacy_root.join("conversations/users/user-1/2026/10/01/aionrs-temp-conv-2");
+        std::fs::create_dir_all(&other).unwrap();
+        // A plain folder under the legacy root's conversations dir is a user folder.
+        let plain = legacy_root.join("conversations/my-notes");
+        std::fs::create_dir_all(&plain).unwrap();
+
+        for custom in [other, plain] {
+            let row = row(
+                "aionrs",
+                serde_json::json!({ "workspace": custom.to_string_lossy() }),
+                None,
+            );
+            let context = repos
+                .builder()
+                .with_legacy_workspace_roots(&legacy_roots)
+                .build(&row)
+                .await
+                .unwrap();
+            assert!(context.workspace.is_custom, "{} must stay custom", custom.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_workspace_still_provisions_under_the_current_root_only() {
+        let repos = setup().await;
+        let legacy_root = repos.workspace_root.join("legacy-data");
+        let legacy_roots = vec![legacy_root.clone()];
+        let row = row("aionrs", serde_json::json!({}), None);
+
+        let context = repos
+            .builder()
+            .with_legacy_workspace_roots(&legacy_roots)
+            .build(&row)
+            .await
+            .unwrap();
+        assert!(!context.workspace.is_custom);
+        assert!(
+            Path::new(&context.workspace.path).starts_with(repos.workspace_root.join("conversations")),
+            "new workspaces belong to the current root, got {}",
+            context.workspace.path
+        );
+        assert!(!legacy_root.exists());
+    }
+
     #[test]
     fn is_auto_workspace_matches_by_structure_across_user_and_date() {
         let root = std::path::Path::new("/w");
@@ -1272,7 +1423,7 @@ mod tests {
         );
         assert!(new_path.to_string_lossy().ends_with("-temp-conv-1"));
 
-        let auto = |candidate: &std::path::Path| is_auto_workspace(root, "conv-1", &AgentType::Acp, None, candidate);
+        let auto = |candidate: &std::path::Path| is_auto_workspace(&[root], "conv-1", &AgentType::Acp, None, candidate);
         let dated = |segments: &[&str], leaf: &str| {
             let mut p = root.join("conversations");
             for seg in segments {
@@ -1325,6 +1476,23 @@ mod tests {
 
         // A genuinely custom path is not auto.
         assert!(!auto(&root.join("somewhere-else")));
+    }
+
+    #[test]
+    fn is_auto_workspace_tries_every_root() {
+        let current = Path::new("/w");
+        let legacy = Path::new("/old");
+        let in_legacy = legacy.join("conversations/users/u/2026/10/01/acp-temp-conv-1");
+        let in_current = current.join("conversations/users/u/2026/10/01/acp-temp-conv-1");
+        let elsewhere = Path::new("/elsewhere/conversations/users/u/2026/10/01/acp-temp-conv-1");
+        let auto =
+            |roots: &[&Path], candidate: &Path| is_auto_workspace(roots, "conv-1", &AgentType::Acp, None, candidate);
+
+        assert!(auto(&[current, legacy], &in_legacy));
+        assert!(auto(&[current, legacy], &in_current));
+        assert!(!auto(&[current], &in_legacy), "legacy root not registered");
+        assert!(!auto(&[current, legacy], elsewhere));
+        assert!(!auto(&[], &in_current), "no roots, nothing is auto");
     }
 
     #[test]

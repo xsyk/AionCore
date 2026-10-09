@@ -58,7 +58,7 @@ use crate::convert::{
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
 use crate::error::ConversationError;
-use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
+use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder, recognized_roots};
 use crate::session_mentions;
 use crate::shared_session_mcp::{SharedSessionMcpSource, merge_shared_session_mcp};
 use crate::skill_resolver::SkillResolver;
@@ -314,6 +314,10 @@ fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), Conversati
 #[derive(Clone)]
 pub struct ConversationService {
     workspace_root: PathBuf,
+    /// Earlier roots whose `conversations/...` auto workspaces are still on disk
+    /// (the work dir moved since they were created). Recognized and cleaned up
+    /// exactly like the current root's; new workspaces never go there.
+    legacy_workspace_roots: Vec<PathBuf>,
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Arc<dyn SkillResolver>,
     task_manager: Arc<dyn IWorkerTaskManager>,
@@ -413,6 +417,7 @@ impl ConversationService {
     ) -> Self {
         Self {
             workspace_root,
+            legacy_workspace_roots: Vec::new(),
             broadcaster,
             skill_resolver,
             task_manager,
@@ -437,6 +442,14 @@ impl ConversationService {
             agent_metadata_repo,
             acp_session_repo,
         }
+    }
+
+    /// Register earlier work-dir roots whose auto workspaces must still be
+    /// recognized (session context, delete cleanup). Creation keeps using the
+    /// current root only.
+    pub fn with_legacy_workspace_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.legacy_workspace_roots = roots;
+        self
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
@@ -764,7 +777,19 @@ impl ConversationService {
         row: &aionui_db::models::ConversationRow,
         conversation_id: &str,
     ) -> Option<PathBuf> {
-        auto_provisioned_workspace_to_delete(&self.workspace_root, row, conversation_id)
+        auto_provisioned_workspace_to_delete(&self.recognized_workspace_roots(), row, conversation_id)
+    }
+
+    /// Every root whose `conversations/` tree may hold one of this server's auto
+    /// workspaces. Only the current root is ever written to (see
+    /// `auto_workspace_parent`).
+    fn recognized_workspace_roots(&self) -> Vec<&Path> {
+        recognized_roots(&self.workspace_root, &self.legacy_workspace_roots)
+    }
+
+    fn session_context_builder(&self) -> SessionContextBuilder<'_> {
+        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+            .with_legacy_workspace_roots(&self.legacy_workspace_roots)
     }
 
     pub(crate) fn assistant_definition_repo(&self) -> Option<Arc<dyn IAssistantDefinitionRepository>> {
@@ -2607,7 +2632,8 @@ impl ConversationService {
             .source
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
-        let mut auto_workspace_to_delete = auto_provisioned_workspace_to_delete(&self.workspace_root, &existing, id);
+        let mut auto_workspace_to_delete =
+            auto_provisioned_workspace_to_delete(&self.recognized_workspace_roots(), &existing, id);
         // Shared-workspace guard: a forked conversation inherits the parent's
         // auto workspace verbatim (claude keys on-disk sessions by cwd), so
         // deleting the parent must not rip the directory out from under the
@@ -2689,7 +2715,7 @@ impl ConversationService {
                 }
             };
             if workspace_removed {
-                cleanup_empty_date_workspace_parents(&self.workspace_root, &workspace).await;
+                cleanup_empty_date_workspace_parents(&self.recognized_workspace_roots(), &workspace).await;
             }
         }
 
@@ -4829,10 +4855,7 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
-        let mut options =
-            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-                .build_options(row, seed)
-                .await?;
+        let mut options = self.session_context_builder().build_options(row, seed).await?;
         self.apply_shared_session_mcp(&mut options).await;
         Ok(options)
     }
@@ -4844,10 +4867,10 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
-        let mut options =
-            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-                .build_options_with_workspace_override(row, workspace_override, seed)
-                .await?;
+        let mut options = self
+            .session_context_builder()
+            .build_options_with_workspace_override(row, workspace_override, seed)
+            .await?;
         self.apply_shared_session_mcp(&mut options).await;
         Ok(options)
     }
@@ -4881,8 +4904,7 @@ impl ConversationService {
     /// turn, so they already carry the server-wide MCP servers; only the resume
     /// anchor is re-read here.
     pub(crate) async fn refresh_resume_anchor_for_replay(&self, conv_id: &str, options: &mut BuildTaskOptions) {
-        let builder =
-            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo);
+        let builder = self.session_context_builder();
         if let Err(err) = builder.refresh_resume_anchor(conv_id, options).await {
             warn!(
                 conversation_id = %conv_id,
@@ -5175,8 +5197,13 @@ fn auto_workspace_parent(workspace_root: &Path, user_id: &str) -> PathBuf {
         .join(format!("{:02}", now.day()))
 }
 
+/// The directory this conversation's auto-provisioned workspace occupies, when
+/// it has one: an existing, absolute `extra.workspace` named
+/// `...-temp-{conversation_id}` that sits in the auto layout under
+/// `<root>/conversations` of ANY of `workspace_roots` (the current root and the
+/// legacy ones). User-supplied directories never match.
 fn auto_provisioned_workspace_to_delete(
-    workspace_root: &Path,
+    workspace_roots: &[&Path],
     row: &ConversationRow,
     conversation_id: &str,
 ) -> Option<PathBuf> {
@@ -5191,8 +5218,6 @@ fn auto_provisioned_workspace_to_delete(
         return None;
     }
 
-    let conversations_root = workspace_root.join("conversations");
-    let conversations_root = std::fs::canonicalize(conversations_root).ok()?;
     let workspace_path = std::fs::canonicalize(workspace_path).ok()?;
     let file_name = workspace_path.file_name()?.to_str()?;
     let expected_suffix = format!("-temp-{conversation_id}");
@@ -5200,12 +5225,23 @@ fn auto_provisioned_workspace_to_delete(
         return None;
     }
 
-    let relative = workspace_path.strip_prefix(&conversations_root).ok()?;
-    if !is_auto_workspace_relative_path(relative) {
-        return None;
-    }
+    let is_auto = workspace_roots.iter().any(|root| {
+        path_below_conversations_root(root, &workspace_path)
+            .is_some_and(|relative| is_auto_workspace_relative_path(&relative))
+    });
+    is_auto.then_some(workspace_path)
+}
 
-    Some(workspace_path)
+/// `workspace_path` (already canonical) relative to `<root>/conversations`, when
+/// it lies below it. The conversations directory is canonicalized here so a
+/// symlinked root compares correctly; a root without one (a legacy root that
+/// never held a workspace) yields `None`.
+fn path_below_conversations_root(root: &Path, workspace_path: &Path) -> Option<PathBuf> {
+    let conversations_root = std::fs::canonicalize(root.join("conversations")).ok()?;
+    workspace_path
+        .strip_prefix(conversations_root)
+        .ok()
+        .map(Path::to_path_buf)
 }
 
 /// True when `leaf` is an auto-generated workspace directory name. Auto/temp
@@ -5275,8 +5311,8 @@ pub fn is_temp_session_workspace(workspace: &Path) -> bool {
         .is_some_and(is_temp_leaf)
 }
 
-async fn cleanup_empty_date_workspace_parents(workspace_root: &Path, workspace_path: &Path) {
-    let Some(date_dirs) = date_workspace_parent_dirs(workspace_root, workspace_path) else {
+async fn cleanup_empty_date_workspace_parents(workspace_roots: &[&Path], workspace_path: &Path) {
+    let Some(date_dirs) = date_workspace_parent_dirs(workspace_roots, workspace_path) else {
         return;
     };
 
@@ -5303,10 +5339,12 @@ async fn cleanup_empty_date_workspace_parents(workspace_root: &Path, workspace_p
     }
 }
 
-fn date_workspace_parent_dirs(workspace_root: &Path, workspace_path: &Path) -> Option<[PathBuf; 3]> {
-    let conversations_root = std::fs::canonicalize(workspace_root.join("conversations")).ok()?;
-    let relative = workspace_path.strip_prefix(&conversations_root).ok()?;
-    if !is_dated_auto_workspace_relative_path(relative) {
+fn date_workspace_parent_dirs(workspace_roots: &[&Path], workspace_path: &Path) -> Option<[PathBuf; 3]> {
+    let is_dated = workspace_roots.iter().any(|root| {
+        path_below_conversations_root(root, workspace_path)
+            .is_some_and(|relative| is_dated_auto_workspace_relative_path(&relative))
+    });
+    if !is_dated {
         return None;
     }
 

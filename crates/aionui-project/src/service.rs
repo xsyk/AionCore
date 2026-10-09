@@ -21,6 +21,10 @@ use crate::types::{
 pub struct ProjectService {
     store: Arc<dyn IProjectStore>,
     temp_root: PathBuf,
+    /// Earlier temp roots (same shape as `temp_root`) that still hold session
+    /// directories created before the work dir moved. They only take part in
+    /// classification; new temp directories are always created under `temp_root`.
+    legacy_temp_roots: Vec<PathBuf>,
     /// Sink for project-root changes to the source-control actor. Shared across
     /// clones (behind `Arc`) so the one instance the scm monitor installs the
     /// sender on is the same one the HTTP handlers see. Set once at startup;
@@ -30,10 +34,11 @@ pub struct ProjectService {
 }
 
 impl ProjectService {
-    pub fn new(store: Arc<dyn IProjectStore>, temp_root: PathBuf) -> Self {
+    pub fn new(store: Arc<dyn IProjectStore>, temp_root: PathBuf, legacy_temp_roots: Vec<PathBuf>) -> Self {
         Self {
             store,
             temp_root,
+            legacy_temp_roots,
             scm_roots_tx: Arc::new(OnceLock::new()),
         }
     }
@@ -93,7 +98,8 @@ impl ProjectService {
     }
 
     /// Lazy backfill of an existing path. Does not create directories; `kind`
-    /// is decided here (under `temp_root` ⇒ temp, otherwise standard).
+    /// is decided here (under `temp_root` or a legacy temp root ⇒ temp,
+    /// otherwise standard).
     pub async fn resolve_existing(&self, user_id: &str, uri: String) -> Result<ResolveOutput, ProjectError> {
         let canonical = canonical::canonicalize(&uri)?;
         self.ensure_accessible(&canonical)?;
@@ -437,22 +443,16 @@ impl ProjectService {
         Ok(dir)
     }
 
-    /// Whether a canonical folder lives under this service's temp root
-    /// (both sides canonicalized so the comparison is lexically consistent).
+    /// Whether a canonical folder lives under this service's temp root or one of
+    /// its legacy temp roots (both sides canonicalized so the comparison is
+    /// lexically consistent).
     fn is_under_temp_root(&self, canonical: &Canonical) -> bool {
         let Ok(target) = canonical::fs_path(canonical) else {
             return false;
         };
-        let Ok(root_uri) = canonical::to_file_uri(&self.temp_root) else {
-            return false;
-        };
-        let Ok(root_canonical) = canonical::canonicalize(&root_uri) else {
-            return false;
-        };
-        let Ok(root_path) = canonical::fs_path(&root_canonical) else {
-            return false;
-        };
-        target.starts_with(root_path)
+        std::iter::once(&self.temp_root)
+            .chain(&self.legacy_temp_roots)
+            .any(|root| is_under_root(&target, root))
     }
 
     fn build_folder_dto(&self, folder: &FolderRow) -> FolderDto {
@@ -475,6 +475,22 @@ impl ProjectService {
             runtime_error,
         }
     }
+}
+
+/// Whether `target` (already a canonical filesystem path) lies under `root`,
+/// with `root` canonicalized the same way so the comparison is lexical on both
+/// sides.
+fn is_under_root(target: &Path, root: &Path) -> bool {
+    let Ok(root_uri) = canonical::to_file_uri(root) else {
+        return false;
+    };
+    let Ok(root_canonical) = canonical::canonicalize(&root_uri) else {
+        return false;
+    };
+    let Ok(root_path) = canonical::fs_path(&root_canonical) else {
+        return false;
+    };
+    target.starts_with(root_path)
 }
 
 /// The final path segment of a directory, used as a temp project name.

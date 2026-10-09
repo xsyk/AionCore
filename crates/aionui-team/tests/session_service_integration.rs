@@ -3095,6 +3095,7 @@ async fn create_team_side_branch_backfills_project_binding_when_injected() {
     svc.with_project_service(Arc::new(aionui_project::ProjectService::new(
         store,
         std::env::temp_dir().join("aionui-team-bind-test-conversations"),
+        Vec::new(),
     )));
 
     let workspace_dir = std::env::temp_dir().join(format!("aionui-team-bind-{}", aionui_common::generate_id()));

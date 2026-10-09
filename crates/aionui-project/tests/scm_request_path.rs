@@ -45,7 +45,11 @@ struct Fixture {
 async fn fixture() -> Fixture {
     let db = init_database_memory().await.expect("db");
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
-    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
+    let service = Arc::new(ProjectService::new(
+        Arc::clone(&store),
+        std::env::temp_dir(),
+        Vec::new(),
+    ));
 
     // A real repository with a file one directory deep, so `dir/sub/../file`-style
     // spellings have something to resolve against.

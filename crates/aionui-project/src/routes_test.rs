@@ -30,7 +30,11 @@ use crate::types::ProjectError;
 async fn setup() -> (Router, String, String, TempDir, Database) {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
-    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
+    let service = Arc::new(ProjectService::new(
+        Arc::clone(&store),
+        std::env::temp_dir(),
+        Vec::new(),
+    ));
 
     let dir = tempfile::tempdir().unwrap();
     let created = service

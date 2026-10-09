@@ -36,6 +36,7 @@ async fn setup_targets_ctx() -> TargetsCtx {
     let project_service = Arc::new(ProjectService::new(
         store,
         std::env::temp_dir().join("aionui-session-message-targets-test"),
+        Vec::new(),
     ));
     TargetsCtx {
         targets: MentionableTargets::new(repo.clone(), project_service),

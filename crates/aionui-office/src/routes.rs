@@ -622,7 +622,11 @@ mod tests {
 
         let db = aionui_db::init_database_memory().await.unwrap();
         let store: Arc<dyn aionui_db::IProjectStore> = Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
-        let project = Arc::new(aionui_project::ProjectService::new(store, std::env::temp_dir()));
+        let project = Arc::new(aionui_project::ProjectService::new(
+            store,
+            std::env::temp_dir(),
+            Vec::new(),
+        ));
 
         OfficeRouterState {
             watch_manager: wm,

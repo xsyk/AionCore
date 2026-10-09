@@ -8,9 +8,16 @@ use aionui_project::canonical::{canonicalize, to_file_uri};
 use aionui_project::types::{AttachInput, FileOp, ReferenceInput};
 
 async fn harness(temp_root: PathBuf) -> (ProjectService, Arc<dyn IProjectStore>, Database) {
+    harness_with_legacy_roots(temp_root, Vec::new()).await
+}
+
+async fn harness_with_legacy_roots(
+    temp_root: PathBuf,
+    legacy_temp_roots: Vec<PathBuf>,
+) -> (ProjectService, Arc<dyn IProjectStore>, Database) {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
-    let service = ProjectService::new(Arc::clone(&store), temp_root);
+    let service = ProjectService::new(Arc::clone(&store), temp_root, legacy_temp_roots);
     (service, store, db)
 }
 
@@ -96,6 +103,88 @@ async fn resolve_existing_classifies_temp_vs_standard_by_temp_root() {
         .await
         .unwrap();
     assert_eq!(standard.project.kind, "standard");
+}
+
+// A deployment that moved its work dir keeps the old root's auto workspaces on
+// disk (and in `conversations.extra.workspace`). Those must keep classifying as
+// temp projects, otherwise a lazy backfill would show them as user projects.
+#[tokio::test]
+async fn resolve_existing_classifies_legacy_temp_root_as_temp() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let legacy_root = tempfile::tempdir().unwrap();
+    let legacy_conversations = legacy_root.path().join("conversations");
+    let (svc, _store, _db) =
+        harness_with_legacy_roots(temp_root.path().to_path_buf(), vec![legacy_conversations.clone()]).await;
+
+    let under_legacy = legacy_conversations.join("users/u/2026/10/01/claude-temp-abc");
+    std::fs::create_dir_all(&under_legacy).unwrap();
+    let temp = svc
+        .resolve_existing("system_default_user", uri_of(&under_legacy))
+        .await
+        .unwrap();
+    assert_eq!(temp.project.kind, "temp");
+
+    // The current root keeps working next to the legacy one.
+    let under_current = temp_root.path().join("users/u/2026/10/02/claude-temp-def");
+    std::fs::create_dir_all(&under_current).unwrap();
+    let current = svc
+        .resolve_existing("system_default_user", uri_of(&under_current))
+        .await
+        .unwrap();
+    assert_eq!(current.project.kind, "temp");
+
+    // An ordinary directory (outside every root) is still a standard project.
+    let outside = tempfile::tempdir().unwrap();
+    let standard = svc
+        .resolve_existing("system_default_user", uri_of(outside.path()))
+        .await
+        .unwrap();
+    assert_eq!(standard.project.kind, "standard");
+}
+
+// Guard for the test above: the legacy root is what makes the difference, i.e.
+// without it the same path is an ordinary (standard) directory.
+#[tokio::test]
+async fn resolve_existing_treats_unregistered_old_root_as_standard() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let old_root = tempfile::tempdir().unwrap();
+    let (svc, _store, _db) = harness(temp_root.path().to_path_buf()).await;
+
+    let under_old = old_root.path().join("conversations/users/u/2026/10/01/claude-temp-abc");
+    std::fs::create_dir_all(&under_old).unwrap();
+    let out = svc
+        .resolve_existing("system_default_user", uri_of(&under_old))
+        .await
+        .unwrap();
+    assert_eq!(out.project.kind, "standard");
+}
+
+// New temp directories are only ever provisioned under the current root.
+#[tokio::test]
+async fn create_temp_never_provisions_under_a_legacy_root() {
+    let temp_root = tempfile::tempdir().unwrap();
+    let legacy_root = tempfile::tempdir().unwrap();
+    let (svc, _store, _db) =
+        harness_with_legacy_roots(temp_root.path().to_path_buf(), vec![legacy_root.path().to_path_buf()]).await;
+
+    let out = svc
+        .create_temp("system_default_user", Some("fresh".to_owned()))
+        .await
+        .unwrap();
+    assert_eq!(out.project.kind, "temp");
+
+    let created = canonicalize(&out.folder.resource_uri).unwrap();
+    let current_root = canonicalize(&uri_of(temp_root.path())).unwrap();
+    assert!(
+        created.as_str().starts_with(current_root.as_str()),
+        "temp dir must live under the current root: {}",
+        created.as_str()
+    );
+    assert_eq!(
+        std::fs::read_dir(legacy_root.path()).unwrap().count(),
+        0,
+        "the legacy root must stay untouched"
+    );
 }
 
 #[tokio::test]

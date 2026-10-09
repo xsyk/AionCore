@@ -14,7 +14,11 @@ use aionui_api_types::ChatFileRef;
 async fn setup() -> (Arc<ProjectService>, String, TempDir, TempDir) {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
-    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
+    let service = Arc::new(ProjectService::new(
+        Arc::clone(&store),
+        std::env::temp_dir(),
+        Vec::new(),
+    ));
     let dir = tempfile::tempdir().unwrap();
     let created = service
         .create_standard("system_default_user", to_file_uri(dir.path()).unwrap())
@@ -118,7 +122,11 @@ async fn resolves_project_root_ref_empty_relative_path() {
 async fn emitted_absolute_path_keeps_real_root_casing() {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
-    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
+    let service = Arc::new(ProjectService::new(
+        Arc::clone(&store),
+        std::env::temp_dir(),
+        Vec::new(),
+    ));
 
     // A mixed-case root directory; only OUR segment's casing is asserted, so the
     // tempdir parent's own casing is irrelevant.
@@ -344,7 +352,11 @@ async fn upload_outside_root_is_rejected() {
 async fn setup_with_project() -> (Arc<ProjectService>, String, String, TempDir) {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
-    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
+    let service = Arc::new(ProjectService::new(
+        Arc::clone(&store),
+        std::env::temp_dir(),
+        Vec::new(),
+    ));
     let dir = tempfile::tempdir().unwrap();
     let created = service
         .create_standard("system_default_user", to_file_uri(dir.path()).unwrap())

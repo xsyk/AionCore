@@ -1314,6 +1314,26 @@ fn make_service_with_workspace_root(
     (svc, broadcaster, repo, task_mgr)
 }
 
+/// A service whose work dir moved: new workspaces go under `workspace_root`,
+/// auto workspaces already on disk under `legacy_root` are still recognized.
+fn make_service_with_legacy_workspace_root(
+    workspace_root: PathBuf,
+    legacy_root: PathBuf,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<dyn IWorkerTaskManager>,
+) {
+    let (svc, broadcaster, repo, task_mgr) = make_service_with_workspace_root(workspace_root);
+    (
+        svc.with_legacy_workspace_roots(vec![legacy_root]),
+        broadcaster,
+        repo,
+        task_mgr,
+    )
+}
+
 fn make_service_with_resolver_and_agent_metadata_repo(
     skill_resolver: Arc<dyn crate::skill_resolver::SkillResolver>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
@@ -1887,6 +1907,7 @@ async fn make_injected_project_service(temp_root: &std::path::Path) -> std::sync
     std::sync::Arc::new(aionui_project::ProjectService::new(
         store,
         temp_root.join("conversations"),
+        Vec::new(),
     ))
 }
 
@@ -2804,6 +2825,149 @@ async fn delete_preserves_user_supplied_workspace_directory() {
     svc.delete("user_1", &conv.id).await.unwrap();
 
     assert!(user_workspace.is_dir());
+}
+
+// ── Legacy workspace root (work dir moved after the conversation was created) ──
+
+/// Store a conversation the way one created before the work dir moved looks:
+/// an absolute `extra.workspace` under the old root.
+async fn seed_conversation_with_workspace(repo: &MockRepo, id: &str, workspace: &Path) {
+    repo.create(&ConversationRow {
+        id: id.to_owned(),
+        user_id: "user_1".to_owned(),
+        name: "legacy".to_owned(),
+        r#type: "acp".to_owned(),
+        extra: json!({ "workspace": workspace, "backend": "claude" }).to_string(),
+        model: None,
+        status: Some("finished".to_owned()),
+        source: Some("aionui".to_owned()),
+        channel_chat_id: None,
+        pinned: false,
+        pinned_at: None,
+        created_at: 1,
+        updated_at: 1,
+        project_id: None,
+        folder_id: None,
+        name_source: None,
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn delete_removes_auto_workspace_under_a_legacy_root_and_prunes_empty_date_dirs() {
+    let temp = tempfile::tempdir().unwrap();
+    let legacy_root = temp.path().join("data");
+    let (svc, _bc, repo, _task_mgr) =
+        make_service_with_legacy_workspace_root(temp.path().join("work"), legacy_root.clone());
+
+    let user_dir = legacy_root.join("conversations/users/u");
+    let workspace = user_dir.join("2026/10/01/claude-temp-conv-legacy");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("notes.txt"), "scratch").unwrap();
+    seed_conversation_with_workspace(&repo, "conv-legacy", &workspace).await;
+
+    svc.delete("user_1", "conv-legacy").await.unwrap();
+
+    assert!(
+        !workspace.exists(),
+        "the legacy auto workspace goes with its conversation"
+    );
+    assert!(!user_dir.join("2026").exists(), "empty date directories are pruned");
+    assert!(user_dir.is_dir(), "pruning stops at the date directories");
+}
+
+#[tokio::test]
+async fn delete_under_a_legacy_root_keeps_date_dirs_that_still_hold_other_workspaces() {
+    let temp = tempfile::tempdir().unwrap();
+    let legacy_root = temp.path().join("data");
+    let (svc, _bc, repo, _task_mgr) =
+        make_service_with_legacy_workspace_root(temp.path().join("work"), legacy_root.clone());
+
+    let day_dir = legacy_root.join("conversations/users/u/2026/10/01");
+    let first = day_dir.join("claude-temp-conv-a");
+    let second = day_dir.join("claude-temp-conv-b");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    seed_conversation_with_workspace(&repo, "conv-a", &first).await;
+    seed_conversation_with_workspace(&repo, "conv-b", &second).await;
+
+    svc.delete("user_1", "conv-a").await.unwrap();
+    assert!(!first.exists());
+    assert!(second.is_dir(), "a sibling workspace must survive");
+    assert!(day_dir.is_dir(), "a date directory that is not empty must survive");
+
+    svc.delete("user_1", "conv-b").await.unwrap();
+    assert!(!second.exists());
+    assert!(!legacy_root.join("conversations/users/u/2026").exists());
+}
+
+#[tokio::test]
+async fn auto_workspace_to_delete_for_row_resolves_legacy_root_workspaces() {
+    // The cron cleanup path asks the service (not `delete`) which directory a
+    // conversation owns; it must see legacy-root workspaces too.
+    let temp = tempfile::tempdir().unwrap();
+    let legacy_root = temp.path().join("data");
+    let (svc, _bc, repo, _task_mgr) =
+        make_service_with_legacy_workspace_root(temp.path().join("work"), legacy_root.clone());
+
+    let workspace = legacy_root.join("conversations/users/u/2026/10/01/claude-temp-conv-legacy");
+    std::fs::create_dir_all(&workspace).unwrap();
+    seed_conversation_with_workspace(&repo, "conv-legacy", &workspace).await;
+    let row = repo.get("user_1", "conv-legacy").await.unwrap().unwrap();
+
+    assert_eq!(
+        svc.auto_workspace_to_delete_for_row(&row, "conv-legacy"),
+        Some(std::fs::canonicalize(&workspace).unwrap())
+    );
+}
+
+#[tokio::test]
+async fn delete_keeps_directories_that_are_not_auto_workspaces_of_a_known_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let legacy_root = temp.path().join("data");
+    let unrelated_root = temp.path().join("somewhere-else");
+    let (svc, _bc, repo, _task_mgr) =
+        make_service_with_legacy_workspace_root(temp.path().join("work"), legacy_root.clone());
+
+    // Under the legacy `conversations/` dir and with a matching leaf, but not
+    // in the auto layout (`[users/<dir>/]Y/M/D/<leaf>`).
+    let user_project = legacy_root.join("conversations/my-project/claude-temp-conv-project");
+    // The auto layout, but under a root nobody registered.
+    let unknown_root = unrelated_root.join("conversations/users/u/2026/10/01/claude-temp-conv-unknown");
+    // Under the legacy root, but the leaf belongs to another conversation.
+    let other_conversation = legacy_root.join("conversations/users/u/2026/10/01/claude-temp-conv-other");
+    for (id, dir) in [
+        ("conv-project", &user_project),
+        ("conv-unknown", &unknown_root),
+        ("conv-mismatch", &other_conversation),
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+        seed_conversation_with_workspace(&repo, id, dir).await;
+        svc.delete("user_1", id).await.unwrap();
+        assert!(dir.is_dir(), "{id}: only a recognized auto workspace may be removed");
+    }
+}
+
+#[tokio::test]
+async fn new_auto_workspaces_use_the_current_root_even_with_legacy_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    let work_root = temp.path().join("work");
+    let legacy_root = temp.path().join("data");
+    let (svc, _bc, _repo, _task_mgr) = make_service_with_legacy_workspace_root(work_root.clone(), legacy_root.clone());
+
+    let conv = svc.create("user_1", make_acp_req_without_workspace()).await.unwrap();
+    let workspace = PathBuf::from(conv.extra["workspace"].as_str().unwrap());
+    assert_dated_workspace_path(&work_root, &workspace, &format!("acp-temp-{}", conv.id));
+
+    let team_workspace = PathBuf::from(svc.create_team_temp_workspace("user_1", "team_1").unwrap());
+    assert_dated_workspace_path(&work_root, &team_workspace, "team-temp-team_1");
+
+    assert!(!legacy_root.exists(), "nothing is provisioned under the legacy root");
+}
+
+fn make_acp_req_without_workspace() -> CreateConversationRequest {
+    serde_json::from_value(json!({ "type": "acp", "extra": {} })).unwrap()
 }
 
 // ── Broadcast payload tests ────────────────────────────────────────

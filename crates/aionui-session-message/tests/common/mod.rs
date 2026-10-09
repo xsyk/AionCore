@@ -306,6 +306,7 @@ pub async fn setup_with_clock(clock: Arc<TestClock>) -> Ctx {
     let project_service = Arc::new(ProjectService::new(
         Arc::new(SqliteProjectStore::new(pool.clone())),
         std::env::temp_dir().join("aionui-session-message-test-projects"),
+        Vec::new(),
     ));
 
     Ctx {

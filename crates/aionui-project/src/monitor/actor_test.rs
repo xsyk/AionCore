@@ -62,7 +62,11 @@ async fn setup() -> (
 ) {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
-    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
+    let service = Arc::new(ProjectService::new(
+        Arc::clone(&store),
+        std::env::temp_dir(),
+        Vec::new(),
+    ));
 
     let dir = tempfile::tempdir().unwrap();
     let created = service
@@ -550,7 +554,11 @@ async fn copy_across_project_explorers() {
     // reference against its own root.
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
-    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
+    let service = Arc::new(ProjectService::new(
+        Arc::clone(&store),
+        std::env::temp_dir(),
+        Vec::new(),
+    ));
 
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();

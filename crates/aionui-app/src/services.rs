@@ -1,7 +1,7 @@
 //! Shared application services for dependency injection.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::{AppConfig, IdentityMode, derive_encryption_key};
@@ -143,6 +143,25 @@ fn must_refuse_startup_on_unreadable_system_user(
     is_new && !system_user_present && existing_row_present
 }
 
+/// Earlier roots whose `conversations/...` temp workspaces must stay recognized
+/// now that the work dir may differ from the data dir.
+///
+/// The work dir falls back to the data dir when the launcher passes no
+/// `--work-dir`, so a conversation created that way stores its absolute workspace
+/// path under `<data_dir>/conversations/...`. When the launcher later passes a
+/// different work dir (1.0.1 servers do), the data dir becomes the legacy root:
+/// those directories still count as temp workspaces (cleaned up with their
+/// conversation, never classified as user projects), while new ones are only ever
+/// created under the work dir. The configured values are compared as given,
+/// without canonicalizing.
+fn legacy_workspace_roots(data_dir: &Path, work_dir: &Path) -> Vec<PathBuf> {
+    if data_dir == work_dir {
+        Vec::new()
+    } else {
+        vec![data_dir.to_path_buf()]
+    }
+}
+
 impl AppServices {
     pub(crate) fn backend_binary_path(&self) -> Arc<PathBuf> {
         self.backend_binary_path.clone()
@@ -156,6 +175,7 @@ impl AppServices {
         self.conversation_service = build_conversation_service(ConversationServiceDeps {
             database: &self.database,
             work_dir: self.work_dir.clone(),
+            legacy_workspace_roots: legacy_workspace_roots(&self.data_dir, &self.work_dir),
             event_bus: self.event_bus.clone(),
             skill_paths: self.skill_paths.clone(),
             skill_repo: self.skill_repo.clone(),
@@ -341,12 +361,31 @@ impl AppServices {
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
 
+        // Roots that held temp workspaces before the work dir moved away from the
+        // data dir; recognized (not written to) by the conversation and project
+        // services.
+        let legacy_workspace_roots = legacy_workspace_roots(&data_dir, &work_dir);
+        if !legacy_workspace_roots.is_empty() {
+            tracing::info!(
+                work_dir = %work_dir.display(),
+                legacy_roots = ?legacy_workspace_roots,
+                "work dir differs from data dir: temp workspaces under the previous root stay recognized"
+            );
+        }
+
         // Project-bind service (side branch). temp_root mirrors the existing
         // conversation temp-workspace root (`work_dir/conversations`) so
         // `resolve_existing` classifies auto workspaces as temp and
-        // user-picked directories as standard.
+        // user-picked directories as standard; legacy roots classify the same way.
         let project_store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(database.pool().clone()));
-        let project_service = ProjectService::new(project_store, work_dir.join("conversations"));
+        let project_service = ProjectService::new(
+            project_store,
+            work_dir.join("conversations"),
+            legacy_workspace_roots
+                .iter()
+                .map(|root| root.join("conversations"))
+                .collect(),
+        );
 
         // Sidebar ordering store (`user_order` table). Built early so it can be
         // shared by the conversation delete hook, the team service, and the
@@ -457,6 +496,7 @@ impl AppServices {
         let conversation_service = build_conversation_service(ConversationServiceDeps {
             database: &database,
             work_dir: work_dir.clone(),
+            legacy_workspace_roots,
             event_bus: event_bus.clone(),
             skill_paths: skill_paths.clone(),
             skill_repo: skill_repo.clone(),
@@ -535,6 +575,8 @@ impl AppServices {
 struct ConversationServiceDeps<'a> {
     database: &'a Database,
     work_dir: PathBuf,
+    /// Earlier roots whose temp workspaces are still recognized (not written to).
+    legacy_workspace_roots: Vec<PathBuf>,
     event_bus: Arc<BroadcastEventBus>,
     skill_paths: Arc<aionui_extension::SkillPaths>,
     skill_repo: Arc<dyn ISkillRepository>,
@@ -568,6 +610,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         Arc::new(SqliteAgentMetadataRepository::new(deps.database.pool().clone())),
         Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
     )
+    .with_legacy_workspace_roots(deps.legacy_workspace_roots)
     .with_runtime_state(deps.conversation_runtime_state)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
     .with_runtime_token_service(deps.runtime_token_service);
@@ -701,6 +744,23 @@ mod tests {
     #[test]
     fn the_image_generation_script_variable_is_the_one_the_launcher_sets() {
         assert_eq!(IMAGE_GEN_MCP_SCRIPT_ENV, "AIONUI_IMAGE_GEN_MCP_SCRIPT");
+    }
+
+    #[test]
+    fn data_dir_is_the_legacy_root_only_when_the_work_dir_moved() {
+        let data = Path::new("/home/u/.aionui-web");
+        assert!(
+            legacy_workspace_roots(data, data).is_empty(),
+            "work dir == data dir: there is no previous root"
+        );
+        assert!(
+            legacy_workspace_roots(data, Path::new("/home/u/.aionui-web/")).is_empty(),
+            "a trailing separator is not a different directory"
+        );
+        assert_eq!(
+            legacy_workspace_roots(data, Path::new("/data/.AionEasiful")),
+            vec![data.to_path_buf()]
+        );
     }
 
     // ELECTRON-3T0 guard decision table. `from_config` hard-constructs the repo,
