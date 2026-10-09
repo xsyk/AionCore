@@ -21,8 +21,10 @@ const DEFAULT_USER_ID: &str = "system_default_user";
 /// resource: its identity, CLI-login-derived capabilities/models, availability
 /// probe, command/env overrides AND its enable/disable state all live on this
 /// one row and are shared by every user on the device. There is no per-user
-/// overlay — the acting-user filter only scopes row *visibility* (a custom
-/// agent's owner), never field values.
+/// overlay — the acting-user filter only scopes row *visibility* (a row that
+/// has an owner is seen by that owner alone; builtin, internal and, since
+/// 1.0.1, custom agents have none and are seen by everyone), never field
+/// values.
 const AGENT_METADATA_SAFE_COLUMNS: &str = "\
     am.agent_id AS id, am.user_id, am.icon, am.name, am.name_i18n, am.description, am.description_i18n, \
     am.backend, am.agent_type, am.agent_source, am.agent_source_info, \
@@ -639,8 +641,9 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
     async fn set_enabled_for_user(&self, user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError> {
         // enabled is machine-level: it gates whether the registry starts the
         // agent at all, so it lives on the catalog row and is shared by every
-        // user. The user_id only scopes visibility (a custom agent's owner) —
-        // the toggle itself is not per-user.
+        // user. The user_id only scopes visibility: rows without an owner
+        // (builtin, internal and, since 1.0.1, custom agents) are visible to
+        // everyone. The toggle itself is not per-user.
         if self.get_for_user(user_id, id).await?.is_none() {
             return Ok(false);
         }
@@ -659,13 +662,19 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
     }
 
     async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<bool, DbError> {
-        // Only the owner may delete a catalog row (builtin rows have no owner
-        // and are never deletable through this path).
-        let result = sqlx::query("DELETE FROM agent_metadata WHERE agent_id = ? AND user_id = ?")
-            .bind(id)
-            .bind(user_id)
-            .execute(&self.pool)
-            .await?;
+        // Since 1.0.1 custom agents are server-wide (no owner), so a custom row is
+        // deletable whoever asks; who may ask is decided by the route (the
+        // administrator). A row that still has an owner stays that owner's to
+        // delete. Only custom rows are ever deletable here: builtin and internal
+        // catalog rows have no owner as well and must never go.
+        let result = sqlx::query(
+            "DELETE FROM agent_metadata \
+             WHERE agent_id = ? AND agent_source = 'custom' AND (user_id IS NULL OR user_id = ?)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -1352,5 +1361,114 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(global_override.as_deref(), Some("/tmp/claude"));
+    }
+
+    #[tokio::test]
+    async fn a_custom_agent_created_globally_is_visible_to_every_user() {
+        let (repo, _db) = setup().await;
+
+        repo.upsert_global(&custom_params("custom-shared-by-all", "Shared Custom"))
+            .await
+            .unwrap();
+
+        for user in [USER_A, USER_B] {
+            let row = repo
+                .get_for_user(user, "custom-shared-by-all")
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{user} must see the shared custom agent"));
+            assert_eq!(row.name, "Shared Custom");
+            assert_eq!(row.agent_source, "custom");
+            assert_eq!(row.user_id, None, "a shared agent has no owner");
+            assert!(
+                repo.list_all_for_user(user)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.id == "custom-shared-by-all"),
+                "{user} must list the shared custom agent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_global_custom_agent_works_for_the_admin() {
+        let (repo, _db) = setup().await;
+        repo.upsert_global(&custom_params("custom-global-gone", "Throwaway"))
+            .await
+            .unwrap();
+
+        assert!(repo.delete_for_user(USER_A, "custom-global-gone").await.unwrap());
+
+        assert!(repo.get_for_user(USER_A, "custom-global-gone").await.unwrap().is_none());
+        assert!(repo.get_for_user(USER_B, "custom-global-gone").await.unwrap().is_none());
+        assert!(
+            !repo.delete_for_user(USER_A, "custom-global-gone").await.unwrap(),
+            "a second delete finds nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_global_custom_agent_is_deleted_whichever_user_the_admin_acts_as() {
+        // The route only lets the administrator in; the administrator acting as
+        // another user passes that user's id, and the shared agent still goes.
+        let (repo, _db) = setup().await;
+        repo.upsert_global(&custom_params("custom-global-acted", "Acted"))
+            .await
+            .unwrap();
+
+        assert!(repo.delete_for_user(USER_B, "custom-global-acted").await.unwrap());
+
+        assert!(
+            repo.get_for_user(USER_A, "custom-global-acted")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_agent_owned_by_one_user_is_not_deleted_for_another() {
+        // Rows that still carry an owner keep the owner check.
+        let (repo, _db) = setup().await;
+        repo.upsert_for_user(USER_A, &custom_params("custom-owned", "Owned"))
+            .await
+            .unwrap();
+
+        assert!(!repo.delete_for_user(USER_B, "custom-owned").await.unwrap());
+        assert!(repo.get_for_user(USER_A, "custom-owned").await.unwrap().is_some());
+        assert!(repo.delete_for_user(USER_A, "custom-owned").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn builtin_rows_are_never_deleted() {
+        let (repo, db) = setup().await;
+        // A seeded builtin row (Claude Code) and the internal one (Aion CLI).
+        let catalog_ids = ["2d23ff1c", "632f31d2"];
+        let sources: Vec<String> = sqlx::query_scalar(
+            "SELECT agent_source FROM agent_metadata WHERE agent_id IN ('2d23ff1c', '632f31d2') ORDER BY agent_source",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            sources,
+            ["builtin", "internal"],
+            "the ids name one builtin and one internal row"
+        );
+
+        for user in [USER_A, USER_B] {
+            for id in catalog_ids {
+                assert!(
+                    !repo.delete_for_user(user, id).await.unwrap(),
+                    "{user} must not delete the catalog row {id}"
+                );
+            }
+        }
+        assert!(!repo.delete("2d23ff1c").await.unwrap());
+
+        for id in catalog_ids {
+            assert!(repo.get(id).await.unwrap().is_some(), "catalog row {id} must remain");
+        }
     }
 }

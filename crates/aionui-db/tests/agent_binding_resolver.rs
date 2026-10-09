@@ -89,6 +89,37 @@ async fn resolves_agent_binding_for_current_user_scope() {
     );
 }
 
+/// Custom agents are server-wide since 1.0.1: the administrator creates one and
+/// every user, not only its creator, can bind a conversation to it.
+#[tokio::test]
+async fn a_global_custom_agent_resolves_for_every_user() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteAgentMetadataRepository::new(db.pool().clone());
+    for user_id in ["user-a", "user-b"] {
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, created_at, updated_at) VALUES (?, ?, 'hash', 0, 0)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    repo.upsert_global(&custom_agent_params("agent-shared", "Shared Agent", "shared-backend"))
+        .await
+        .unwrap();
+
+    for user_id in ["user-a", "user-b", "system_default_user"] {
+        let resolved = resolve_agent_binding_for_user(db.pool(), user_id, "agent-shared")
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{user_id} must resolve the shared custom agent"));
+        assert_eq!(resolved.agent_id, "agent-shared");
+        assert_eq!(resolved.agent_source, "custom");
+        assert_eq!(resolved.runtime_backend, "shared-backend");
+    }
+}
+
 fn custom_agent_params<'a>(id: &'a str, name: &'a str, backend: &'a str) -> UpsertAgentMetadataParams<'a> {
     UpsertAgentMetadataParams {
         id,

@@ -5,6 +5,13 @@
 //! F-CAGENT-04 / -05 / -12 / -13 / -14 (create, edit, save, delete,
 //! toggle enable).
 //!
+//! Since 1.0.1 custom agents are server-wide, like the builtin catalog rows:
+//! they are stored without an owner (`user_id` NULL) and every user sees and
+//! runs them. The user id passed in here only names the acting user (for the
+//! visibility lookups and for whom the probe reports progress); it is never an
+//! owner. Who may create, edit or delete them is decided by the routes (the
+//! administrator alone), not here.
+//!
 //! Test-on-save: create / update run `try_connect_custom_agent`
 //! before hitting the DB. Failures become `AgentError::BadRequest` with
 //! a prefixed marker (`cli_not_found:` / `acp_init_failed:`) that the
@@ -106,9 +113,8 @@ impl AgentService {
             return Err(AgentError::not_found(format!("Agent '{id}' not found")));
         }
         // Agents are machine-level, so the machine cache must be refreshed
-        // regardless of which user triggered the change. reload_one is a safe
-        // no-op for rows the machine cache never held (a non-default user's own
-        // custom agent).
+        // regardless of which user triggered the change. A custom agent has no
+        // owner, so the cache holds it; reload_one drops the removed row.
         if let Err(err) = self.registry().reload_one(id).await {
             warn!(agent_id = %id, error = %err, "registry reload failed after delete_custom_agent");
         }
@@ -196,14 +202,15 @@ impl AgentService {
             sort_order: CUSTOM_SORT_ORDER_DEFAULT,
         };
 
+        // Written without an owner so every user sees it, whoever saved it
+        // (the administrator may be acting as another user).
         self.registry()
             .repo_handle()
-            .upsert_for_user(user_id, &params)
+            .upsert_global(&params)
             .await
-            .map_err(|e| AgentError::internal(format!("repo.upsert_for_user: {e}")))?;
+            .map_err(|e| AgentError::internal(format!("repo.upsert_global: {e}")))?;
 
-        // Machine-level cache refresh; harmless no-op when the row is a
-        // non-default user's own custom agent (never in the machine cache).
+        // Machine-level cache refresh: the row has no owner, so the cache holds it.
         self.registry()
             .reload_one(id)
             .await

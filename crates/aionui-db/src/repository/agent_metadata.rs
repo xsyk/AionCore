@@ -52,12 +52,15 @@ pub trait IAgentMetadataRepository: Send + Sync {
     /// Insert or replace a row. Returns the row as stored.
     async fn upsert(&self, params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError>;
 
+    /// Insert or replace a row owned by `user_id`, which only that user sees.
     async fn upsert_for_user(
         &self,
         user_id: &str,
         params: &UpsertAgentMetadataParams<'_>,
     ) -> Result<AgentMetadataRow, DbError>;
 
+    /// Insert or replace a row with no owner, which every user sees: the
+    /// builtin and internal catalog rows and, since 1.0.1, custom agents.
     async fn upsert_global(&self, params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
         self.upsert(params).await
     }
@@ -116,8 +119,11 @@ pub trait IAgentMetadataRepository: Send + Sync {
 
     async fn set_enabled_for_user(&self, user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError>;
 
-    /// Delete a row. Returns `true` if a row was removed.
+    /// Delete a custom agent. Returns `true` if a row was removed.
     async fn delete(&self, id: &str) -> Result<bool, DbError>;
 
+    /// Delete a custom agent that has no owner (every custom agent since
+    /// 1.0.1) or is owned by `user_id`. Builtin and internal rows are never
+    /// deleted. Returns `true` if a row was removed.
     async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<bool, DbError>;
 }

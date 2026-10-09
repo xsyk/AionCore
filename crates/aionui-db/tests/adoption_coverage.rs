@@ -37,6 +37,9 @@ const GLOBAL_TABLES: &[(&str, &str)] = &[
     ("folders", "global canonical path registry"),
     // Single-row Feishu web-login settings owned by the super admin, not a user.
     ("feishu_login_config", "machine-wide feishu login settings"),
+    // Server-wide settings managed by the super admin (e.g. the image
+    // generation model), shared by every user rather than owned by one.
+    ("global_settings", "server-wide settings, not owned by any user"),
 ];
 
 /// Tables whose `user_id` column is NOT a Core-user ownership column — it
