@@ -27,8 +27,16 @@ pub fn require_shared_config_admin(real: Option<&RealUser>, current: &CurrentUse
 
 /// Whether the caller manages shared configuration (and may see its secrets).
 pub fn can_manage_shared_config(real: Option<&RealUser>, current: &CurrentUser) -> bool {
-    let caller = real.map_or(current.id.as_str(), |real| real.0.id.as_str());
-    is_super_admin(caller)
+    is_super_admin(real_caller_id(real, current))
+}
+
+/// The id of whoever really made the request: the authenticated user, not the
+/// user the super admin may be acting as. Anything that records or authorizes
+/// "who did this" for shared configuration goes through here, so the rule
+/// (including the fallback to the effective user when no [`RealUser`] was
+/// injected) exists once.
+pub fn real_caller_id<'a>(real: Option<&'a RealUser>, current: &'a CurrentUser) -> &'a str {
+    real.map_or(current.id.as_str(), |real| real.0.id.as_str())
 }
 
 #[cfg(test)]
@@ -67,5 +75,18 @@ mod tests {
     fn the_real_caller_decides_not_the_effective_user() {
         let real = RealUser(user("user_1"));
         assert!(!can_manage_shared_config(Some(&real), &user(SUPER_ADMIN_USER_ID)));
+    }
+
+    #[test]
+    fn the_real_caller_id_is_the_authenticated_user_not_the_one_acted_as() {
+        let real = RealUser(user(SUPER_ADMIN_USER_ID));
+        let acting_as = user("user_1");
+        assert_eq!(real_caller_id(Some(&real), &acting_as), SUPER_ADMIN_USER_ID);
+    }
+
+    #[test]
+    fn without_a_real_user_the_effective_user_is_the_caller() {
+        let current = user("user_1");
+        assert_eq!(real_caller_id(None, &current), "user_1");
     }
 }

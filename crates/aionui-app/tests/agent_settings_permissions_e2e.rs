@@ -460,7 +460,19 @@ async fn ordinary_users_never_see_environment_values_in_the_agent_list() {
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(json["data"]["env_override"][0]["value"], "sk-override-secret");
 
-    // The shared agent is listed for an ordinary user, with no environment value anywhere.
+    // The administrator's list carries the agent's variables with their values: the
+    // editor prefills from it, and saving what it shows must not wipe them.
+    let row = h
+        .management_row(&h.admin, &id)
+        .await
+        .expect("the administrator sees the agent");
+    assert_eq!(
+        row["env"],
+        json!([{"name": "SHARED_API_KEY", "value": "sk-custom-secret"}]),
+        "the administrator's list must carry the stored env: {row}"
+    );
+
+    // The shared agent is listed for an ordinary user too: the variable names, no value anywhere.
     let (status, listing) = h.send(request(&h.alice, "GET", "/api/agents/management", None)).await;
     assert_eq!(status, StatusCode::OK, "{listing}");
     let row = listing["data"]
@@ -470,6 +482,11 @@ async fn ordinary_users_never_see_environment_values_in_the_agent_list() {
         .find(|row| row["id"] == id.as_str())
         .expect("the shared agent is listed for an ordinary user");
     assert_eq!(row["env_override_key_count"], 1, "which variables exist is not secret");
+    assert_eq!(
+        row["env"],
+        json!([{"name": "SHARED_API_KEY", "value": ""}]),
+        "an ordinary user sees which variables are set, with empty values: {row}"
+    );
     let listing = listing.to_string();
     for secret in ["sk-custom-secret", "sk-override-secret"] {
         assert!(
@@ -477,10 +494,49 @@ async fn ordinary_users_never_see_environment_values_in_the_agent_list() {
             "{secret} leaked into the agent list: {listing}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_health_check_hides_environment_values_from_ordinary_users_too() {
+    let _probe = ProbeBypass::on().await;
+    let h = Harness::new().await;
+    // A command that does not exist keeps the probe instant (the save is let through by the bypass).
+    let create = request(
+        &h.admin,
+        "POST",
+        "/api/agents/custom",
+        Some(json!({
+            "name": "Keyed Agent",
+            "command": "/nonexistent/path/to/agent",
+            "env": [{"name": "SHARED_API_KEY", "value": "sk-custom-secret"}]
+        })),
+    );
+    let (status, json) = h.send(create).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let id = json["data"]["id"].as_str().expect("id in response").to_owned();
+    let health_check = |session: &Session| {
+        request(
+            session,
+            "POST",
+            &format!("/api/agents/{id}/health-check"),
+            Some(json!({})),
+        )
+    };
+
+    // The check answers with the agent's management row: the administrator gets the values ...
+    let (status, json) = h.send(health_check(&h.admin)).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json["data"]["env"],
+        json!([{"name": "SHARED_API_KEY", "value": "sk-custom-secret"}])
+    );
+
+    // ... an ordinary user gets the names and nothing else.
+    let (status, json) = h.send(health_check(&h.alice)).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["data"]["env"], json!([{"name": "SHARED_API_KEY", "value": ""}]));
     assert!(
-        row["env"]
-            .as_array()
-            .is_none_or(|env| env.iter().all(|entry| entry["value"] == "")),
-        "env entries, if any, carry empty values: {row}"
+        !json.to_string().contains("sk-custom-secret"),
+        "the secret leaked into the health check answer: {json}"
     );
 }

@@ -141,9 +141,9 @@ impl ProviderService {
     /// empty string, `bedrock_config` keeps only how the provider connects
     /// (auth method, region, profile) and the stored ciphertext is not touched.
     ///
-    /// Pre-launch: the response returns the API key in plaintext so the
-    /// frontend can migrate its local store to the backend without losing
-    /// the key on re-read. Storage remains encrypted at rest.
+    /// Only the administrator is given the keys (the routes pass `reveal_keys`
+    /// for the real caller): the settings page needs them to edit a provider.
+    /// Storage remains encrypted at rest.
     fn row_to_response(&self, row: Provider, reveal_keys: bool) -> Result<ProviderResponse, SystemError> {
         // Lenient on decryption: a credential encrypted under a rotated/lost
         // key (e.g. one saved during the ELECTRON-3T0 broken session, whose
@@ -185,10 +185,23 @@ impl ProviderService {
             if reveal_keys {
                 config
             } else {
+                // Every field is named on purpose: a credential field added to
+                // `BedrockConfig` later stops this from compiling until someone
+                // decides whether other users may see it (`..config` would
+                // copy it silently).
+                let BedrockConfig {
+                    auth_method,
+                    region,
+                    profile,
+                    access_key_id: _,
+                    secret_access_key: _,
+                } = config;
                 BedrockConfig {
+                    auth_method,
+                    region,
+                    profile,
                     access_key_id: None,
                     secret_access_key: None,
-                    ..config
                 }
             }
         });
@@ -564,7 +577,7 @@ mod tests {
         assert_eq!(created.platform, "anthropic");
         assert_eq!(created.name, "Anthropic");
         assert_eq!(created.base_url, "https://api.anthropic.com");
-        // API key is returned in plaintext (pre-launch; encrypted at rest).
+        // The administrator creates providers and is answered with the key in plaintext (encrypted at rest).
         assert_eq!(created.api_key, "sk-ant-api03-test1234");
         assert_eq!(created.models, vec!["claude-sonnet-4-20250514"]);
         assert!(created.enabled);

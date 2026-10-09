@@ -29,7 +29,7 @@ pub use account::{AccountError, PasswordOutcome, create_local_user, set_local_pa
 pub use admin_routes::require_super_admin;
 
 // Shared (server-wide) configuration write guard
-pub use shared_config::{can_manage_shared_config, require_shared_config_admin};
+pub use shared_config::{can_manage_shared_config, real_caller_id, require_shared_config_admin};
 
 // Storage-encryption-secret provisioning and inspection
 pub use secret::{

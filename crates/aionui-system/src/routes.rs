@@ -14,7 +14,7 @@ use aionui_api_types::{
     UpdateCheckResult, UpdateClientPreferencesRequest, UpdateImageGenerationSettingsRequest, UpdateProviderRequest,
     UpdateSettingsRequest,
 };
-use aionui_auth::{CurrentUser, RealUser, can_manage_shared_config, require_shared_config_admin};
+use aionui_auth::{CurrentUser, RealUser, can_manage_shared_config, real_caller_id, require_shared_config_admin};
 use aionui_common::ApiError;
 
 use crate::client_pref::ClientPrefService;
@@ -261,7 +261,7 @@ async fn create_provider(
     let Json(req) = body.map_err(ApiError::from)?;
     // A shared provider belongs to no user: record the administrator who added
     // it, not the user the administrator may be acting as.
-    let creator_id = real.map_or(user.id.as_str(), |real| real.0.id.as_str());
+    let creator_id = real_caller_id(real, &user);
     let provider = state
         .provider_service
         .create(creator_id, req)

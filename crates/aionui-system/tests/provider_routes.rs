@@ -200,7 +200,7 @@ async fn list_providers_returns_plaintext_api_key_to_the_admin() {
     assert_eq!(providers.len(), 1);
 
     let api_key = providers[0]["api_key"].as_str().unwrap();
-    // Pre-launch: api_key is returned plaintext on the wire (encrypted at rest).
+    // The administrator gets the key in plaintext (it is encrypted at rest).
     assert_eq!(api_key, "sk-ant-api03-test1234");
     assert!(!api_key.contains("***"));
 }

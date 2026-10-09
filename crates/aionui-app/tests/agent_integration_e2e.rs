@@ -656,9 +656,10 @@ async fn agent_overrides_roundtrip_and_management_summary() {
         .expect("row present");
     assert_eq!(row["has_command_override"], true);
     assert_eq!(row["env_override_key_count"], 1); // PATH excluded
+    // An override lives in its own column, never in the row's own `env`.
     assert!(
         row["env"].as_array().is_none_or(|arr| arr.is_empty()),
-        "management row env must be empty or absent"
+        "an override must not show up in the management row env"
     );
     assert!(
         !mbody_str.contains("sk-x"),
@@ -671,6 +672,98 @@ async fn agent_overrides_roundtrip_and_management_summary() {
     assert_eq!(gbody["data"]["command_override"], "true");
     let envs = gbody["data"]["env_override"].as_array().unwrap();
     assert!(envs.iter().any(|e| e["name"] == "ANTHROPIC_API_KEY"));
+}
+
+// ── Custom agent env in management rows ─────────────────────────
+
+#[tokio::test]
+async fn management_rows_carry_a_custom_agents_env_for_the_admin_and_hide_the_values_from_users() {
+    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (admin_token, _admin_csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let (user_token, _user_csrf) = setup_and_login(&mut app, &services, "alice", "Pass123!").await;
+
+    // A custom agent the way the administrator saves it: stored without an owner.
+    services
+        .agent_registry
+        .repo_handle()
+        .upsert_global(&UpsertAgentMetadataParams {
+            id: "env-agent",
+            icon: None,
+            name: "Env Agent",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: None,
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some("{}"),
+            enabled: true,
+            command: Some("true"),
+            args: Some("[]"),
+            env: Some(
+                r#"[{"name":"API_KEY","value":"sk-custom-secret","description":"the key"},{"name":"MODE","value":"fast"}]"#,
+            ),
+            native_skills_dirs: None,
+            skill_delivery: None,
+            behavior_policy: Some("{}"),
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 1,
+        })
+        .await
+        .unwrap();
+    services.agent_registry.hydrate().await.unwrap();
+
+    let env_of = |listing: &Value| -> (Value, String) {
+        let row = listing["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "env-agent")
+            .expect("the custom agent is listed")
+            .clone();
+        (row["env"].clone(), listing.to_string())
+    };
+
+    // The administrator gets the names and the values: the editor prefills from them.
+    let listing = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/agents/management", &admin_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let (env, _) = env_of(&listing);
+    assert_eq!(
+        env,
+        json!([
+            {"name": "API_KEY", "value": "sk-custom-secret", "description": "the key"},
+            {"name": "MODE", "value": "fast"}
+        ])
+    );
+
+    // An ordinary user sees which variables are set, with empty values.
+    let listing = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/agents/management", &user_token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let (env, raw) = env_of(&listing);
+    assert_eq!(
+        env,
+        json!([
+            {"name": "API_KEY", "value": "", "description": "the key"},
+            {"name": "MODE", "value": ""}
+        ])
+    );
+    assert!(!raw.contains("sk-custom-secret"), "the value leaked: {raw}");
 }
 
 #[tokio::test]

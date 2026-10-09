@@ -105,9 +105,9 @@ async fn health_check_by_id(
 /// A variable's value is usually an API key and agents are shared by every user,
 /// so only the administrator (`reveal`) gets the values in management rows;
 /// everyone else still sees which variables are set. Applies to every agent's
-/// row, not only custom ones: a builtin agent's env can carry the
-/// administrator's overrides. (The registry builds management rows with an empty
-/// `env` today; this keeps the promise should that ever change.)
+/// row, not only custom ones: the registry puts each row's own stored `env` into
+/// its management row, whatever the agent's source. (The administrator's env
+/// overrides are not part of it; they have their own administrator-only route.)
 fn hide_env_values(rows: &mut [AgentManagementRow], reveal: bool) {
     if reveal {
         return;
@@ -118,8 +118,9 @@ fn hide_env_values(rows: &mut [AgentManagementRow], reveal: bool) {
 }
 
 // The check makes a real request with the provider's stored API key, so like
-// editing the provider it is the administrator's alone. The providers are shared
-// by every user; only who may spend their keys is restricted.
+// editing the provider it is the administrator's alone. Conversations spend the
+// shared keys on every user's behalf anyway; this probe, a tool for managing
+// providers, is what is restricted.
 async fn provider_health_check(
     State(state): State<AgentRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -290,7 +291,7 @@ mod tests {
                     {"name": "MODE", "value": "fast"},
                 ]),
             ),
-            // A builtin agent's env can carry the administrator's overrides.
+            // Every source is treated alike, builtin agents included.
             row(
                 "builtin-1",
                 "builtin",

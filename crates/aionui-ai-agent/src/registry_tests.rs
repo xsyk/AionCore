@@ -475,6 +475,86 @@ async fn management_rows_project_runtime_catalogs_from_agent_metadata() {
     );
 }
 
+// The custom agent editor prefills its environment variables from the management
+// row and saves them back, so the row must carry the agent's own stored env (in
+// the shape the rest of the API uses) and not the administrator's env overrides,
+// which `decode_row` merges into `AgentMetadata::env` for the spawn. Who may see
+// the values is decided by the route, not by the registry.
+#[tokio::test]
+async fn management_rows_carry_the_stored_env() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+
+    repo.upsert_global(&UpsertAgentMetadataParams {
+        id: "custom-with-env",
+        icon: None,
+        name: "Custom With Env",
+        name_i18n: None,
+        description: None,
+        description_i18n: None,
+        backend: None,
+        agent_type: "acp",
+        agent_source: "custom",
+        agent_source_info: None,
+        enabled: true,
+        command: Some("sh"),
+        args: Some("[]"),
+        env: Some(r#"[{"name":"API_KEY","value":"sk-stored","description":"the key"},{"name":"MODE","value":"fast"}]"#),
+        native_skills_dirs: None,
+        skill_delivery: None,
+        behavior_policy: None,
+        yolo_id: None,
+        agent_capabilities: None,
+        auth_methods: None,
+        config_options: None,
+        available_modes: None,
+        available_models: None,
+        available_commands: None,
+        sort_order: 100,
+    })
+    .await
+    .unwrap();
+
+    // An override layered on top by the administrator (and a key that is never allowed).
+    repo.update_agent_overrides(
+        "custom-with-env",
+        None,
+        Some(r#"[{"name":"OVERRIDE_KEY","value":"sk-override"},{"name":"PATH","value":"/evil"}]"#),
+    )
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+
+    let row = registry
+        .list_management_rows()
+        .await
+        .into_iter()
+        .find(|item| item.id == "custom-with-env")
+        .unwrap();
+    let env: Vec<_> = row
+        .env
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.value.as_str(), entry.description.as_deref()))
+        .collect();
+
+    assert_eq!(
+        env,
+        vec![("API_KEY", "sk-stored", Some("the key")), ("MODE", "fast", None)],
+        "the row's env is the stored env only"
+    );
+    assert_eq!(row.env_override_key_count, 1, "the override is counted, not listed");
+}
+
+#[test]
+fn no_provider_guidance_says_models_are_shared_and_only_the_administrator_adds_them() {
+    assert_eq!(
+        guidance_for_snapshot_error_code("no_provider"),
+        "Add and enable a model provider in Settings (models are shared by all users and only the administrator can add them), then run Test Connection again."
+    );
+}
+
 #[tokio::test]
 async fn management_rows_include_aionrs_builtin_mode_catalog() {
     let db = init_database_memory().await.unwrap();

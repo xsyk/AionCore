@@ -340,6 +340,10 @@ sensitive fields by default.
 
 ## Providers
 
+Model providers, agents, and the image generation model are shared by every user of this server, and only the administrator can change them.
+If a command below returns 403 / `FORBIDDEN`, tell the user to ask the administrator and do not retry.
+Provider keys (and Bedrock credentials) read back empty for other users, so an empty `api_key` is not a bug.
+
 List model providers:
 
 ```bash
@@ -440,6 +444,11 @@ Client preferences are a free-form key-value map. Pass `null` to remove a key. A
 user or read back first to discover keys in use — there is no fixed schema.
 
 ## Agents
+
+Agents, including custom agents, enable/disable, and overrides, are shared by every user of this server, like the model providers and the image generation model.
+Only the administrator can change them: enabling or disabling an agent, reading or setting overrides, and creating, updating, deleting, or try-connecting a custom agent.
+If a command returns 403 / `FORBIDDEN`, tell the user to ask the administrator and do not retry.
+Agent environment values read back empty for other users.
 
 List available agents:
 

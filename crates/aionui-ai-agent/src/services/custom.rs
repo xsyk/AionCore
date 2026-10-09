@@ -34,6 +34,9 @@ use crate::runtime_status::custom_agent_runtime_reporter;
 
 const CUSTOM_SORT_ORDER_DEFAULT: i64 = 1500;
 
+/// How many generated ids `create_custom_agent` tries before giving up.
+const CUSTOM_AGENT_ID_ATTEMPTS: usize = 5;
+
 impl AgentService {
     /// Public accessor for the probe — powers both
     /// `POST /api/agents/custom/try-connect` and the test-on-save path
@@ -60,9 +63,36 @@ impl AgentService {
         validate_upsert(&req)?;
         probe_or_reject(&req).await?;
 
-        let id = generate_short_id();
+        let id = self.unused_agent_id(generate_short_id).await?;
         self.upsert_custom_row(user_id, &id, &req, /* keep_enabled = */ true)
             .await
+    }
+
+    /// An id that no catalog row uses yet, drawn from `next_id` (at most
+    /// [`CUSTOM_AGENT_ID_ATTEMPTS`] times).
+    ///
+    /// Custom agents are saved with the global upsert, whose conflict clause
+    /// matches every ownerless row. The generated ids are only 8 characters, so
+    /// reusing a builtin agent's id (or another custom agent's) would silently
+    /// overwrite that row; look first instead.
+    async fn unused_agent_id(&self, mut next_id: impl FnMut() -> String) -> Result<String, AgentError> {
+        for _ in 0..CUSTOM_AGENT_ID_ATTEMPTS {
+            let id = next_id();
+            let taken = self
+                .registry()
+                .repo_handle()
+                .get(&id)
+                .await
+                .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
+                .is_some();
+            if !taken {
+                return Ok(id);
+            }
+            warn!(agent_id = %id, "generated custom agent id is already in use; generating another");
+        }
+        Err(AgentError::internal(format!(
+            "could not generate an unused custom agent id in {CUSTOM_AGENT_ID_ATTEMPTS} attempts"
+        )))
     }
 
     pub async fn update_custom_agent(
@@ -265,4 +295,108 @@ async fn probe_or_reject(req: &CustomAgentUpsertRequest) -> Result<(), AgentErro
 
 fn first_token(s: &str) -> &str {
     s.split_whitespace().next().unwrap_or(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    use aionui_db::{
+        IAgentMetadataRepository, IProviderRepository, SqliteAgentMetadataRepository, SqliteProviderRepository,
+        UpsertAgentMetadataParams, init_database_memory,
+    };
+    use aionui_realtime::EventBroadcaster;
+
+    use super::*;
+    use crate::registry::AgentRegistry;
+
+    struct NoopBroadcaster;
+
+    impl EventBroadcaster for NoopBroadcaster {
+        fn broadcast(&self, _msg: aionui_api_types::WebSocketMessage<serde_json::Value>) {}
+    }
+
+    /// A service over an in-memory database that already holds the builtin agent `taken`.
+    async fn service_with_builtin(taken: &str) -> Arc<AgentService> {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+        repo.upsert_global(&UpsertAgentMetadataParams {
+            id: taken,
+            icon: None,
+            name: "Builtin",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("claude"),
+            agent_type: "acp",
+            agent_source: "builtin",
+            agent_source_info: None,
+            enabled: true,
+            command: None,
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            skill_delivery: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 100,
+        })
+        .await
+        .unwrap();
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        AgentService::new(
+            AgentRegistry::new(repo),
+            Arc::new(NoopBroadcaster),
+            provider_repo,
+            [0; 32],
+            std::env::temp_dir(),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_id_nobody_uses_is_taken_as_generated() {
+        let service = service_with_builtin("1a2b3c4d").await;
+
+        let id = service.unused_agent_id(|| "ffffffff".to_owned()).await.unwrap();
+
+        assert_eq!(id, "ffffffff");
+    }
+
+    #[tokio::test]
+    async fn an_id_a_builtin_agent_uses_is_never_handed_out() {
+        // The global upsert would overwrite the builtin row with the new custom agent.
+        let service = service_with_builtin("1a2b3c4d").await;
+        let mut candidates = ["1a2b3c4d", "5e6f7a8b"].into_iter().map(str::to_owned);
+
+        let id = service
+            .unused_agent_id(|| candidates.next().expect("asked for more ids than expected"))
+            .await
+            .unwrap();
+
+        assert_eq!(id, "5e6f7a8b");
+    }
+
+    #[tokio::test]
+    async fn gives_up_with_an_internal_error_after_a_bounded_number_of_collisions() {
+        let service = service_with_builtin("1a2b3c4d").await;
+        let attempts = Cell::new(0);
+
+        let err = service
+            .unused_agent_id(|| {
+                attempts.set(attempts.get() + 1);
+                "1a2b3c4d".to_owned()
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(attempts.get(), CUSTOM_AGENT_ID_ATTEMPTS);
+        assert!(matches!(err, AgentError::Internal(_)), "{err:?}");
+    }
 }

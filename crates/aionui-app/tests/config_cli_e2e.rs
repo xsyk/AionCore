@@ -1115,3 +1115,51 @@ fn builtin_config_skills_use_config_cli_not_python_or_cron_helper() {
     assert!(cron.contains("\"$AIONUI_HELPER_BIN\" config cron current list"));
     assert!(cron.contains("\"job_id\""));
 }
+
+/// The note at the top of the `## {title}` section of `doc`: the text between
+/// the heading and the first command block.
+fn skill_section_note<'a>(doc: &'a str, title: &str) -> &'a str {
+    let heading = format!("\n## {title}\n");
+    let start = doc.find(&heading).unwrap_or_else(|| panic!("no `## {title}` section")) + heading.len();
+    let section = &doc[start..];
+    let section = &section[..section.find("\n## ").unwrap_or(section.len())];
+    &section[..section.find("```").unwrap_or(section.len())]
+}
+
+// Providers, agents and the image generation model are shared by every user and
+// only the administrator can change them. The skill has to say so before it
+// lists the commands, otherwise an agent that gets a 403 has no idea why.
+#[test]
+fn builtin_config_skill_explains_that_shared_settings_are_administrator_only() {
+    let skill = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/builtin-skills/auto-inject/aionui-config/SKILL.md"),
+    )
+    .unwrap();
+
+    for title in ["Providers", "Agents"] {
+        let note = skill_section_note(&skill, title);
+        for expected in [
+            "shared by every user",
+            "image generation model",
+            "administrator",
+            "403",
+            "FORBIDDEN",
+            "read back empty",
+        ] {
+            assert!(
+                note.contains(expected),
+                "the note at the top of `## {title}` must mention `{expected}`, got:\n{note}"
+            );
+        }
+    }
+
+    // The custom agent commands come right after the Agents note, so it names them.
+    let note = skill_section_note(&skill, "Agents");
+    for expected in ["custom agents", "enable/disable", "overrides"] {
+        assert!(
+            note.contains(expected),
+            "the Agents note must cover {expected}, got:\n{note}"
+        );
+    }
+}

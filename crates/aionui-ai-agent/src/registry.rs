@@ -660,6 +660,14 @@ fn agent_management_row(meta: AgentMetadata, reason: Option<&UnavailableReason>)
     let status = derive_management_status(&meta, reason);
     let diagnostics = derive_management_diagnostics(&meta, status, reason);
     let handshake = meta.handshake;
+    // The row carries the agent's own stored env, which the custom agent editor
+    // prefills from and saves back. `decode_row` appends the administrator's env
+    // overrides after it (`env_override_key_count` entries) so the spawn and the
+    // probe see one merged environment; leaving them in would copy them into the
+    // stored env on the next save. Overrides have their own route and count.
+    let own_env_len = meta.env.len().saturating_sub(meta.env_override_key_count);
+    let mut env = meta.env;
+    env.truncate(own_env_len);
     AgentManagementRow {
         id: meta.id,
         icon: meta.icon,
@@ -675,7 +683,7 @@ fn agent_management_row(meta: AgentMetadata, reason: Option<&UnavailableReason>)
         installed: meta.available,
         command: meta.command,
         args: meta.args,
-        env: Vec::new(),
+        env,
         native_skills_dirs: meta.native_skills_dirs,
         skill_delivery: meta.skill_delivery,
         behavior_policy: meta.behavior_policy,
@@ -1403,7 +1411,9 @@ pub(crate) fn guidance_for_snapshot_error_code(error_code: &str) -> &'static str
         "session_send_failed" => {
             "Fix the provider credentials or network issue that caused the last session failure, then start a new conversation."
         }
-        "no_provider" => "Add and enable a model provider in Settings, then run Test Connection again.",
+        "no_provider" => {
+            "Add and enable a model provider in Settings (models are shared by all users and only the administrator can add them), then run Test Connection again."
+        }
         "version_probe_failed" => {
             "The CLI is on PATH but `--version` failed — the install is likely corrupted. Reinstall the CLI, then run Test Connection again."
         }

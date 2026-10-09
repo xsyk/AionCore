@@ -51,7 +51,7 @@ async fn provider_full_crud_with_auth() {
     let api_key = json["data"]["api_key"].as_str().unwrap();
     assert_eq!(
         api_key, "sk-ant-api03-test1234",
-        "API key should be plaintext on the wire (pre-launch)"
+        "the administrator gets the API key in plaintext (it is encrypted at rest)"
     );
 
     // 3. List — should contain one
