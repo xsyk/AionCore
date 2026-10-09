@@ -7,8 +7,8 @@ use aion_config::compat::OpenAiApiMode;
 use aion_config::config::{McpServerConfig, TransportType};
 use aion_types::message::ImageInputCapability;
 use aionui_api_types::{
-    AionrsBuildExtra, ForkSpec, ModelImageInputCapability, ModelOpenAiApiMode, ModelSettings, SessionMcpServer,
-    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
+    AionrsBuildExtra, ForkSpec, IMAGE_GENERATION_MCP_NAME, ModelImageInputCapability, ModelOpenAiApiMode,
+    ModelSettings, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
 };
 use aionui_common::ProviderWithModel;
 use aionui_db::IMcpServerRepository;
@@ -580,10 +580,12 @@ async fn load_user_mcp_servers(
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
             .unwrap_or(row.enabled);
-        // `aionui-team` is the reserved team coordination MCP name; a user row
-        // that collides with it is never injected here (the team bridge is
-        // folded in separately and must win).
-        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME {
+        // `aionui-team` is the reserved team coordination MCP name and
+        // `aionui-image-generation` the reserved name of the server-wide image
+        // generation server; a user row that collides with either is never
+        // injected here (the team bridge and the shared server are folded in
+        // separately and must win).
+        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME || row.name == IMAGE_GENERATION_MCP_NAME {
             continue;
         }
 
@@ -1113,6 +1115,46 @@ mod tests {
 
         assert!(extra_mcp_servers.contains_key("mcp-docs"));
         assert_eq!(extra_mcp_servers["mcp-docs"].transport, TransportType::StreamableHttp);
+    }
+
+    /// The shared image generation server is added to every session from the
+    /// server-wide setting; a user row with its name must not start next to it.
+    #[tokio::test]
+    async fn aionrs_skips_a_user_row_named_like_the_shared_image_generation_server() {
+        let repo = MockMcpRepo {
+            rows: vec![
+                make_row(
+                    "mcp-docs",
+                    "http",
+                    r#"{"url":"http://localhost:54321/mcp"}"#,
+                    true,
+                    false,
+                ),
+                make_row(
+                    IMAGE_GENERATION_MCP_NAME,
+                    "http",
+                    r#"{"url":"http://localhost:54322/mcp"}"#,
+                    true,
+                    false,
+                ),
+            ],
+        };
+
+        // Every enabled row.
+        let enabled = load_user_mcp_servers(&repo, None, TEST_USER_ID, "conv-reserved", test_broadcaster()).await;
+        assert_eq!(enabled.keys().collect::<Vec<_>>(), ["mcp-docs"]);
+
+        // Rows picked by id.
+        let selected = vec![format!("mcp_{IMAGE_GENERATION_MCP_NAME}"), "mcp_mcp-docs".to_owned()];
+        let picked = load_user_mcp_servers(
+            &repo,
+            Some(&selected),
+            TEST_USER_ID,
+            "conv-reserved",
+            test_broadcaster(),
+        )
+        .await;
+        assert_eq!(picked.keys().collect::<Vec<_>>(), ["mcp-docs"]);
     }
 
     #[cfg(unix)]

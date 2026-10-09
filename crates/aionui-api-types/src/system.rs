@@ -118,9 +118,9 @@ pub struct ImageGenerationSettingsResponse {
 
 /// Request body for `PUT /api/settings/image-generation`.
 ///
-/// Turning the setting on needs an existing provider and a model. Turning it
-/// off needs nothing: `provider_id` and `model` are stored as given, so the
-/// administrator can always switch it off or clear it.
+/// Turning the setting on needs an existing, enabled provider and a model.
+/// Turning it off needs nothing: `provider_id` and `model` are stored as given,
+/// so the administrator can always switch it off or clear it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UpdateImageGenerationSettingsRequest {
     pub provider_id: Option<String>,

@@ -5,9 +5,13 @@
 //! that a change needs the CSRF token, that ordinary users read the setting but
 //! cannot change it, and that the administrator, also while acting as another
 //! user, can. The test server has no image generation script installed, so the
-//! setting reads as unsupported and can only be saved switched off.
+//! setting reads as unsupported and can only be saved switched off. The server
+//! is built that way explicitly: `AIONUI_IMAGE_GEN_MCP_SCRIPT`, which a real
+//! server reads its script from, does not matter to these tests.
 
 mod common;
+
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
@@ -15,11 +19,32 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use aionui_app::AppServices;
-use common::{body_json, build_app, get_request, get_with_token, json_with_token, setup_and_login};
+use aionui_app::{AppConfig, AppServices, create_router, derive_encryption_key};
+use aionui_db::{SqliteGlobalSettingRepository, SqliteProviderRepository};
+use aionui_system::ImageGenerationService;
+use common::{body_json, get_request, get_with_token, json_with_token, setup_and_login};
 
 const PASSWORD: &str = "StrongP@ss1";
 const URI: &str = "/api/settings/image-generation";
+
+/// An app whose server has no image generation script, whatever the environment
+/// the tests run in says. `AppServices::from_config` takes the script from
+/// `AIONUI_IMAGE_GEN_MCP_SCRIPT`, so the service is replaced before the router
+/// is built.
+async fn build_app_without_script() -> (Router, AppServices) {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let pool = services.database.pool().clone();
+    let image_generation = ImageGenerationService::new(
+        Arc::new(SqliteGlobalSettingRepository::new(pool.clone())),
+        Arc::new(SqliteProviderRepository::new(pool)),
+        derive_encryption_key(&services.encryption_secret_raw),
+        None,
+    );
+    let services = services.with_image_generation_service(image_generation);
+    let router = create_router(&services).await.expect("build router");
+    (router, services)
+}
 
 struct Session {
     token: String,
@@ -36,7 +61,7 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
-        let (mut app, services) = build_app().await;
+        let (mut app, services) = build_app_without_script().await;
         let (token, csrf) = setup_and_login(&mut app, &services, "admin", PASSWORD).await;
         let admin = Session { token, csrf };
         let (token, csrf) = setup_and_login(&mut app, &services, "alice", PASSWORD).await;

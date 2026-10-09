@@ -13,8 +13,10 @@
 
 mod common;
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -81,15 +83,22 @@ struct Harness {
 }
 
 impl Harness {
+    /// A server whose Node is a fake program.
     async fn new() -> Self {
+        Self::with_node_resolver(|| async { Some(ResolvedCommand::plain(PathBuf::from("/test/bin/node"))) }).await
+    }
+
+    /// A server that finds Node the way `resolve` says.
+    async fn with_node_resolver<F, Fut>(resolve: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Option<ResolvedCommand>> + Send + 'static,
+    {
         let env = ScriptEnv::install().await;
         let db = aionui_db::init_database_memory().await.unwrap();
         let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
         // The machine running the test may have no Node runtime to find.
-        let image_generation = services
-            .image_generation_service
-            .clone()
-            .with_node_resolver(|| async { Some(ResolvedCommand::plain(PathBuf::from("/test/bin/node"))) });
+        let image_generation = services.image_generation_service.clone().with_node_resolver(resolve);
         let services = services.with_image_generation_service(image_generation);
         let mut app = create_router(&services).await.expect("build router");
         let (token, csrf) = setup_and_login(&mut app, &services, "admin", PASSWORD).await;
@@ -285,4 +294,27 @@ async fn a_server_without_the_image_generation_script_gives_sessions_nothing() {
     std::fs::remove_file(h.env.script.path()).unwrap();
 
     assert!(image_generation(&h.options(&row).await).is_none());
+}
+
+/// Assembling a session's options is on the start path of every message, so a
+/// Node that cannot be found in time must cost it a few seconds at most and
+/// leave the session without the tool, not stop or stall it.
+#[tokio::test]
+async fn a_node_lookup_that_never_finishes_does_not_hold_up_the_session() {
+    let h = Harness::with_node_resolver(std::future::pending::<Option<ResolvedCommand>>).await;
+    let provider_id = h.admin_adds_provider().await;
+    let row = h.conversation(&h.alice, "alice", "aionrs").await;
+    h.admin_saves(json!({"provider_id": provider_id, "model": "gpt-image-1", "enabled": true}))
+        .await;
+
+    // The wait for Node is three seconds; the generous bound only turns a hang
+    // into a failure.
+    let options = tokio::time::timeout(Duration::from_secs(10), h.options(&row))
+        .await
+        .expect("assembling the options must not wait for a Node that is never found");
+
+    assert!(
+        image_generation(&options).is_none(),
+        "no Node in time, so this session starts without the tool"
+    );
 }

@@ -557,6 +557,47 @@ async fn enabling_without_a_model_is_rejected() {
     assert_eq!(env.stored_raw().await, None);
 }
 
+/// A provider that exists but is switched off cannot serve images, so turning
+/// the setting on needs an enabled one.
+#[tokio::test]
+async fn enabling_with_a_disabled_provider_is_rejected() {
+    let env = Env::with_script().await;
+    env.add_provider(PROVIDER_ID, &[IMAGE_MODEL]).await;
+    env.set_provider_enabled(PROVIDER_ID, false).await;
+    let enable = json!({"provider_id": PROVIDER_ID, "model": IMAGE_MODEL, "enabled": true});
+
+    let message = env.put_rejected(enable.clone()).await;
+
+    assert!(
+        message.contains(PROVIDER_ID),
+        "the message names the provider: {message}"
+    );
+    assert!(message.contains("disabled"), "and says why: {message}");
+    assert_eq!(env.stored_raw().await, None, "a rejected save stores nothing");
+    assert_eq!(env.get_as(USER_ID).await["enabled"], false);
+
+    // The same request goes through once the provider is switched on.
+    env.set_provider_enabled(PROVIDER_ID, true).await;
+    assert_eq!(env.put_ok(enable).await["enabled"], true);
+}
+
+/// Turning the setting off validates nothing, a disabled provider included.
+#[tokio::test]
+async fn turning_the_setting_off_accepts_a_disabled_provider() {
+    let env = Env::with_script().await;
+    env.add_provider(PROVIDER_ID, &[IMAGE_MODEL]).await;
+    env.enable(PROVIDER_ID, IMAGE_MODEL).await;
+    env.set_provider_enabled(PROVIDER_ID, false).await;
+
+    let saved = env
+        .put_ok(json!({"provider_id": PROVIDER_ID, "model": IMAGE_MODEL, "enabled": false}))
+        .await;
+
+    let expected = json!({"provider_id": PROVIDER_ID, "model": IMAGE_MODEL, "enabled": false, "supported": true});
+    assert_eq!(saved, expected);
+    assert_eq!(env.get_as(USER_ID).await, expected);
+}
+
 #[tokio::test]
 async fn enabling_on_a_server_without_the_script_is_rejected() {
     let env = Env::without_script().await;

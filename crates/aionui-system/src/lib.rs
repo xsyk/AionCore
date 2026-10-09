@@ -9,6 +9,7 @@ pub mod error;
 pub mod image_generation;
 pub mod keep_awake;
 pub mod model_fetcher;
+mod node_cache;
 pub mod protocol;
 pub mod provider;
 pub mod routes;

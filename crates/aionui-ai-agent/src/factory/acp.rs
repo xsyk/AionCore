@@ -12,7 +12,9 @@ use crate::session_context::AcpSessionBuildContext;
 use agent_client_protocol::schema::v1::{
     EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
 };
-use aionui_api_types::{AgentMetadata, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME};
+use aionui_api_types::{
+    AgentMetadata, IMAGE_GENERATION_MCP_NAME, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME,
+};
 use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
@@ -440,10 +442,12 @@ async fn load_user_mcp_servers(
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
             .unwrap_or(row.enabled);
-        // `aionui-team` is the reserved team coordination MCP name; a user row
-        // that collides with it is never injected here (the team bridge is
-        // folded in separately and must win).
-        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME {
+        // `aionui-team` is the reserved team coordination MCP name and
+        // `aionui-image-generation` the reserved name of the server-wide image
+        // generation server; a user row that collides with either is never
+        // injected here (the team bridge and the shared server are folded in
+        // separately and must win).
+        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME || row.name == IMAGE_GENERATION_MCP_NAME {
             continue;
         }
         if !row_supported_by_capabilities(&row, capabilities) {
@@ -1185,6 +1189,45 @@ mod tests {
             fail: false,
         });
         let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
+        assert_eq!(servers.len(), 1);
+        match &servers[0] {
+            McpServer::Stdio(s) => assert_eq!(s.name, "user-enabled"),
+            _ => panic!("expected stdio"),
+        }
+    }
+
+    /// The shared image generation server is added to every session from the
+    /// server-wide setting; a user row with its name must not start next to it.
+    #[tokio::test]
+    async fn load_user_mcp_servers_skips_reserved_image_generation_name() {
+        let stdio_config = stdio_config_for_existing_command();
+        let caps = AcpMcpCapabilities {
+            stdio: true,
+            http: true,
+            sse: true,
+        };
+        let repo: Arc<dyn IMcpServerRepository> = Arc::new(MockRepo {
+            rows: vec![
+                make_row("user-enabled", "stdio", &stdio_config, true, false),
+                make_row(IMAGE_GENERATION_MCP_NAME, "stdio", &stdio_config, true, false),
+            ],
+            fail: false,
+        });
+
+        // Every enabled row.
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
+        assert_eq!(servers.len(), 1);
+        match &servers[0] {
+            McpServer::Stdio(s) => assert_eq!(s.name, "user-enabled"),
+            _ => panic!("expected stdio"),
+        }
+
+        // Rows picked by id.
+        let selected = vec![
+            format!("mcp_{IMAGE_GENERATION_MCP_NAME}"),
+            "mcp_user-enabled".to_owned(),
+        ];
+        let servers = load_user_mcp_servers(repo.as_ref(), Some(&selected), TEST_USER_ID, "conv-1", &caps).await;
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             McpServer::Stdio(s) => assert_eq!(s.name, "user-enabled"),

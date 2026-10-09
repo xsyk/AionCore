@@ -32,5 +32,7 @@ http-body-util.workspace = true
 reqwest.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
+# Paused-time tests (`start_paused`) for the Node lookup wait and cooldown.
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 wiremock = "0.6"

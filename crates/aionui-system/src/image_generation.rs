@@ -9,11 +9,15 @@
 //! [`IMAGE_GENERATION_SETTING_KEY`]. It holds ids, never secrets: the API key is
 //! read from the provider each time a session server is built, so changing the
 //! provider's key or model list needs no second step here.
+//!
+//! Building the server runs on the start path of every session, so it must stay
+//! quick: Node is looked up in the background by `NodeCache` (see the
+//! `node_cache` module), and a session waits for it a few seconds at most before
+//! it starts without the tool.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
 
 use aionui_api_types::{
@@ -23,10 +27,10 @@ use aionui_common::decrypt_string;
 use aionui_db::{IGlobalSettingRepository, IProviderRepository};
 use aionui_runtime::ResolvedCommand;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::error::SystemError;
+use crate::node_cache::{NodeCache, NodeLookup};
 
 pub use aionui_api_types::IMAGE_GENERATION_MCP_NAME;
 
@@ -52,12 +56,6 @@ struct StoredImageGeneration {
     enabled: bool,
 }
 
-type NodeLookup = Pin<Box<dyn Future<Output = Option<ResolvedCommand>> + Send>>;
-
-/// How the service finds Node to run the script with: the program, any
-/// arguments that must come before the script, and environment to launch it in.
-type NodeResolver = Arc<dyn Fn() -> NodeLookup + Send + Sync>;
-
 /// Business logic for the shared image generation setting and for the MCP
 /// server sessions get from it.
 ///
@@ -70,12 +68,17 @@ pub struct ImageGenerationService {
     encryption_key: [u8; 32],
     /// The image generation MCP script, when this server is told where it is.
     script: Option<PathBuf>,
-    node: NodeResolver,
+    /// Where Node is found; shared by every clone of the service.
+    node: NodeCache,
 }
 
 impl ImageGenerationService {
     /// `script` is where the image generation MCP script is expected; image
     /// generation counts as supported only while a file is actually there.
+    ///
+    /// Node is not looked for yet: call [`Self::warm_up`] once the service is
+    /// built, so a setting that is already on has its runtime ready by the time
+    /// the first session asks for it.
     pub fn new(
         settings: Arc<dyn IGlobalSettingRepository>,
         providers: Arc<dyn IProviderRepository>,
@@ -89,19 +92,35 @@ impl ImageGenerationService {
             // The agent runs in a conversation workspace, so a relative path
             // would not find the script there.
             script: script.map(|path| std::path::absolute(&path).unwrap_or(path)),
-            node: remembered(Arc::new(|| -> NodeLookup { Box::pin(locate_node()) })),
+            node: NodeCache::new(Arc::new(|| -> NodeLookup { Box::pin(locate_node()) })),
         }
     }
 
     /// Replace how Node is located. Tests use this so they do not depend on the
-    /// runtime installed on the machine.
+    /// runtime installed on the machine. What was found so far is forgotten.
     pub fn with_node_resolver<F, Fut>(mut self, resolve: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Option<ResolvedCommand>> + Send + 'static,
     {
-        self.node = Arc::new(move || -> NodeLookup { Box::pin(resolve()) });
+        self.node = NodeCache::new(Arc::new(move || -> NodeLookup { Box::pin(resolve()) }));
         self
+    }
+
+    /// Start looking for Node in the background when image generation is already
+    /// on, so the first session after a restart does not have to wait for it.
+    /// Call once after construction; it returns as soon as the setting is read.
+    pub async fn warm_up(&self) {
+        let enabled = match self.read_stored().await {
+            Ok(stored) => stored.enabled,
+            Err(error) => {
+                warn!(%error, "image generation: could not read the setting; Node is not looked up ahead of time");
+                return;
+            }
+        };
+        if enabled && self.supported().await {
+            self.node.warm_up();
+        }
     }
 
     /// Whether this server has the image generation MCP script installed.
@@ -119,10 +138,10 @@ impl ImageGenerationService {
     ///
     /// Switching it off needs nothing: the values are stored as given, so the
     /// administrator can always turn it off or clear it, even after the provider
-    /// was deleted. Switching it on needs a server that has the script, an
-    /// existing provider and a model. The model is not checked against the
-    /// provider's stored model list: the settings page also offers image models
-    /// no provider lists.
+    /// was deleted or disabled. Switching it on needs a server that has the
+    /// script, an existing and enabled provider (sessions cannot use a disabled
+    /// one) and a model. The model is not checked against the provider's stored
+    /// model list: the settings page also offers image models no provider lists.
     pub async fn update(
         &self,
         req: UpdateImageGenerationSettingsRequest,
@@ -145,6 +164,10 @@ impl ImageGenerationService {
             enabled = stored.enabled,
             "image generation setting updated"
         );
+        if stored.enabled {
+            // The first session after the save should find Node ready.
+            self.node.warm_up();
+        }
         Ok(self.response(stored).await)
     }
 
@@ -155,6 +178,11 @@ impl ImageGenerationService {
     /// cannot be decrypted or there is no Node to run the script with. Each
     /// reason other than "off" is logged, and a session simply starts without
     /// the tool; a broken setting must never stop a conversation.
+    ///
+    /// This runs whenever a session is assembled, so it never waits more than a
+    /// few seconds for Node: a runtime that is still being looked for (or
+    /// installed) when the wait is over means no tool for this session, and the
+    /// next one that comes after the lookup finished gets it.
     pub async fn session_server(&self) -> Option<SessionMcpServer> {
         let stored = match self.read_stored().await {
             Ok(stored) => stored,
@@ -201,8 +229,8 @@ impl ImageGenerationService {
                 return None;
             }
         };
-        let Some(node) = (self.node)().await else {
-            warn!("image generation: no Node runtime to run the MCP script; sessions start without the tool");
+        let Some(node) = self.node.get().await else {
+            // The cache has said why, once, when the lookup failed or ran long.
             return None;
         };
 
@@ -258,8 +286,11 @@ impl ImageGenerationService {
                 "A provider is required to turn image generation on".into(),
             ));
         };
-        if self.providers.find_by_id(provider_id).await?.is_none() {
+        let Some(provider) = self.providers.find_by_id(provider_id).await? else {
             return Err(SystemError::BadRequest(format!("Provider '{provider_id}' not found")));
+        };
+        if !provider.enabled {
+            return Err(SystemError::BadRequest(format!("Provider '{provider_id}' is disabled")));
         }
         if stored.model.is_none() {
             return Err(SystemError::BadRequest(
@@ -329,98 +360,9 @@ async fn locate_node() -> Option<ResolvedCommand> {
     }
 }
 
-/// Remember the last Node `locate` found for as long as its program is still
-/// there.
-///
-/// Locating Node validates the whole runtime by starting `node`, `npm` and
-/// `npx`, which is too slow to repeat for every message of every conversation.
-/// A runtime that was replaced or removed is noticed because its program is no
-/// longer a file, and a lookup that failed is never remembered.
-fn remembered(locate: NodeResolver) -> NodeResolver {
-    let last: Arc<Mutex<Option<ResolvedCommand>>> = Arc::default();
-    Arc::new(move || -> NodeLookup {
-        let locate = locate.clone();
-        let last = last.clone();
-        Box::pin(async move {
-            // Held across the lookup on purpose: sessions that start together
-            // wait for one lookup instead of each installing the runtime.
-            let mut last = last.lock().await;
-            if let Some(known) = last.as_ref()
-                && is_file(&known.program).await
-            {
-                return Some(known.clone());
-            }
-            let found = locate().await;
-            last.clone_from(&found);
-            found
-        })
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::*;
-
-    /// A locator that answers `answer` and counts how often it was asked.
-    fn counting(answer: Option<ResolvedCommand>) -> (NodeResolver, Arc<AtomicUsize>) {
-        let asked = Arc::new(AtomicUsize::new(0));
-        let counter = asked.clone();
-        let locate: NodeResolver = Arc::new(move || -> NodeLookup {
-            counter.fetch_add(1, Ordering::SeqCst);
-            let answer = answer.clone();
-            Box::pin(async move { answer })
-        });
-        (locate, asked)
-    }
-
-    fn node_at(program: &Path) -> ResolvedCommand {
-        ResolvedCommand::plain(program.to_path_buf())
-    }
-
-    #[tokio::test]
-    async fn a_located_runtime_is_remembered_while_its_program_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let program = dir.path().join("node");
-        std::fs::write(&program, b"").unwrap();
-        let (locate, asked) = counting(Some(node_at(&program)));
-        let node = remembered(locate);
-
-        assert_eq!(node().await, Some(node_at(&program)));
-        assert_eq!(node().await, Some(node_at(&program)));
-        assert_eq!(node().await, Some(node_at(&program)));
-
-        assert_eq!(asked.load(Ordering::SeqCst), 1, "later asks are answered from memory");
-    }
-
-    #[tokio::test]
-    async fn a_runtime_whose_program_is_gone_is_located_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let program = dir.path().join("node");
-        std::fs::write(&program, b"").unwrap();
-        let (locate, asked) = counting(Some(node_at(&program)));
-        let node = remembered(locate);
-        assert!(node().await.is_some());
-
-        std::fs::remove_file(&program).unwrap();
-        // The lookup still answers with the vanished program here; what matters
-        // is that the memory was not trusted.
-        assert!(node().await.is_some());
-
-        assert_eq!(asked.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn a_failed_lookup_is_not_remembered() {
-        let (locate, asked) = counting(None);
-        let node = remembered(locate);
-
-        assert_eq!(node().await, None);
-        assert_eq!(node().await, None);
-
-        assert_eq!(asked.load(Ordering::SeqCst), 2, "a failure is retried on the next ask");
-    }
 
     #[test]
     fn non_blank_trims_and_drops_empty_values() {

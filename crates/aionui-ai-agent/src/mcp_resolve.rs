@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use aionui_api_types::{SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME};
+use aionui_api_types::{IMAGE_GENERATION_MCP_NAME, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME};
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_realtime::EventBroadcaster;
@@ -57,10 +57,12 @@ pub async fn resolve_session_mcp_servers(
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
             .unwrap_or(row.enabled);
-        // `aionui-team` is a reserved wire-level name: the team coordination MCP
-        // must win, so a user row that collides with it is skipped (never
-        // injected), regardless of selection state.
-        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME {
+        // `aionui-team` and `aionui-image-generation` are reserved wire-level
+        // names: the team coordination MCP must win, and the image generation
+        // server comes from the server-wide setting (the conversation service
+        // adds it to every session), so a user row that collides with either is
+        // skipped (never injected), regardless of selection state.
+        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME || row.name == IMAGE_GENERATION_MCP_NAME {
             continue;
         }
         match row_to_session_mcp_server(&row).await {
@@ -284,6 +286,10 @@ mod tests {
         Arc::new(aionui_realtime::BroadcastEventBus::new(16))
     }
 
+    fn server_names(servers: &[SessionMcpServer]) -> Vec<&str> {
+        servers.iter().map(|server| server.name.as_str()).collect()
+    }
+
     #[tokio::test]
     async fn resolve_skips_reserved_team_mcp_name() {
         let repo = MockRepo {
@@ -293,6 +299,49 @@ mod tests {
         let servers = resolve_session_mcp_servers(&repo, TEST_USER_ID, None, "conv-1", test_broadcaster()).await;
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "docs");
+    }
+
+    /// The shared image generation server is added to every session from the
+    /// server-wide setting, so its name is reserved: a user row that carries it
+    /// must never start, whether it is picked by id (a conversation's frozen
+    /// selection) or enabled.
+    #[tokio::test]
+    async fn resolve_skips_reserved_image_generation_mcp_name() {
+        let repo = MockRepo {
+            rows: vec![
+                make_row("docs", true),
+                make_row(IMAGE_GENERATION_MCP_NAME, true),
+                make_row("off", false),
+            ],
+            fail: false,
+        };
+
+        // Every enabled row.
+        let servers = resolve_session_mcp_servers(&repo, TEST_USER_ID, None, "conv-1", test_broadcaster()).await;
+        assert_eq!(server_names(&servers), ["docs"]);
+
+        // Rows picked by id are injected whatever their enabled flag says, except
+        // the reserved one.
+        let picked = vec![
+            format!("mcp_{IMAGE_GENERATION_MCP_NAME}"),
+            "mcp_docs".to_owned(),
+            "mcp_off".to_owned(),
+        ];
+        let servers =
+            resolve_session_mcp_servers(&repo, TEST_USER_ID, Some(&picked), "conv-1", test_broadcaster()).await;
+        assert_eq!(server_names(&servers), ["docs", "off"]);
+
+        // Picked while disabled makes no difference either.
+        let mut disabled = make_row(IMAGE_GENERATION_MCP_NAME, false);
+        disabled.id = "mcp_reserved_but_off".to_owned();
+        let repo = MockRepo {
+            rows: vec![make_row("docs", true), disabled],
+            fail: false,
+        };
+        let picked = vec!["mcp_reserved_but_off".to_owned(), "mcp_docs".to_owned()];
+        let servers =
+            resolve_session_mcp_servers(&repo, TEST_USER_ID, Some(&picked), "conv-1", test_broadcaster()).await;
+        assert_eq!(server_names(&servers), ["docs"]);
     }
 
     #[tokio::test]

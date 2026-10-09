@@ -336,6 +336,9 @@ impl AppServices {
             encryption_key,
             image_generation_script,
         );
+        // When image generation is already on, look for its Node runtime now (in
+        // the background) so the first session after a restart finds it ready.
+        image_generation_service.warm_up().await;
         let event_bus = Arc::new(BroadcastEventBus::new(256));
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
