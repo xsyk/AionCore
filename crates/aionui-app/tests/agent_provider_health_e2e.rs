@@ -1,4 +1,7 @@
 //! Provider health-check route auth and validation tests.
+//!
+//! The check sends a real request with the stored key, so only the
+//! administrator may run it.
 
 mod common;
 
@@ -72,4 +75,51 @@ async fn provider_health_check_validates_required_fields() {
             .is_some_and(|message| message.contains("provider_id is required")),
         "expected provider_id validation error, got {json}"
     );
+}
+
+#[tokio::test]
+async fn provider_health_check_is_refused_for_ordinary_users() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "alice", "StrongP@ss1").await;
+
+    // The very request the administrator gets a 400 validation error for.
+    let req = json_with_token(
+        "POST",
+        "/api/agents/provider-health-check",
+        json!({"provider_id": "", "model": "gpt-4o"}),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "FORBIDDEN");
+}
+
+#[tokio::test]
+async fn provider_health_check_is_open_to_the_admin_acting_as_a_user() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let alice = services
+        .user_repo
+        .create_user("alice", &aionui_auth::hash_password("StrongP@ss1").unwrap())
+        .await
+        .unwrap();
+
+    let mut req = json_with_token(
+        "POST",
+        "/api/agents/provider-health-check",
+        json!({"provider_id": "", "model": "gpt-4o"}),
+        &token,
+        &csrf,
+    );
+    req.headers_mut()
+        .insert(aionui_auth::ACT_AS_HEADER, alice.id.parse().unwrap());
+    let resp = app.oneshot(req).await.unwrap();
+
+    // Past the guard: the empty provider_id is rejected by validation.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "BAD_REQUEST");
 }

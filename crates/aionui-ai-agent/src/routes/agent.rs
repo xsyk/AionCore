@@ -5,6 +5,7 @@
 //! Endpoints:
 //!
 //! - `GET  /api/agents/management` — list diagnostics-first agent rows
+//! - `POST /api/agents/provider-health-check` — probe a stored provider with its API key (administrator only)
 //! - `POST /api/agents/custom/try-connect` — test custom agent configuration (e.g. ACP connection)
 
 use axum::Router;
@@ -17,7 +18,7 @@ use aionui_api_types::{
     DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse, SetAgentOverridesRequest,
     SetEnabledRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, RealUser, require_shared_config_admin};
 use aionui_common::ApiError;
 
 use crate::routes::error_mapping::agent_error_to_api_error;
@@ -80,10 +81,16 @@ async fn health_check_by_id(
     )))
 }
 
+// The check makes a real request with the provider's stored API key, so like
+// editing the provider it is the administrator's alone. The providers are shared
+// by every user; only who may spend their keys is restricted.
 async fn provider_health_check(
     State(state): State<AgentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    real: Option<Extension<RealUser>>,
     body: Result<Json<ProviderHealthCheckRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderHealthCheckResponse>>, ApiError> {
+    require_shared_config_admin(real.as_ref().map(|Extension(real)| real), &user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state

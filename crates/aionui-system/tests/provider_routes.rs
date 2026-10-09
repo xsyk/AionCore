@@ -1,7 +1,9 @@
 //! Black-box integration tests for provider CRUD routes.
 //!
 //! Tests exercise the HTTP layer (request -> handler -> response) via
-//! `tower::ServiceExt::oneshot`, without authentication middleware.
+//! `tower::ServiceExt::oneshot`, without authentication middleware: each
+//! request carries the `CurrentUser` (and `RealUser`) that the middleware would
+//! have injected, built by `request_as`.
 //! Auth protection is verified at the app-level E2E tests (task 3.9).
 
 use std::sync::Arc;
@@ -13,7 +15,8 @@ use http_body_util::BodyExt;
 use serde_json::json;
 use tower::ServiceExt;
 
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, RealUser};
+use aionui_common::constants::SUPER_ADMIN_USER_ID;
 use aionui_db::{
     SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
     SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
@@ -30,6 +33,9 @@ use aionui_system::{
 const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42; 32];
 const TEST_USER_ID: &str = "user-1";
 const OTHER_USER_ID: &str = "user-2";
+/// The administrator (the only account that may change providers). Its user
+/// row is seeded by `init_database_memory`, so `setup` does not insert it.
+const ADMIN_ID: &str = SUPER_ADMIN_USER_ID;
 
 fn build_state(db: &aionui_db::Database) -> SystemRouterState {
     let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
@@ -70,58 +76,71 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn current_user(id: &str) -> CurrentUser {
+    CurrentUser {
+        id: id.to_owned(),
+        username: id.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
+    }
+}
+
+/// Build a request the way the auth middleware leaves it: `current` is the
+/// effective user and `real`, when `Some`, the authenticated caller behind it.
+/// The two differ only while the administrator acts as another user. With
+/// `real = None` only `CurrentUser` is injected, as a router that was built
+/// without the middleware sees requests.
+fn request_as(
+    real: Option<&str>,
+    current: &str,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> Request<Body> {
+    let builder = Request::builder().method(method).uri(uri);
+    let mut req = match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    if let Some(real) = real {
+        req.extensions_mut().insert(RealUser(current_user(real)));
+    }
+    req.extensions_mut().insert(current_user(current));
+    req
+}
+
+/// A GET as the administrator.
 fn get_request(uri: &str) -> Request<Body> {
-    get_request_for_user(TEST_USER_ID, uri)
+    get_request_for_user(ADMIN_ID, uri)
 }
 
+/// A GET as `user_id`, who is both the real caller and the effective user.
 fn get_request_for_user(user_id: &str, uri: &str) -> Request<Body> {
-    let mut req = Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
-    req.extensions_mut().insert(CurrentUser {
-        id: user_id.to_owned(),
-        username: user_id.to_owned(),
-        user_type: UserType::Local,
-        status: UserStatus::Active,
-    });
-    req
+    request_as(Some(user_id), user_id, "GET", uri, None)
 }
 
+/// A JSON request as the administrator.
 fn json_request(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
-    json_request_for_user(TEST_USER_ID, method, uri, body)
+    json_request_for_user(ADMIN_ID, method, uri, body)
 }
 
+/// A JSON request as `user_id`, who is both the real caller and the effective
+/// user.
 fn json_request_for_user(user_id: &str, method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
-    let mut req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-    req.extensions_mut().insert(CurrentUser {
-        id: user_id.to_owned(),
-        username: user_id.to_owned(),
-        user_type: UserType::Local,
-        status: UserStatus::Active,
-    });
-    req
+    request_as(Some(user_id), user_id, method, uri, Some(body))
 }
 
+/// A DELETE as the administrator.
 fn delete_request(uri: &str) -> Request<Body> {
-    delete_request_for_user(TEST_USER_ID, uri)
+    delete_request_for_user(ADMIN_ID, uri)
 }
 
+/// A DELETE as `user_id`, who is both the real caller and the effective user.
 fn delete_request_for_user(user_id: &str, uri: &str) -> Request<Body> {
-    let mut req = Request::builder()
-        .method("DELETE")
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
-    req.extensions_mut().insert(CurrentUser {
-        id: user_id.to_owned(),
-        username: user_id.to_owned(),
-        user_type: UserType::Local,
-        status: UserStatus::Active,
-    });
-    req
+    request_as(Some(user_id), user_id, "DELETE", uri, None)
 }
 
 fn sample_create_body() -> serde_json::Value {
@@ -133,7 +152,7 @@ fn sample_create_body() -> serde_json::Value {
     })
 }
 
-/// Create a provider and return (response_json, provider_id, fresh_router).
+/// Create a provider as the administrator and return (response_json, provider_id).
 async fn create_one(db: &aionui_db::Database) -> (serde_json::Value, String) {
     let app = system_routes(build_state(db));
     let resp = app
@@ -162,7 +181,7 @@ async fn list_providers_empty() {
 }
 
 #[tokio::test]
-async fn list_providers_returns_plaintext_api_key() {
+async fn list_providers_returns_plaintext_api_key_to_the_admin() {
     let (_app, db) = setup().await;
     create_one(&db).await;
 
@@ -178,6 +197,285 @@ async fn list_providers_returns_plaintext_api_key() {
     // Pre-launch: api_key is returned plaintext on the wire (encrypted at rest).
     assert_eq!(api_key, "sk-ant-api03-test1234");
     assert!(!api_key.contains("***"));
+}
+
+// ===========================================================================
+// Permissions — only the administrator changes providers or reads their keys
+// ===========================================================================
+
+/// Send one request through a fresh router built over `db`.
+async fn send(db: &aionui_db::Database, req: Request<Body>) -> axum::response::Response {
+    system_routes(build_state(db)).oneshot(req).await.unwrap()
+}
+
+#[tokio::test]
+async fn admin_sees_keys_and_users_see_the_shared_list_without_keys() {
+    let (_app, db) = setup().await;
+    let mut body = sample_create_body();
+    body["api_key"] = json!("sk-shared");
+    let resp = send(
+        &db,
+        request_as(Some(ADMIN_ID), ADMIN_ID, "POST", "/api/providers", Some(body)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let id = body_json(resp).await["data"]["id"].as_str().unwrap().to_owned();
+
+    // A Bedrock provider keeps its AWS credentials in `bedrock_config`, not in `api_key`.
+    let bedrock = json!({
+        "platform": "bedrock",
+        "name": "AWS Bedrock",
+        "base_url": "",
+        "api_key": "",
+        "bedrock_config": {
+            "auth_method": "accessKey",
+            "region": "us-east-1",
+            "access_key_id": "AKIA-shared-id",
+            "secret_access_key": "bedrock-shared-secret"
+        }
+    });
+    let resp = send(
+        &db,
+        request_as(Some(ADMIN_ID), ADMIN_ID, "POST", "/api/providers", Some(bedrock)),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bedrock_id = body_json(resp).await["data"]["id"].as_str().unwrap().to_owned();
+
+    // The administrator reads the key and the AWS credentials.
+    let resp = send(&db, request_as(Some(ADMIN_ID), ADMIN_ID, "GET", "/api/providers", None)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let providers = json["data"].as_array().unwrap();
+    assert_eq!(providers.len(), 2);
+    let anthropic = providers.iter().find(|p| p["id"] == id.as_str()).unwrap();
+    assert_eq!(anthropic["api_key"], "sk-shared");
+    let aws = providers.iter().find(|p| p["id"] == bedrock_id.as_str()).unwrap();
+    assert_eq!(aws["bedrock_config"]["access_key_id"], "AKIA-shared-id");
+    assert_eq!(aws["bedrock_config"]["secret_access_key"], "bedrock-shared-secret");
+
+    // Another user gets the very same providers, but never a key or credential.
+    let resp = send(
+        &db,
+        request_as(Some(TEST_USER_ID), TEST_USER_ID, "GET", "/api/providers", None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let providers = json["data"].as_array().unwrap();
+    assert_eq!(providers.len(), 2);
+    let anthropic = providers.iter().find(|p| p["id"] == id.as_str()).unwrap();
+    assert_eq!(anthropic["api_key"], "");
+    assert_eq!(anthropic["name"], "Anthropic");
+    // How the Bedrock provider connects stays visible; its credentials do not.
+    let aws = providers.iter().find(|p| p["id"] == bedrock_id.as_str()).unwrap();
+    assert_eq!(aws["api_key"], "");
+    assert_eq!(aws["bedrock_config"]["auth_method"], "accessKey");
+    assert_eq!(aws["bedrock_config"]["region"], "us-east-1");
+    let raw = json.to_string();
+    for secret in ["sk-shared", "AKIA-shared-id", "bedrock-shared-secret"] {
+        assert!(
+            !raw.contains(secret),
+            "{secret} must not appear in a user's response: {raw}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn users_cannot_change_providers() {
+    let (_app, db) = setup().await;
+    let (_, id) = create_one(&db).await;
+
+    let attempts = [
+        ("POST", "/api/providers".to_owned(), Some(sample_create_body())),
+        ("PUT", format!("/api/providers/{id}"), Some(json!({"name": "Hijacked"}))),
+        ("DELETE", format!("/api/providers/{id}"), None),
+        ("POST", format!("/api/providers/{id}/models"), Some(json!({}))),
+    ];
+    for (method, uri, body) in attempts {
+        let resp = send(&db, request_as(Some(TEST_USER_ID), TEST_USER_ID, method, &uri, body)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        assert_eq!(body_json(resp).await["code"], "FORBIDDEN", "{method} {uri}");
+    }
+
+    // Nothing was created, renamed or removed.
+    let resp = send(&db, get_request("/api/providers")).await;
+    let json = body_json(resp).await;
+    assert_eq!(json["data"].as_array().unwrap().len(), 1);
+    assert_eq!(json["data"][0]["id"], id);
+    assert_eq!(json["data"][0]["name"], "Anthropic");
+}
+
+/// A refused caller learns nothing about the providers: the refusal comes
+/// before body validation and before any lookup, so it is the same 403 whether
+/// the body is malformed or the id does not exist.
+#[tokio::test]
+async fn users_are_refused_before_validation_and_lookup() {
+    let (_app, db) = setup().await;
+
+    let attempts = [
+        ("POST", "/api/providers", Some(json!({}))),
+        ("PUT", "/api/providers/nonexistent", Some(json!({"name": "X"}))),
+        ("DELETE", "/api/providers/nonexistent", None),
+        ("POST", "/api/providers/nonexistent/models", Some(json!({}))),
+    ];
+    for (method, uri, body) in attempts {
+        let resp = send(&db, request_as(Some(TEST_USER_ID), TEST_USER_ID, method, uri, body)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        assert_eq!(body_json(resp).await["code"], "FORBIDDEN", "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn the_admin_acting_as_a_user_can_change_providers() {
+    let (_app, db) = setup().await;
+    let (_, id) = create_one(&db).await;
+
+    // real = admin, current = user-1: the administrator acting as a user.
+    let resp = send(
+        &db,
+        request_as(
+            Some(ADMIN_ID),
+            TEST_USER_ID,
+            "PUT",
+            &format!("/api/providers/{id}"),
+            Some(json!({"name": "Renamed while acting as a user"})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["name"], "Renamed while acting as a user");
+
+    let resp = send(
+        &db,
+        request_as(
+            Some(ADMIN_ID),
+            TEST_USER_ID,
+            "POST",
+            "/api/providers",
+            Some(json!({
+                "platform": "openai",
+                "name": "Added while acting as a user",
+                "base_url": "https://api.openai.com",
+                "api_key": "sk-acting"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let added_id = body_json(resp).await["data"]["id"].as_str().unwrap().to_owned();
+
+    // Shared providers belong to no user: the row records the administrator who
+    // added it, not the user the administrator was acting as.
+    let creator: String = sqlx::query_scalar("SELECT user_id FROM providers WHERE id = ?")
+        .bind(&added_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(creator, ADMIN_ID);
+
+    // Acting as a user does not hide the keys from the administrator either.
+    let resp = send(
+        &db,
+        request_as(Some(ADMIN_ID), TEST_USER_ID, "GET", "/api/providers", None),
+    )
+    .await;
+    let json = body_json(resp).await;
+    let keys: Vec<&str> = json["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|provider| provider["api_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains(&"sk-ant-api03-test1234"), "keys: {keys:?}");
+    assert!(keys.contains(&"sk-acting"), "keys: {keys:?}");
+
+    let resp = send(
+        &db,
+        request_as(
+            Some(ADMIN_ID),
+            TEST_USER_ID,
+            "DELETE",
+            &format!("/api/providers/{id}"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// The real caller decides, not the effective user: this pairing cannot come
+/// out of the auth middleware (only the administrator may act as someone else),
+/// so it pins that the routes never fall back to `CurrentUser` when a
+/// `RealUser` is present.
+#[tokio::test]
+async fn authorization_follows_the_real_caller_not_the_effective_user() {
+    let (_app, db) = setup().await;
+    let (_, id) = create_one(&db).await;
+
+    let resp = send(
+        &db,
+        request_as(
+            Some(TEST_USER_ID),
+            ADMIN_ID,
+            "PUT",
+            &format!("/api/providers/{id}"),
+            Some(json!({"name": "Hijacked"})),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["code"], "FORBIDDEN");
+
+    let resp = send(
+        &db,
+        request_as(Some(TEST_USER_ID), ADMIN_ID, "GET", "/api/providers", None),
+    )
+    .await;
+    let json = body_json(resp).await;
+    assert_eq!(json["data"][0]["api_key"], "");
+}
+
+/// Routers built without the auth middleware only inject `CurrentUser`; the
+/// effective user decides there.
+#[tokio::test]
+async fn without_a_real_user_the_effective_user_decides() {
+    let (_app, db) = setup().await;
+    let (_, id) = create_one(&db).await;
+    let rename = |name: &str| Some(json!({"name": name}));
+
+    let resp = send(
+        &db,
+        request_as(
+            None,
+            TEST_USER_ID,
+            "PUT",
+            &format!("/api/providers/{id}"),
+            rename("Hijacked"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let resp = send(&db, request_as(None, TEST_USER_ID, "GET", "/api/providers", None)).await;
+    assert_eq!(body_json(resp).await["data"][0]["api_key"], "");
+
+    let resp = send(
+        &db,
+        request_as(
+            None,
+            ADMIN_ID,
+            "PUT",
+            &format!("/api/providers/{id}"),
+            rename("Renamed"),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send(&db, request_as(None, ADMIN_ID, "GET", "/api/providers", None)).await;
+    let json = body_json(resp).await;
+    assert_eq!(json["data"][0]["name"], "Renamed");
+    assert_eq!(json["data"][0]["api_key"], "sk-ant-api03-test1234");
 }
 
 // ===========================================================================
@@ -246,7 +544,7 @@ async fn create_provider_ignores_body_user_id() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    assert_eq!(owner, TEST_USER_ID);
+    assert_eq!(owner, ADMIN_ID);
 
     // Providers are shared by every user: the creator column only records who
     // added the row, so the other user sees the provider all the same.
@@ -525,51 +823,53 @@ async fn update_provider_nonexistent() {
 }
 
 /// Providers are shared by every user (since 1.0.1): the creator is only
-/// recorded, so listing, editing and deleting go by id alone. Who may write is
-/// a separate route-level decision (the administrator guard); this pins only
-/// that the creator no longer matters.
+/// recorded, so listing, editing and deleting go by id alone. A row some user
+/// added before only the administrator could is therefore listed for everyone
+/// and stays the administrator's to edit or remove, never its creator's.
 #[tokio::test]
-async fn providers_added_by_one_user_are_listed_and_editable_by_another() {
+async fn providers_added_by_a_user_are_listed_for_everyone_and_managed_by_the_admin() {
     let (_app, db) = setup().await;
-    let (_, id) = create_one(&db).await; // added by TEST_USER_ID
-
-    let list_app = system_routes(build_state(&db));
-    let resp = list_app
-        .oneshot(get_request_for_user(OTHER_USER_ID, "/api/providers"))
+    let id = build_state(&db)
+        .provider_service
+        .create(TEST_USER_ID, serde_json::from_value(sample_create_body()).unwrap())
         .await
-        .unwrap();
+        .unwrap()
+        .id;
+
+    let resp = send(&db, get_request_for_user(OTHER_USER_ID, "/api/providers")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["data"].as_array().unwrap().len(), 1);
     assert_eq!(json["data"][0]["id"], id);
+    assert_eq!(json["data"][0]["api_key"], "");
 
-    let update_app = system_routes(build_state(&db));
-    let resp = update_app
-        .oneshot(json_request_for_user(
-            OTHER_USER_ID,
+    let resp = send(
+        &db,
+        json_request(
             "PUT",
             &format!("/api/providers/{id}"),
-            json!({"name": "Renamed by another user"}),
-        ))
-        .await
-        .unwrap();
+            json!({"name": "Renamed by the administrator"}),
+        ),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let creator_app = system_routes(build_state(&db));
-    let resp = creator_app.oneshot(get_request("/api/providers")).await.unwrap();
+    // The creator sees the new name but may not remove its own row any more.
+    let resp = send(&db, get_request_for_user(TEST_USER_ID, "/api/providers")).await;
     let json = body_json(resp).await;
     assert_eq!(json["data"][0]["id"], id);
-    assert_eq!(json["data"][0]["name"], "Renamed by another user");
+    assert_eq!(json["data"][0]["name"], "Renamed by the administrator");
+    let resp = send(
+        &db,
+        delete_request_for_user(TEST_USER_ID, &format!("/api/providers/{id}")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    let delete_app = system_routes(build_state(&db));
-    let resp = delete_app
-        .oneshot(delete_request_for_user(OTHER_USER_ID, &format!("/api/providers/{id}")))
-        .await
-        .unwrap();
+    let resp = send(&db, delete_request(&format!("/api/providers/{id}"))).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let creator_app = system_routes(build_state(&db));
-    let resp = creator_app.oneshot(get_request("/api/providers")).await.unwrap();
+    let resp = send(&db, get_request("/api/providers")).await;
     let json = body_json(resp).await;
     assert_eq!(json["data"], json!([]));
 }

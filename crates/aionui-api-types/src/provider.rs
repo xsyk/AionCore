@@ -130,6 +130,9 @@ pub enum BedrockAuthMethod {
 }
 
 /// AWS Bedrock-specific configuration.
+///
+/// `access_key_id` and `secret_access_key` are credentials: provider responses
+/// carry them only for the administrator and omit them for everyone else.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BedrockConfig {
     pub auth_method: BedrockAuthMethod,
@@ -144,16 +147,19 @@ pub struct BedrockConfig {
 
 /// Provider response for `GET /api/providers` and single-provider endpoints.
 ///
-/// The `api_key` field is returned in plaintext (decrypted on read). Storage
-/// remains encrypted at rest. Pre-launch convention for the frontend
-/// local-store → backend migration; no masking applied.
+/// Providers are shared by every user, but their secrets are not. The
+/// `api_key` field and the Bedrock static credentials in `bedrock_config` are
+/// returned in plaintext (decrypted on read; storage remains encrypted at
+/// rest) only to the administrator, who needs them to edit the provider. Every
+/// other user gets an empty `api_key` and no Bedrock credentials.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderResponse {
     pub id: String,
     pub platform: String,
     pub name: String,
     pub base_url: String,
-    /// Plaintext API key (decrypted from storage).
+    /// Plaintext API key (decrypted from storage); an empty string for anyone
+    /// but the administrator.
     pub api_key: String,
     pub models: Vec<String>,
     pub enabled: bool,
@@ -522,7 +528,8 @@ mod tests {
 
     #[test]
     fn test_provider_response_api_key_plaintext() {
-        // Pre-launch: no masking is applied to the api_key field on the wire.
+        // The type itself applies no masking to api_key; hiding it from users
+        // other than the administrator is the service's job (`reveal_keys`).
         let resp = ProviderResponse {
             id: "id".into(),
             platform: "openai".into(),

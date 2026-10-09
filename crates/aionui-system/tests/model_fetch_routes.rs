@@ -13,7 +13,8 @@ use tower::ServiceExt;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, RealUser};
+use aionui_common::constants::SUPER_ADMIN_USER_ID;
 use aionui_common::encrypt_string;
 use aionui_db::{
     CreateProviderParams, IProviderRepository, SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository,
@@ -31,6 +32,9 @@ use aionui_system::{
 
 const TEST_KEY: [u8; 32] = [0x42; 32];
 const TEST_USER_ID: &str = "user-1";
+/// The administrator, the only account that may fetch models for a stored
+/// provider. Its user row is seeded by `init_database_memory`.
+const ADMIN_ID: &str = SUPER_ADMIN_USER_ID;
 
 fn build_state(db: &aionui_db::Database) -> SystemRouterState {
     let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
@@ -96,20 +100,110 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-fn post_request(uri: &str, body: serde_json::Value) -> Request<Body> {
+fn current_user(id: &str) -> CurrentUser {
+    CurrentUser {
+        id: id.to_owned(),
+        username: id.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
+    }
+}
+
+/// A JSON POST the way the auth middleware leaves it: `current` is the
+/// effective user and `real`, when `Some`, the authenticated caller behind it.
+/// The two differ only while the administrator acts as another user.
+fn post_request_as(real: Option<&str>, current: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
     let mut req = Request::builder()
         .method("POST")
         .uri(uri)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap();
-    req.extensions_mut().insert(CurrentUser {
-        id: TEST_USER_ID.to_owned(),
-        username: TEST_USER_ID.to_owned(),
-        user_type: UserType::Local,
-        status: UserStatus::Active,
-    });
+    if let Some(real) = real {
+        req.extensions_mut().insert(RealUser(current_user(real)));
+    }
+    req.extensions_mut().insert(current_user(current));
     req
+}
+
+/// A JSON POST as the administrator.
+fn post_request(uri: &str, body: serde_json::Value) -> Request<Body> {
+    post_request_as(Some(ADMIN_ID), ADMIN_ID, uri, body)
+}
+
+// ---------------------------------------------------------------------------
+// Tests: who may fetch models for a stored provider
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fetch_models_by_id_is_refused_for_users_before_the_stored_key_is_used() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "gpt-4o"}]})))
+        .mount(&mock_server)
+        .await;
+
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "openai", &mock_server.uri(), "stored-key").await;
+
+    let req = post_request_as(
+        Some(TEST_USER_ID),
+        TEST_USER_ID,
+        &format!("/api/providers/{id}/models"),
+        json!({"try_fix": false}),
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["code"], "FORBIDDEN");
+
+    // The refusal came before the provider was contacted with the stored key.
+    assert!(mock_server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn fetch_models_by_id_works_for_the_admin_acting_as_a_user() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("Authorization", "Bearer stored-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "gpt-4o"}]})))
+        .mount(&mock_server)
+        .await;
+
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "openai", &mock_server.uri(), "stored-key").await;
+
+    // real = admin, current = user-1: the administrator acting as a user.
+    let req = post_request_as(
+        Some(ADMIN_ID),
+        TEST_USER_ID,
+        &format!("/api/providers/{id}/models"),
+        json!({"try_fix": false}),
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["models"][0], "gpt-4o");
+}
+
+/// `fetch-models` takes the key from the request body, not from the stored
+/// provider, so it stays open to every user (the "Add platform" preview).
+#[tokio::test]
+async fn fetch_models_anonymous_stays_open_to_users() {
+    let (router, _db) = setup().await;
+    let req = post_request_as(
+        Some(TEST_USER_ID),
+        TEST_USER_ID,
+        "/api/providers/fetch-models",
+        json!({
+            "platform": "minimax",
+            "base_url": "https://unused",
+            "api_key": "fake"
+        }),
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["models"].as_array().unwrap().len(), 3);
 }
 
 // ---------------------------------------------------------------------------

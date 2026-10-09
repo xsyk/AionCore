@@ -12,8 +12,9 @@ use crate::middleware::{CurrentUser, RealUser};
 ///
 /// Authorizes on the *real* caller, so the super admin may change shared
 /// settings while acting as another user (the settings are not per-user).
-/// Requests that never passed the auth middleware's act-as step carry no
-/// [`RealUser`]; they fall back to the effective user.
+/// `auth_middleware` always inserts [`RealUser`] next to [`CurrentUser`] (local,
+/// runtime-token and JWT paths alike); `real` is `None` only for routers or
+/// tests that inject `CurrentUser` without it, and they use the effective user.
 pub fn require_shared_config_admin(real: Option<&RealUser>, current: &CurrentUser) -> Result<(), ApiError> {
     if can_manage_shared_config(real, current) {
         Ok(())

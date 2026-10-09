@@ -91,6 +91,100 @@ async fn provider_full_crud_with_auth() {
     assert_eq!(json["data"], json!([]));
 }
 
+/// Through the real auth middleware: ordinary users get the shared list
+/// without keys and cannot change it, while the administrator, also when acting
+/// as a user, can.
+#[tokio::test]
+async fn ordinary_users_see_shared_providers_without_keys_and_cannot_change_them() {
+    let (mut app, services) = build_app().await;
+    let (admin_token, admin_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (user_token, user_csrf) = setup_and_login(&mut app, &services, "alice", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/providers",
+        json!({
+            "platform": "anthropic",
+            "name": "Anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "sk-shared-e2e"
+        }),
+        &admin_token,
+        &admin_csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let id = body_json(resp).await["data"]["id"].as_str().unwrap().to_owned();
+
+    // The administrator reads the key; an ordinary user gets the same provider without it.
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/providers", &admin_token))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["data"][0]["api_key"], "sk-shared-e2e");
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/providers", &user_token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"].as_array().unwrap().len(), 1);
+    assert_eq!(json["data"][0]["id"], id);
+    assert_eq!(json["data"][0]["api_key"], "");
+    assert!(!json.to_string().contains("sk-shared-e2e"), "key leaked: {json}");
+
+    // An ordinary user cannot create, edit, delete or fetch models for a stored provider.
+    let attempts = [
+        (
+            "POST",
+            "/api/providers".to_owned(),
+            Some(json!({
+                "platform": "openai",
+                "name": "Mine",
+                "base_url": "https://api.openai.com",
+                "api_key": "sk-mine"
+            })),
+        ),
+        ("PUT", format!("/api/providers/{id}"), Some(json!({"name": "Hijacked"}))),
+        ("DELETE", format!("/api/providers/{id}"), None),
+        ("POST", format!("/api/providers/{id}/models"), Some(json!({}))),
+    ];
+    for (method, uri, body) in attempts {
+        let req = match body {
+            Some(body) => json_with_token(method, &uri, body, &user_token, &user_csrf),
+            None => delete_with_token(&uri, &user_token, &user_csrf),
+        };
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        assert_eq!(body_json(resp).await["code"], "FORBIDDEN", "{method} {uri}");
+    }
+
+    // The administrator acting as that user is still the administrator.
+    let alice = services.user_repo.find_by_username("alice").await.unwrap().unwrap();
+    let mut req = json_with_token(
+        "PUT",
+        &format!("/api/providers/{id}"),
+        json!({"name": "Renamed while acting as alice"}),
+        &admin_token,
+        &admin_csrf,
+    );
+    req.headers_mut()
+        .insert(aionui_auth::ACT_AS_HEADER, alice.id.parse().unwrap());
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Nothing the user tried got through; only the administrator's rename did.
+    let resp = app
+        .oneshot(get_with_token("/api/providers", &user_token))
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["data"].as_array().unwrap().len(), 1);
+    assert_eq!(json["data"][0]["name"], "Renamed while acting as alice");
+}
+
 #[tokio::test]
 async fn provider_create_validation_with_auth() {
     let (mut app, services) = build_app().await;

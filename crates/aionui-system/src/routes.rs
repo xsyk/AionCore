@@ -13,7 +13,7 @@ use aionui_api_types::{
     SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
     UpdateProviderRequest, UpdateSettingsRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, RealUser, can_manage_shared_config, require_shared_config_admin};
 use aionui_common::ApiError;
 
 use crate::client_pref::ClientPrefService;
@@ -62,11 +62,11 @@ impl From<SystemError> for ApiError {
 /// - `PATCH /api/settings`                   — partial update backend settings
 /// - `GET  /api/settings/client`             — get client preferences
 /// - `PUT  /api/settings/client`             — batch update client preferences
-/// - `GET  /api/providers`                   — list all providers
-/// - `POST /api/providers`                   — create a provider
-/// - `PUT  /api/providers/:id`               — update a provider
-/// - `DELETE /api/providers/:id`             — delete a provider
-/// - `POST /api/providers/:id/models`        — fetch models from remote API
+/// - `GET  /api/providers`                   — list all providers (API keys only for the administrator)
+/// - `POST /api/providers`                   — create a provider (administrator only)
+/// - `PUT  /api/providers/:id`               — update a provider (administrator only)
+/// - `DELETE /api/providers/:id`             — delete a provider (administrator only)
+/// - `POST /api/providers/:id/models`        — fetch models from remote API with the stored key (administrator only)
 /// - `POST /api/providers/fetch-models`      — fetch models anonymously (pre-create preview)
 /// - `POST /api/providers/detect-protocol`   — detect API protocol
 /// - `GET  /api/system/current-user`         — the identity the auth middleware injected
@@ -195,24 +195,35 @@ async fn update_client_preferences(
 // ===========================================================================
 
 // Providers are shared by every user (since 1.0.1): the list is not scoped to
-// the caller. Keys are revealed to every caller for now; restricting them to
-// the administrator is a separate permission step.
+// the caller. Changing them, and reading their API keys, is the administrator's
+// alone. Authorization follows the real caller, so the administrator acting as
+// another user keeps both. Each write handler refuses first, before the body is
+// validated or the provider looked up, so a refused caller learns nothing.
 async fn list_providers(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    real: Option<Extension<RealUser>>,
 ) -> Result<Json<ApiResponse<Vec<ProviderResponse>>>, ApiError> {
-    let providers = state.provider_service.list(true).await.map_err(ApiError::from)?;
+    let reveal_keys = can_manage_shared_config(real.as_ref().map(|Extension(real)| real), &user);
+    let providers = state.provider_service.list(reveal_keys).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(providers)))
 }
 
 async fn create_provider(
     State(state): State<SystemRouterState>,
     Extension(user): Extension<CurrentUser>,
+    real: Option<Extension<RealUser>>,
     body: Result<Json<CreateProviderRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ProviderResponse>>), ApiError> {
+    let real = real.as_ref().map(|Extension(real)| real);
+    require_shared_config_admin(real, &user)?;
     let Json(req) = body.map_err(ApiError::from)?;
+    // A shared provider belongs to no user: record the administrator who added
+    // it, not the user the administrator may be acting as.
+    let creator_id = real.map_or(user.id.as_str(), |real| real.0.id.as_str());
     let provider = state
         .provider_service
-        .create(&user.id, req)
+        .create(creator_id, req)
         .await
         .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(provider))))
@@ -220,9 +231,12 @@ async fn create_provider(
 
 async fn update_provider(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    real: Option<Extension<RealUser>>,
     Path(id): Path<String>,
     body: Result<Json<UpdateProviderRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderResponse>>, ApiError> {
+    require_shared_config_admin(real.as_ref().map(|Extension(real)| real), &user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let provider = state.provider_service.update(&id, req).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(provider)))
@@ -230,17 +244,26 @@ async fn update_provider(
 
 async fn delete_provider(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    real: Option<Extension<RealUser>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    require_shared_config_admin(real.as_ref().map(|Extension(real)| real), &user)?;
     state.provider_service.delete(&id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
+// Fetching models for a stored provider sends the stored API key to the remote
+// service, so it counts as editing the provider. `fetch-models` below takes the
+// key from the request instead and stays open to every user.
 async fn fetch_models(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    real: Option<Extension<RealUser>>,
     Path(id): Path<String>,
     body: Result<Json<FetchModelsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FetchModelsResponse>>, ApiError> {
+    require_shared_config_admin(real.as_ref().map(|Extension(real)| real), &user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .model_fetch_service
