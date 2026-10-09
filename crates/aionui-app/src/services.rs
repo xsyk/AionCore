@@ -1,5 +1,6 @@
 //! Shared application services for dependency injection.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,9 +16,9 @@ use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
     IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository, SqliteAcpSessionRepository,
     SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteUserOrderStore,
-    SqliteUserRepository,
+    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteGlobalSettingRepository,
+    SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository, SqliteSettingsRepository,
+    SqliteSkillRepository, SqliteUserOrderStore, SqliteUserRepository,
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
@@ -26,7 +27,18 @@ use aionui_session_message::queue::{DeliveryQueue, SystemClock};
 use aionui_session_message::rate_limit::RateLimiter;
 use aionui_session_message::service::{SessionMessageDeps, SessionMessageService};
 use aionui_sidebar::UserOrderDeleteHook;
+use aionui_system::ImageGenerationService;
 use tokio::sync::Notify;
+
+/// Environment variable naming the image generation MCP script. The launcher
+/// (AionUi) sets it to the script that ships next to the backend; when it is
+/// unset, or names a file that is not there, image generation is unsupported.
+const IMAGE_GEN_MCP_SCRIPT_ENV: &str = "AIONUI_IMAGE_GEN_MCP_SCRIPT";
+
+/// The image generation script path out of the environment value, if any.
+fn image_generation_script_path(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
 
 pub struct AppServices {
     pub database: Database,
@@ -41,6 +53,9 @@ pub struct AppServices {
     pub runtime_token_service: Arc<RuntimeTokenService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    /// The image generation model shared by every user and the MCP server
+    /// sessions get from it. Cheap to clone.
+    pub image_generation_service: ImageGenerationService,
     /// Cross-session messaging. The queue, the rate limiter and the notify
     /// handle are shared by the send path, the drainer, and the cancel hook, so
     /// they are built once here (`AppServices` is the sole construction centre).
@@ -253,6 +268,23 @@ impl AppServices {
         let encryption_key = derive_encryption_key(&encryption_secret);
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
+        let image_generation_script = image_generation_script_path(std::env::var_os(IMAGE_GEN_MCP_SCRIPT_ENV));
+        match image_generation_script.as_deref() {
+            Some(script) => tracing::info!(
+                "image generation MCP script: {} ({})",
+                script.display(),
+                if script.is_file() { "installed" } else { "missing" }
+            ),
+            None => tracing::info!(
+                "image generation MCP script: not configured (image generation is unavailable; set {IMAGE_GEN_MCP_SCRIPT_ENV})"
+            ),
+        }
+        let image_generation_service = ImageGenerationService::new(
+            Arc::new(SqliteGlobalSettingRepository::new(database.pool().clone())),
+            provider_repo.clone(),
+            encryption_key,
+            image_generation_script,
+        );
         let event_bus = Arc::new(BroadcastEventBus::new(256));
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
@@ -440,6 +472,7 @@ impl AppServices {
             runtime_token_service,
             conversation_runtime_state,
             conversation_service,
+            image_generation_service,
             session_message_service,
             session_message_queue,
             session_message_notify,
@@ -599,6 +632,25 @@ mod tests {
         );
 
         services.database.close().await;
+    }
+
+    #[test]
+    fn the_image_generation_script_comes_from_a_non_empty_environment_value() {
+        assert_eq!(image_generation_script_path(None), None);
+        assert_eq!(
+            image_generation_script_path(Some(OsString::new())),
+            None,
+            "empty means not configured"
+        );
+        assert_eq!(
+            image_generation_script_path(Some(OsString::from("/opt/aionui/builtin-mcp/builtin-mcp-image-gen.js"))),
+            Some(PathBuf::from("/opt/aionui/builtin-mcp/builtin-mcp-image-gen.js"))
+        );
+    }
+
+    #[test]
+    fn the_image_generation_script_variable_is_the_one_the_launcher_sets() {
+        assert_eq!(IMAGE_GEN_MCP_SCRIPT_ENV, "AIONUI_IMAGE_GEN_MCP_SCRIPT");
     }
 
     // ELECTRON-3T0 guard decision table. `from_config` hard-constructs the repo,

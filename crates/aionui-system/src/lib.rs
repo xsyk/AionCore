@@ -1,10 +1,12 @@
 #![warn(clippy::disallowed_types)]
 
-//! System services: provider management, model fetching, settings, and version checks.
+//! System services: provider management, model fetching, settings (including the shared image
+//! generation setting), and version checks.
 pub mod bedrock_probe;
 pub mod client_pref;
 pub mod diagnostics;
 pub mod error;
+pub mod image_generation;
 pub mod keep_awake;
 pub mod model_fetcher;
 pub mod protocol;
@@ -19,6 +21,7 @@ pub use bedrock_probe::{ConnectionTestRouterState, ConnectionTestService, connec
 pub use client_pref::ClientPrefService;
 pub use diagnostics::FeedbackDiagnosticsService;
 pub use error::SystemError;
+pub use image_generation::{IMAGE_GENERATION_MCP_NAME, IMAGE_GENERATION_SETTING_KEY, ImageGenerationService};
 pub use keep_awake::{KeepAwakeController, NoopKeepAwakeController, SystemKeepAwakeController};
 pub use model_fetcher::ModelFetchService;
 pub use protocol::ProtocolDetectionService;

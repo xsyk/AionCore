@@ -3,8 +3,8 @@ use std::sync::Arc;
 use aionui_auth::CurrentUser;
 use aionui_realtime::BroadcastEventBus;
 use aionui_system::{
-    ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ProtocolDetectionService, ProviderService,
-    RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService, system_routes,
+    ClientPrefService, FeedbackDiagnosticsService, ImageGenerationService, ModelFetchService, ProtocolDetectionService,
+    ProviderService, RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService, system_routes,
 };
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -13,8 +13,8 @@ use serde_json::json;
 use tower::ServiceExt;
 
 use aionui_db::{
-    SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
+    SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteGlobalSettingRepository,
+    SqliteProviderRepository, SqliteSettingsRepository, UserStatus, UserType, init_database_memory,
 };
 
 const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42; 32];
@@ -26,6 +26,12 @@ fn build_state(db: &aionui_db::Database) -> SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(db.pool().clone()))),
         client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(db.pool().clone()))),
         provider_service: ProviderService::new(provider_repo.clone(), TEST_ENCRYPTION_KEY),
+        image_generation_service: ImageGenerationService::new(
+            Arc::new(SqliteGlobalSettingRepository::new(db.pool().clone())),
+            provider_repo.clone(),
+            TEST_ENCRYPTION_KEY,
+            None,
+        ),
         model_fetch_service: ModelFetchService::new(provider_repo, TEST_ENCRYPTION_KEY, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
         version_check_service: VersionCheckService::new(http_client, "0.1.0".to_owned()),

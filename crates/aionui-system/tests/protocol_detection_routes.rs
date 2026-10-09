@@ -15,12 +15,12 @@ use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use aionui_db::{
-    SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteSettingsRepository, init_database_memory,
+    SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteGlobalSettingRepository,
+    SqliteProviderRepository, SqliteSettingsRepository, init_database_memory,
 };
 use aionui_system::{
-    ClientPrefService, FeedbackDiagnosticsService, ModelFetchService, ProtocolDetectionService, ProviderService,
-    RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService, system_routes,
+    ClientPrefService, FeedbackDiagnosticsService, ImageGenerationService, ModelFetchService, ProtocolDetectionService,
+    ProviderService, RuntimePrepareService, SettingsService, SystemRouterState, VersionCheckService, system_routes,
 };
 
 // ---------------------------------------------------------------------------
@@ -36,6 +36,12 @@ fn build_state(db: &aionui_db::Database) -> SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(db.pool().clone()))),
         client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(db.pool().clone()))),
         provider_service: ProviderService::new(provider_repo.clone(), TEST_KEY),
+        image_generation_service: ImageGenerationService::new(
+            Arc::new(SqliteGlobalSettingRepository::new(db.pool().clone())),
+            provider_repo.clone(),
+            TEST_KEY,
+            None,
+        ),
         model_fetch_service: ModelFetchService::new(provider_repo, TEST_KEY, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
         version_check_service: VersionCheckService::new(http_client, "0.1.0".to_owned()),

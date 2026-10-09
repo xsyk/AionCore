@@ -9,9 +9,10 @@ use axum::routing::{delete, get, post};
 use aionui_api_types::{
     ApiResponse, ClientPreferencesResponse, CreateProviderRequest, CurrentUserResponse, DetectProtocolRequest,
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse,
-    FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse,
-    SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
-    UpdateProviderRequest, UpdateSettingsRequest,
+    FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, ImageGenerationSettingsResponse,
+    ProtocolDetectionResponse, ProviderResponse, SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest,
+    UpdateCheckResult, UpdateClientPreferencesRequest, UpdateImageGenerationSettingsRequest, UpdateProviderRequest,
+    UpdateSettingsRequest,
 };
 use aionui_auth::{CurrentUser, RealUser, can_manage_shared_config, require_shared_config_admin};
 use aionui_common::ApiError;
@@ -19,6 +20,7 @@ use aionui_common::ApiError;
 use crate::client_pref::ClientPrefService;
 use crate::diagnostics::FeedbackDiagnosticsService;
 use crate::error::SystemError;
+use crate::image_generation::ImageGenerationService;
 use crate::model_fetcher::ModelFetchService;
 use crate::protocol::ProtocolDetectionService;
 use crate::provider::ProviderService;
@@ -37,6 +39,7 @@ pub struct SystemRouterState {
     pub version_check_service: VersionCheckService,
     pub runtime_prepare_service: RuntimePrepareService,
     pub feedback_diagnostics_service: FeedbackDiagnosticsService,
+    pub image_generation_service: ImageGenerationService,
 }
 
 impl From<SystemError> for ApiError {
@@ -62,6 +65,8 @@ impl From<SystemError> for ApiError {
 /// - `PATCH /api/settings`                   — partial update backend settings
 /// - `GET  /api/settings/client`             — get client preferences
 /// - `PUT  /api/settings/client`             — batch update client preferences
+/// - `GET  /api/settings/image-generation`   — get the image generation setting shared by all users
+/// - `PUT  /api/settings/image-generation`   — change it (administrator only)
 /// - `GET  /api/providers`                   — list all providers (API keys only for the administrator)
 /// - `POST /api/providers`                   — create a provider (administrator only)
 /// - `PUT  /api/providers/:id`               — update a provider (administrator only)
@@ -80,6 +85,10 @@ pub fn system_routes(state: SystemRouterState) -> Router {
         .route(
             "/api/settings/client",
             get(get_client_preferences).put(update_client_preferences),
+        )
+        .route(
+            "/api/settings/image-generation",
+            get(get_image_generation).put(update_image_generation),
         )
         .route("/api/providers", get(list_providers).post(create_provider))
         // Literal-segment routes must register BEFORE the `/{id}` routes so
@@ -188,6 +197,38 @@ async fn update_client_preferences(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
+}
+
+// ===========================================================================
+// Image generation handlers
+// ===========================================================================
+
+// The image generation model is one setting for the whole server (since 1.0.1):
+// every user reads it, only the administrator changes it. Authorization follows
+// the real caller, so the administrator keeps the right while acting as another
+// user. The write handler refuses first, before the body is parsed or the
+// provider looked up, so a refused caller learns nothing.
+async fn get_image_generation(
+    State(state): State<SystemRouterState>,
+) -> Result<Json<ApiResponse<ImageGenerationSettingsResponse>>, ApiError> {
+    let settings = state.image_generation_service.get().await.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(settings)))
+}
+
+async fn update_image_generation(
+    State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    real: Option<Extension<RealUser>>,
+    body: Result<Json<UpdateImageGenerationSettingsRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ImageGenerationSettingsResponse>>, ApiError> {
+    require_shared_config_admin(real.as_ref().map(|Extension(real)| real), &user)?;
+    let Json(req) = body.map_err(ApiError::from)?;
+    let settings = state
+        .image_generation_service
+        .update(req)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(settings)))
 }
 
 // ===========================================================================

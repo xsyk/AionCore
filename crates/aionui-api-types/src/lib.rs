@@ -49,8 +49,8 @@ pub use acp::{
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
-    AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, ForkSpec, SessionMcpServer, SessionMcpTransport,
-    SlashCommandCompletionBehavior, SlashCommandItem,
+    AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, ForkSpec, IMAGE_GENERATION_MCP_NAME, SessionMcpServer,
+    SessionMcpTransport, SlashCommandCompletionBehavior, SlashCommandItem,
 };
 pub use agent_discovery::{
     AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus, AgentMetadata,
@@ -201,7 +201,8 @@ pub use skill_runtime::{
 pub use system::{
     ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,
     FeedbackDiagnosticsPrivacyResponse, FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery,
-    FeedbackDiagnosticsResponse, SystemSettingsResponse, UpdateClientPreferencesRequest, UpdateSettingsRequest,
+    FeedbackDiagnosticsResponse, ImageGenerationSettingsResponse, SystemSettingsResponse,
+    UpdateClientPreferencesRequest, UpdateImageGenerationSettingsRequest, UpdateSettingsRequest,
 };
 pub use team::{
     AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, InterruptTeamAgentRequest,

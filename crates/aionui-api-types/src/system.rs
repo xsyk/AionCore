@@ -98,6 +98,36 @@ pub type ClientPreferencesResponse = HashMap<String, Value>;
 /// the key should be deleted. Non-null values are persisted as-is.
 pub type UpdateClientPreferencesRequest = HashMap<String, Value>;
 
+/// Response for `GET` and `PUT /api/settings/image-generation`.
+///
+/// The image generation model is one setting for the whole server: the
+/// administrator picks it, and while it is on every agent session gets the image
+/// generation tool. Everyone may read it, only the administrator may change it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageGenerationSettingsResponse {
+    /// Provider that serves the image model; `None` while none is chosen.
+    pub provider_id: Option<String>,
+    /// Image model of that provider; `None` while none is chosen.
+    pub model: Option<String>,
+    /// Whether sessions get the image generation tool. Needs a model to be on.
+    pub enabled: bool,
+    /// Whether this server has the image generation MCP script installed.
+    /// Read-only: it is reported, never accepted back.
+    pub supported: bool,
+}
+
+/// Request body for `PUT /api/settings/image-generation`.
+///
+/// Turning the setting on needs an existing provider and a model. Turning it
+/// off needs nothing: `provider_id` and `model` are stored as given, so the
+/// administrator can always switch it off or clear it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateImageGenerationSettingsRequest {
+    pub provider_id: Option<String>,
+    pub model: Option<String>,
+    pub enabled: bool,
+}
+
 /// Query parameters for `GET /api/system/diagnostics/feedback-report`.
 ///
 /// The UI sends only routing and explicit context. aionCore owns profile
@@ -218,6 +248,75 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let parsed: SystemSettingsResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    // -- ImageGenerationSettingsResponse / UpdateImageGenerationSettingsRequest --
+
+    #[test]
+    fn image_generation_response_serializes_every_field_even_when_unset() {
+        let resp = ImageGenerationSettingsResponse {
+            provider_id: None,
+            model: None,
+            enabled: false,
+            supported: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap(),
+            json!({"provider_id": null, "model": null, "enabled": false, "supported": true})
+        );
+    }
+
+    #[test]
+    fn image_generation_response_roundtrip() {
+        let original = ImageGenerationSettingsResponse {
+            provider_id: Some("prov_1".to_owned()),
+            model: Some("gpt-image-1".to_owned()),
+            enabled: true,
+            supported: false,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: ImageGenerationSettingsResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn image_generation_request_reads_the_three_writable_fields() {
+        let req: UpdateImageGenerationSettingsRequest = serde_json::from_value(json!({
+            "provider_id": "prov_1",
+            "model": "gpt-image-1",
+            "enabled": true
+        }))
+        .unwrap();
+        assert_eq!(req.provider_id.as_deref(), Some("prov_1"));
+        assert_eq!(req.model.as_deref(), Some("gpt-image-1"));
+        assert!(req.enabled);
+    }
+
+    #[test]
+    fn image_generation_request_accepts_null_or_missing_provider_and_model() {
+        let nulls: UpdateImageGenerationSettingsRequest =
+            serde_json::from_value(json!({"provider_id": null, "model": null, "enabled": false})).unwrap();
+        let missing: UpdateImageGenerationSettingsRequest = serde_json::from_value(json!({"enabled": false})).unwrap();
+        assert_eq!(nulls, missing);
+        assert!(nulls.provider_id.is_none() && nulls.model.is_none() && !nulls.enabled);
+    }
+
+    #[test]
+    fn image_generation_request_needs_the_enabled_flag() {
+        let result = serde_json::from_value::<UpdateImageGenerationSettingsRequest>(json!({"model": "gpt-image-1"}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn image_generation_request_ignores_the_read_only_supported_field() {
+        let req: UpdateImageGenerationSettingsRequest = serde_json::from_value(json!({
+            "provider_id": null,
+            "model": null,
+            "enabled": false,
+            "supported": true
+        }))
+        .unwrap();
+        assert!(!req.enabled);
     }
 
     // -- UpdateSettingsRequest --

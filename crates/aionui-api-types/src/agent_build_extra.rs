@@ -38,6 +38,14 @@ pub struct SessionMcpServer {
     pub transport: SessionMcpTransport,
 }
 
+/// Name of the server-wide image generation MCP server.
+///
+/// The backend adds it to every session from the shared image generation
+/// setting, so the name is reserved: any other server that carries it (a stale
+/// per-conversation snapshot, an assistant's built-in selection) is dropped
+/// before the shared one is added, or left out when the setting is off.
+pub const IMAGE_GENERATION_MCP_NAME: &str = "aionui-image-generation";
+
 /// The fork spec a forked conversation carries in `conversations.extra.fork`
 /// until its backend session materializes: the parent lineage (UI display) plus
 /// the snapshot the first open needs to fork the backend session. Written ONLY
@@ -170,6 +178,13 @@ pub struct SlashCommandItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The name is a wire contract: the image generation script, the desktop
+    /// built-in row and every stored snapshot spell it this way.
+    #[test]
+    fn image_generation_mcp_name_is_the_reserved_wire_name() {
+        assert_eq!(IMAGE_GENERATION_MCP_NAME, "aionui-image-generation");
+    }
 
     #[test]
     fn acp_build_extra_defaults_thought_level_to_none() {

@@ -500,6 +500,7 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
         feedback_diagnostics_service: FeedbackDiagnosticsService::new(Arc::new(
             SqliteFeedbackDiagnosticsRepository::new(pool),
         )),
+        image_generation_service: services.image_generation_service.clone(),
     }
 }
 
