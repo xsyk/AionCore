@@ -60,6 +60,10 @@ pub const UPLOAD_MAX_SIZE: usize = 30 * 1024 * 1024;
 /// applies to the file's content; the route's request-body limit adds room for
 /// the multipart framing on top of it.
 pub const PROJECT_UPLOAD_MAX_SIZE: usize = 100 * 1024 * 1024;
+/// Name prefix of the private temp file an upload streams into before it gets
+/// its final name. The Explorer hides names with this prefix, so it must stay
+/// lowercase.
+pub const PROJECT_UPLOAD_TEMP_PREFIX: &str = ".aionui-upload-";
 
 // --- Team mode ---
 

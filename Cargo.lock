@@ -700,6 +700,7 @@ dependencies = [
  "dirs",
  "git2",
  "ignore",
+ "libc",
  "mime_guess",
  "notify",
  "reqwest",

@@ -33,6 +33,15 @@ fn hides_linux_trash_by_prefix() {
 }
 
 #[test]
+fn hides_upload_temp_files_by_prefix() {
+    assert!(should_hide(".aionui-upload-3f9c2a7e01b4d685"));
+    assert!(should_hide(".AIONUI-UPLOAD-3F9C"));
+    // Only the temp prefix, not look-alikes.
+    assert!(!should_hide("aionui-upload-notes.md"));
+    assert!(!should_hide(".aionui-uploads"));
+}
+
+#[test]
 fn keeps_real_dotfiles_users_want() {
     // Neither exact nor prefix noise — must stay visible.
     assert!(!should_hide(".env"));

@@ -231,6 +231,8 @@ async fn read_dir_hides_os_junk_and_vcs_but_keeps_real_dotfiles() {
     std::fs::create_dir(root.join(".git")).unwrap();
     std::fs::write(root.join("Thumbs.db"), b"x").unwrap();
     std::fs::write(root.join("._resource"), b"x").unwrap();
+    // An Explorer upload still streaming into its private temp.
+    std::fs::write(root.join(".aionui-upload-3f9c2a7e01b4d685"), b"x").unwrap();
     // Kept — real files including user-meaningful dotfiles.
     std::fs::write(root.join("README.md"), b"x").unwrap();
     std::fs::write(root.join(".env"), b"x").unwrap();

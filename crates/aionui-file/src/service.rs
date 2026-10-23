@@ -20,7 +20,10 @@ use crate::types::{
 };
 
 mod project_upload;
-pub use project_upload::ProjectUpload;
+
+/// The `list_workspace_files` cache, keyed by canonical root. Shared so an
+/// upload in progress can clear its root's entry when it lands or is removed.
+type ListingCache = Arc<DashMap<String, Vec<WorkspaceFlatFile>>>;
 
 /// Maximum number of files returned by `list_workspace_files`.
 const MAX_WORKSPACE_FILES: usize = 20_000;
@@ -66,7 +69,7 @@ pub struct FileService {
     /// Allowed root directories for path safety validation.
     allowed_roots: Vec<std::path::PathBuf>,
     /// In-memory cache for `list_workspace_files`, keyed by canonical root.
-    workspace_files_cache: DashMap<String, Vec<WorkspaceFlatFile>>,
+    workspace_files_cache: ListingCache,
 }
 
 impl FileService {
@@ -74,7 +77,7 @@ impl FileService {
         Self {
             broadcaster,
             allowed_roots,
-            workspace_files_cache: DashMap::new(),
+            workspace_files_cache: Arc::new(DashMap::new()),
         }
     }
 
@@ -928,13 +931,17 @@ impl crate::traits::IFileService for FileService {
         .map_err(|e| FileError::Internal(format!("copy task failed: {e}")))?
     }
 
-    async fn begin_project_upload(&self, root: &Path, dir: &Path, file_name: &str) -> Result<ProjectUpload, FileError> {
+    async fn begin_project_upload(
+        &self,
+        root: &Path,
+        dir: &Path,
+        file_name: &str,
+    ) -> Result<crate::traits::ProjectUploadRef, FileError> {
         let limit = aionui_common::constants::PROJECT_UPLOAD_MAX_SIZE as u64;
-        let (upload, canonical_root) = ProjectUpload::begin(root, dir, file_name, limit).await?;
-        // The workspace listing holds names only, so it is stale as soon as the
-        // new name exists.
-        self.invalidate_cache(&canonical_root.to_string_lossy());
-        Ok(upload)
+        let upload =
+            project_upload::LocalProjectUpload::begin(root, dir, file_name, limit, self.workspace_files_cache.clone())
+                .await?;
+        Ok(Box::new(upload))
     }
 
     async fn create_upload_file(

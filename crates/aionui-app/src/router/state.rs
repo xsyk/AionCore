@@ -569,6 +569,7 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         system_opener,
         clipboard,
         allowed_roots,
+        project_upload: aionui_file::ProjectUploadLimits::default(),
     })
 }
 

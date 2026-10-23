@@ -34,10 +34,12 @@ const HIDDEN_EXACT: &[&str] = &[
     ".directory",
 ];
 
-/// Names hidden by (case-insensitive) prefix.
+/// Names hidden by (case-insensitive) prefix. Entries are lowercase.
 const HIDDEN_PREFIX: &[&str] = &[
     "._",      // macOS AppleDouble resource-fork sidecars (`._file`)
     ".trash-", // Linux trash directories (`.Trash-1000`)
+    // The private temp an Explorer upload streams into before it is named.
+    aionui_common::constants::PROJECT_UPLOAD_TEMP_PREFIX,
 ];
 
 /// Whether `name` is a noise entry to hide entirely from listings.

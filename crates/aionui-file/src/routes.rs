@@ -27,6 +27,9 @@ use crate::error::FileError;
 use crate::traits::{ClipboardWriterRef, FileServiceRef, ItemRevealerRef, SnapshotServiceRef, SystemFileOpenerRef};
 
 mod project_upload;
+pub use project_upload::{
+    PROJECT_UPLOAD_IDLE_TIMEOUT, PROJECT_UPLOAD_QUEUE_WAIT, PROJECT_UPLOAD_SLOTS, ProjectUploadLimits,
+};
 
 /// Request-body cap for `PUT /api/fs/content`, aligned with the 256 MB read cap
 /// so large files can be saved (the 10 MB global limit would otherwise 413).
@@ -103,6 +106,8 @@ pub struct FileRouterState {
     /// service; the path is written server-side and never returned to the client.
     pub clipboard: ClipboardWriterRef,
     pub allowed_roots: Vec<std::path::PathBuf>,
+    /// Concurrency and stall limits of `/api/fs/upload-to-project`.
+    pub project_upload: ProjectUploadLimits,
 }
 
 // ---------------------------------------------------------------------------
@@ -125,8 +130,10 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .with_state(state.clone());
 
     // Explorer upload into a project directory: same layering as the upload
-    // route above, sized by `PROJECT_UPLOAD_BODY_LIMIT`. The body is streamed to
-    // disk, so the larger cap costs no memory.
+    // route above, sized by `PROJECT_UPLOAD_BODY_LIMIT`. The file part is written
+    // through a fixed-size buffer and text parts are capped, so an upload's memory
+    // does not grow with the file; the cap bounds disk use, and
+    // `ProjectUploadLimits` bounds how many uploads run at once.
     let project_upload_router = Router::new()
         .route("/api/fs/upload-to-project", post(project_upload::upload_to_project))
         .layer(DefaultBodyLimit::disable())
