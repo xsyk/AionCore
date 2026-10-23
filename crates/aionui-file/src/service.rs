@@ -19,6 +19,9 @@ use crate::types::{
     ContentUpdateEvent, ContentUpdateOperation, CopyResult, DirOrFile, FileMetadata, WorkspaceFlatFile,
 };
 
+mod project_upload;
+pub use project_upload::ProjectUpload;
+
 /// Maximum number of files returned by `list_workspace_files`.
 const MAX_WORKSPACE_FILES: usize = 20_000;
 
@@ -923,6 +926,15 @@ impl crate::traits::IFileService for FileService {
         })
         .await
         .map_err(|e| FileError::Internal(format!("copy task failed: {e}")))?
+    }
+
+    async fn begin_project_upload(&self, root: &Path, dir: &Path, file_name: &str) -> Result<ProjectUpload, FileError> {
+        let limit = aionui_common::constants::PROJECT_UPLOAD_MAX_SIZE as u64;
+        let (upload, canonical_root) = ProjectUpload::begin(root, dir, file_name, limit).await?;
+        // The workspace listing holds names only, so it is stale as soon as the
+        // new name exists.
+        self.invalidate_cache(&canonical_root.to_string_lossy());
+        Ok(upload)
     }
 
     async fn create_upload_file(

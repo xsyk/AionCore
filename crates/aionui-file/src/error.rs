@@ -21,6 +21,11 @@ pub enum FileError {
     #[error("{0}")]
     Conflict(String),
 
+    /// Uploaded content exceeds the operation's size cap. Maps to HTTP 413
+    /// (`PAYLOAD_TOO_LARGE`).
+    #[error("{0}")]
+    PayloadTooLarge(String),
+
     #[error("{0}")]
     Internal(String),
 

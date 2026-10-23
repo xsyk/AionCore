@@ -21,14 +21,22 @@ use aionui_api_types::{
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
-use aionui_common::constants::UPLOAD_MAX_SIZE;
+use aionui_common::constants::{PROJECT_UPLOAD_MAX_SIZE, UPLOAD_MAX_SIZE};
 
 use crate::error::FileError;
 use crate::traits::{ClipboardWriterRef, FileServiceRef, ItemRevealerRef, SnapshotServiceRef, SystemFileOpenerRef};
 
+mod project_upload;
+
 /// Request-body cap for `PUT /api/fs/content`, aligned with the 256 MB read cap
 /// so large files can be saved (the 10 MB global limit would otherwise 413).
 const CONTENT_MAX_SIZE: usize = 256 * 1024 * 1024;
+
+/// Request-body cap for `POST /api/fs/upload-to-project`: the file cap plus 1 MiB
+/// for the multipart framing and text parts. The file service caps the content
+/// itself, so a file one byte over `PROJECT_UPLOAD_MAX_SIZE` is refused (413) even
+/// though its body fits under this limit.
+const PROJECT_UPLOAD_BODY_LIMIT: usize = PROJECT_UPLOAD_MAX_SIZE + 1024 * 1024;
 use crate::types::{
     CompareResult, CopyResult, DirOrFile, FileChangeInfo, FileMetadata, SnapshotInfo, SnapshotMode, WorkspaceFlatFile,
 };
@@ -49,6 +57,7 @@ impl From<FileError> for ApiError {
             },
             FileError::NotFound(message) => ApiError::NotFound(message),
             FileError::Conflict(message) => ApiError::Conflict(message),
+            FileError::PayloadTooLarge(message) => ApiError::PayloadTooLarge(message),
             FileError::Internal(message) => ApiError::Internal(message),
             // The cause was logged where it arose; it is not forwarded because it
             // comes from the shell layer and can quote subprocess stderr or a path.
@@ -115,6 +124,15 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .layer(RequestBodyLimitLayer::new(UPLOAD_MAX_SIZE))
         .with_state(state.clone());
 
+    // Explorer upload into a project directory: same layering as the upload
+    // route above, sized by `PROJECT_UPLOAD_BODY_LIMIT`. The body is streamed to
+    // disk, so the larger cap costs no memory.
+    let project_upload_router = Router::new()
+        .route("/api/fs/upload-to-project", post(project_upload::upload_to_project))
+        .layer(DefaultBodyLimit::disable())
+        .layer(RequestBodyLimitLayer::new(PROJECT_UPLOAD_BODY_LIMIT))
+        .with_state(state.clone());
+
     // Content endpoint (ChatFileRef identity). PUT carries the full file body,
     // so — like upload — it disables the 10 MB global `DefaultBodyLimit` and
     // applies its own `CONTENT_MAX_SIZE` cap aligned with the 256 MB read cap
@@ -158,6 +176,7 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/snapshot/dispose", post(snapshot_dispose))
         .with_state(state)
         .merge(upload_router)
+        .merge(project_upload_router)
         .merge(content_router)
 }
 

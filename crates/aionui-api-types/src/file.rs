@@ -264,6 +264,24 @@ pub struct CopyFilesResponse {
     pub failed_files: Vec<CopyFailure>,
 }
 
+/// Response for `POST /api/fs/upload-to-project` — one file uploaded into a
+/// directory of a project entry. The request is `multipart/form-data`
+/// (`pe_id`, `relative_path`, optional `file_name`, then exactly one `file`
+/// part), so it has no request DTO.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UploadToProjectResponse {
+    /// Final on-disk name: the requested name, or an auto-renamed sibling
+    /// (`report copy.txt`, `report copy 2.txt`, …) when it was taken.
+    pub name: String,
+    /// The new file's path relative to the entry root, `/`-separated
+    /// (e.g. `sub/report copy.txt`).
+    pub relative_path: String,
+    /// Bytes written.
+    pub size: u64,
+    /// Whether `name` differs from the requested name.
+    pub renamed: bool,
+}
+
 // ---------------------------------------------------------------------------
 // B. Workspace snapshot — Request DTOs
 // ---------------------------------------------------------------------------
@@ -494,6 +512,21 @@ mod tests {
         assert_eq!(json["copied_files"][0], "/ws/a.txt");
         assert_eq!(json["failed_files"][0]["path"], "/missing.txt");
         assert_eq!(json["failed_files"][0]["reason"], "not a file");
+    }
+
+    #[test]
+    fn upload_to_project_response_uses_snake_case_fields() {
+        let resp = UploadToProjectResponse {
+            name: "a copy.png".into(),
+            relative_path: "sub/a copy.png".into(),
+            size: 42,
+            renamed: true,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json,
+            json!({ "name": "a copy.png", "relative_path": "sub/a copy.png", "size": 42, "renamed": true })
+        );
     }
 
     #[test]

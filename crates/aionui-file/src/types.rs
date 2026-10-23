@@ -119,6 +119,17 @@ pub struct CopyResult {
     pub failed_files: Vec<aionui_api_types::CopyFailure>,
 }
 
+/// A file streamed into a project directory (`/api/fs/upload-to-project`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedFile {
+    /// Final on-disk name: the requested one, or an auto-renamed sibling.
+    pub name: String,
+    /// Bytes written.
+    pub size: u64,
+    /// Whether `name` differs from the requested name.
+    pub renamed: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -56,6 +56,10 @@ pub const DEFAULT_PORT: u16 = 25808;
 pub const BODY_LIMIT: usize = 10 * 1024 * 1024;
 /// File upload size limit (30 MB).
 pub const UPLOAD_MAX_SIZE: usize = 30 * 1024 * 1024;
+/// Largest file accepted by `POST /api/fs/upload-to-project` (100 MiB). The cap
+/// applies to the file's content; the route's request-body limit adds room for
+/// the multipart framing on top of it.
+pub const PROJECT_UPLOAD_MAX_SIZE: usize = 100 * 1024 * 1024;
 
 // --- Team mode ---
 

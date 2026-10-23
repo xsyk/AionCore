@@ -7,6 +7,7 @@ use crate::error::FileError;
 
 use aionui_api_types::ContentEncoding;
 
+use crate::service::ProjectUpload;
 use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotInfo, WorkspaceFlatFile};
 
 /// Core file operations: directory browsing, file read/write, management,
@@ -98,6 +99,19 @@ pub trait IFileService: Send + Sync {
         workspace: &str,
         source_root: Option<&str>,
     ) -> Result<CopyResult, FileError>;
+
+    /// Start streaming one upload into a project directory
+    /// (`/api/fs/upload-to-project`); the caller feeds the content through
+    /// [`ProjectUpload::write_chunk`] and keeps it with [`ProjectUpload::finish`].
+    /// Dropping the upload before `finish` removes the file again.
+    ///
+    /// `dir` was resolved from a pe-addressed reference whose folder root is
+    /// `root`. It must be an existing directory whose real path stays inside the
+    /// root's, or this fails with `BadRequest`. `file_name` must be one plain path
+    /// component (not `.`/`..`, no separator or NUL, at most 255 bytes). A taken
+    /// name is never overwritten: the first free `name copy` / `name copy N`
+    /// sibling is created instead. Content is capped at `PROJECT_UPLOAD_MAX_SIZE`.
+    async fn begin_project_upload(&self, root: &Path, dir: &Path, file_name: &str) -> Result<ProjectUpload, FileError>;
 
     /// Write `data` to a temporary file and return its absolute path.
     ///

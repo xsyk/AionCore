@@ -27,6 +27,7 @@ async fn fs_endpoints_require_auth() {
         "/api/fs/write",
         "/api/fs/copy",
         "/api/fs/upload",
+        "/api/fs/upload-to-project",
         "/api/fs/image-base64",
         "/api/fs/fetch-remote-image",
         "/api/fs/snapshot/init",
