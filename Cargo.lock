@@ -550,6 +550,7 @@ dependencies = [
  "rustls-native-certs",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.26.2",
@@ -594,6 +595,10 @@ dependencies = [
  "base64",
  "chrono",
  "futures-util",
+ "getrandom 0.2.17",
+ "mime_guess",
+ "percent-encoding",
+ "pulldown-cmark",
  "regex",
  "serde",
  "serde_json",
@@ -4495,6 +4500,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]

@@ -33,4 +33,4 @@ pub use id::{fnv1a_hex8, generate_id, generate_id_with_length, generate_prefixed
 pub use pagination::PaginatedResult;
 pub use timestamp::{TimestampMs, now_ms};
 pub use types::{CommandSpec, Confirmation, ConfirmationOption, EnvVar, ProviderWithModel, UpdateType, VersionInfo};
-pub use user_paths::{UserDirNameError, user_dir_name};
+pub use user_paths::{UserDirNameError, user_dir_name, user_upload_dir_name};

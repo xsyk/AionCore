@@ -22,6 +22,7 @@ pub struct ChannelOrchestrator {
     message_service: Arc<ChannelMessageService>,
     session_manager: Arc<SessionManager>,
     sender: Arc<dyn ChannelSender>,
+    feishu_bridge: Option<Arc<crate::feishu_bridge::FeishuBridge>>,
 }
 
 impl ChannelOrchestrator {
@@ -36,7 +37,13 @@ impl ChannelOrchestrator {
             message_service,
             session_manager,
             sender,
+            feishu_bridge: None,
         }
+    }
+
+    pub fn with_feishu_bridge(mut self, bridge: Arc<crate::feishu_bridge::FeishuBridge>) -> Self {
+        self.feishu_bridge = Some(bridge);
+        self
     }
 
     /// Start the message loop. Runs until both channels close.
@@ -63,6 +70,11 @@ impl ChannelOrchestrator {
     }
 
     async fn handle_message(&self, msg: UnifiedIncomingMessage) {
+        if let Some(bridge) = &self.feishu_bridge
+            && bridge.handle_incoming(&msg).await
+        {
+            return;
+        }
         let platform = msg.platform;
         let chat_id = msg.chat_id.clone();
         let plugin_id = platform.to_string();

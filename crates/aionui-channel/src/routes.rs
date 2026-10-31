@@ -73,6 +73,9 @@ impl From<ChannelError> for ApiError {
             ChannelError::UserNotFound(msg) => ApiError::NotFound(msg),
             ChannelError::UserNotAuthorized(msg) => ApiError::Forbidden(msg),
             ChannelError::SessionNotFound(msg) => ApiError::NotFound(msg),
+            ChannelError::UnsupportedConversation(msg) => {
+                ApiError::coded(StatusCode::CONFLICT, "FEISHU_BINDING_UNSUPPORTED", msg, None)
+            }
             ChannelError::EncryptionFailed(msg) => ApiError::Internal(msg),
             ChannelError::DecryptionFailed(msg) => ApiError::Internal(msg),
             ChannelError::PlatformApi(msg) => ApiError::BadGateway(msg),

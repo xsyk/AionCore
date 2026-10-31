@@ -226,6 +226,21 @@ impl IUserRepository for SqliteUserRepository {
             return Ok(0);
         }
 
+        // Lark's runtime connector key is its plugin owner, which is also
+        // stored under nonstandard names in binding rows and accepted event
+        // envelopes. Only retarget those aliases if the actual plugin can move:
+        // UPDATE OR IGNORE retains the old plugin when the adopter already has
+        // a different configuration under the same plugin ID.
+        let adopting_lark_connector: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM assistant_plugins legacy \
+             WHERE legacy.owner_user_id='system_default_user' AND legacy.id='lark' \
+               AND NOT EXISTS(SELECT 1 FROM assistant_plugins target \
+                              WHERE target.owner_user_id=? AND target.id=legacy.id))",
+        )
+        .bind(owner_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
         // Discover ownership tables from the live schema rather than a
         // hand-maintained list, so user-scoped tables added by future
         // migrations are adopted automatically. Convention (root-scope
@@ -261,6 +276,29 @@ impl IUserRepository for SqliteUserRepository {
                 .await?;
                 moved += result.rows_affected();
             }
+        }
+
+        if adopting_lark_connector {
+            moved += sqlx::query(
+                "UPDATE feishu_conversation_bindings SET connector_user_id=? \
+                 WHERE connector_user_id='system_default_user'",
+            )
+            .bind(owner_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            // Update only the trusted envelope principal. Platform identities,
+            // binding generations and raw message strings remain byte-for-byte
+            // values; malformed/old unscoped receipts keep their replay policy.
+            moved += sqlx::query(
+                "UPDATE feishu_ingress_events SET payload=json_set(payload,'$.event.owner_user_id',?) \
+                 WHERE CASE WHEN json_valid(payload) \
+                            THEN json_extract(payload,'$.event.owner_user_id') END='system_default_user'",
+            )
+            .bind(owner_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         }
 
         // Stamp the one-shot marker in the same transaction: even a zero-row

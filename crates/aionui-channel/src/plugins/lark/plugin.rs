@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::constants::{LARK_EVENT_DEDUP_TTL, LARK_MESSAGE_LIMIT};
 use crate::error::ChannelError;
-use crate::plugin::{ChannelPlugin, PluginCallbacks};
+use crate::plugin::{ChannelPlugin, DurableChannelIngress, DurableIngressEvent, PluginCallbacks};
 use crate::types::{
     ActionCategory, ActionContext, BotInfo, MessageContentType, PluginConfig, PluginStatus, PluginType, UnifiedAction,
     UnifiedAttachment, UnifiedIncomingMessage, UnifiedMessageContent, UnifiedOutgoingMessage, UnifiedUser,
@@ -17,7 +17,7 @@ use crate::types::{
 
 use super::api::LarkApi;
 use super::frame::{
-    METHOD_CONTROL, METHOD_DATA, build_ack_frame, build_ping_frame, decode_frame, encode_frame, get_header,
+    METHOD_CONTROL, METHOD_DATA, PbFrame, build_ack_frame, build_ping_frame, decode_frame, encode_frame, get_header,
 };
 use super::types::{BotMenuEvent, CardActionEvent, MessageEvent, build_interactive_card, parse_lark_callback};
 use super::ws_session::{FragmentCache, parse_pong_config};
@@ -149,13 +149,40 @@ impl ChannelPlugin for LarkPlugin {
         // Spawn the WebSocket connection loop
         let api_clone = Arc::clone(self.api.as_ref().expect("api set in initialize"));
         let dedup_cache = Arc::clone(&self.dedup_cache);
-        self.ws_handle = Some(tokio::spawn(ws_loop(
-            api_clone,
-            callbacks.message_tx,
-            callbacks.confirm_tx,
-            dedup_cache.clone(),
-            shutdown_rx,
-        )));
+        let app_id = api_clone.app_id().to_owned();
+        let bot_open_id = self.bot_info.as_ref().map(|bot| bot.id.clone()).unwrap_or_default();
+        let ws_dedup_cache = Arc::clone(&dedup_cache);
+        let transport = LarkIngressTransport {
+            app_id: app_id.clone(),
+            bot_open_id: bot_open_id.clone(),
+            ingress: callbacks.durable_ingress.clone(),
+        };
+        self.ws_handle = Some(tokio::spawn(async move {
+            let (transport_tx, mut transport_rx) = mpsc::channel::<UnifiedIncomingMessage>(256);
+            let forward = async move {
+                while let Some(mut message) = transport_rx.recv().await {
+                    let raw = message.raw.get_or_insert_with(|| serde_json::json!({}));
+                    if !raw.is_object() {
+                        *raw = serde_json::json!({});
+                    }
+                    raw["feishu_transport"] = serde_json::json!({"app_id":app_id,"bot_open_id":bot_open_id});
+                    if callbacks.message_tx.send(message).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::join!(
+                ws_loop(
+                    api_clone,
+                    transport_tx,
+                    callbacks.confirm_tx,
+                    ws_dedup_cache,
+                    transport,
+                    shutdown_rx
+                ),
+                forward
+            );
+        }));
 
         // Spawn the dedup cache cleanup task
         let dedup_for_cleanup = dedup_cache;
@@ -212,6 +239,21 @@ impl ChannelPlugin for LarkPlugin {
         Ok(data.message_id)
     }
 
+    async fn send_message_idempotent(
+        &self,
+        chat: &str,
+        message: UnifiedOutgoingMessage,
+        uuid: &str,
+    ) -> Result<String, ChannelError> {
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
+        let text = truncate_message(message.text.as_deref().unwrap_or(""), LARK_MESSAGE_LIMIT);
+        let card = build_interactive_card(&text, message.buttons.as_deref());
+        Ok(api.send_card_idempotent(chat, &card, Some(uuid)).await?.message_id)
+    }
+
     async fn edit_message(
         &self,
         _chat_id: &str,
@@ -263,6 +305,7 @@ async fn ws_loop(
     message_tx: mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: mpsc::Sender<(String, String)>,
     dedup_cache: Arc<Mutex<HashMap<String, Instant>>>,
+    transport: LarkIngressTransport,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut consecutive_errors: u32 = 0;
@@ -307,6 +350,7 @@ async fn ws_loop(
             &message_tx,
             &confirm_tx,
             &dedup_cache,
+            &transport,
             &mut shutdown_rx,
         )
         .await
@@ -335,6 +379,7 @@ async fn ws_loop(
 }
 
 /// Connect to the WebSocket and listen for binary protobuf frames.
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_listen(
     ws_url: &str,
     service_id: i32,
@@ -342,6 +387,7 @@ async fn connect_and_listen(
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: &mpsc::Sender<(String, String)>,
     dedup_cache: &Arc<Mutex<HashMap<String, Instant>>>,
+    transport: &LarkIngressTransport,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), ChannelError> {
     use futures_util::{SinkExt, StreamExt};
@@ -381,31 +427,20 @@ async fn connect_and_listen(
                                 }
                             }
                             METHOD_DATA => {
-                                let ack = build_ack_frame(&frame);
-                                let ack_bytes = encode_frame(&ack);
-                                if let Err(e) = write.send(WsMessage::Binary(ack_bytes.into())).await {
-                                    warn!(error = %e, "Failed to send Lark ack frame");
-                                }
-
-                                let message_id = get_header(&frame.headers, "message_id")
-                                    .unwrap_or("")
-                                    .to_owned();
-                                let sum: usize = get_header(&frame.headers, "sum")
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(1);
-                                let seq: usize = get_header(&frame.headers, "seq")
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(0);
-
-                                if let Some(merged) = fragment_cache.push(&message_id, sum, seq, &frame.payload) {
-                                    let msg_type = get_header(&frame.headers, "type").unwrap_or("");
-                                    if msg_type == "event" || msg_type == "card" {
-                                        if let Ok(text) = String::from_utf8(merged) {
-                                            handle_ws_text(&text, msg_type, message_tx, confirm_tx, dedup_cache).await;
-                                        } else {
-                                            warn!("Lark frame payload is not valid UTF-8");
-                                        }
+                                // The official SDK reassembles first, invokes the
+                                // event handler, then responds 200 (or 500 on error).
+                                let ack = match accept_data_frame(&frame, &mut fragment_cache, transport, message_tx, confirm_tx, dedup_cache).await {
+                                    Ok(ack) => ack,
+                                    Err(error) => {
+                                        warn!(error = %error, "Lark event was not durably accepted");
+                                        let mut ack = build_ack_frame(&frame);
+                                        ack.payload = br#"{"code":500}"#.to_vec();
+                                        Some(ack)
                                     }
+                                };
+                                if let Some(ack) = ack
+                                    && let Err(error) = write.send(WsMessage::Binary(encode_frame(&ack).into())).await {
+                                    warn!(error = %error, "Failed to send Lark acknowledgement");
                                 }
                             }
                             _ => {
@@ -510,9 +545,13 @@ async fn handle_ws_text(
 
             match event_type {
                 "im.message.receive_v1" => {
-                    if let Some(event_data) = envelope.get("event").cloned() {
+                    if let Some(mut event_data) = envelope.get("event").cloned() {
+                        event_data["__feishu_header"] = envelope.get("header").cloned().unwrap_or_default();
                         handle_message_event(event_data, message_tx).await;
                     }
+                }
+                "card.action.trigger" => {
+                    handle_card_action(envelope, message_tx, confirm_tx).await;
                 }
                 "application.bot.menu_v6" => {
                     if let Some(event_data) = envelope.get("event").cloned() {
@@ -549,7 +588,7 @@ async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::
     let evt: MessageEvent = match serde_json::from_value(event_data.clone()) {
         Ok(e) => e,
         Err(e) => {
-            warn!(error = %e, raw = %event_data, "Failed to parse Lark message event");
+            warn!(error = %e, "Failed to parse Lark message event");
             return;
         }
     };
@@ -589,7 +628,14 @@ async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::
         timestamp,
         reply_to_message_id: evt.message.parent_id.clone(),
         action: None,
-        raw: None,
+        raw: Some(serde_json::json!({"feishu_event": {
+            "app_id": event_data["__feishu_header"]["app_id"],
+            "tenant_key": evt.sender.tenant_key,
+            "union_id": evt.sender.sender_id.union_id,
+            "chat_type": evt.message.chat_type,
+            "sender_type": evt.sender.sender_type,
+            "mentioned_ids": evt.message.mentions.as_ref().map(|mentions| mentions.iter().map(|mention| mention.id.open_id.clone()).collect::<Vec<_>>()).unwrap_or_default(),
+        }})),
     };
 
     let _ = message_tx.send(unified).await;
@@ -601,7 +647,22 @@ async fn handle_card_action(
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: &mpsc::Sender<(String, String)>,
 ) {
-    let evt: CardActionEvent = match serde_json::from_value(data) {
+    // New callbacks use the documented schema-2 envelope. Keep compatibility
+    // with older flattened callback fixtures while retaining trusted identity.
+    let header = data.get("header").cloned().unwrap_or_default();
+    let mut event = data.get("event").cloned().unwrap_or_else(|| data.clone());
+    let context = event
+        .get("context")
+        .cloned()
+        .or_else(|| data.get("context").cloned())
+        .unwrap_or_default();
+    if event.get("open_chat_id").is_none() {
+        event["open_chat_id"] = context.get("open_chat_id").cloned().unwrap_or_default();
+    }
+    if event.get("open_message_id").is_none() {
+        event["open_message_id"] = context.get("open_message_id").cloned().unwrap_or_default();
+    }
+    let evt: CardActionEvent = match serde_json::from_value(event.clone()) {
         Ok(e) => e,
         Err(e) => {
             warn!(error = %e, "Failed to parse Lark card action");
@@ -677,7 +738,14 @@ async fn handle_card_action(
         timestamp: chrono_now(),
         reply_to_message_id: None,
         action: unified_action,
-        raw: None,
+        raw: Some(serde_json::json!({"feishu_event": {
+            "app_id": header["app_id"],
+            "tenant_key": event["operator"]["tenant_key"].as_str().or_else(|| header["tenant_key"].as_str()).unwrap_or_default(),
+            "union_id": event["operator"]["union_id"].as_str().unwrap_or_default(),
+            "chat_type": "",
+            "sender_type": "user",
+            "mentioned_ids": [],
+        }})),
     };
 
     let _ = message_tx.send(msg).await;
@@ -891,6 +959,84 @@ fn extract_service_id(url: &str) -> i32 {
             if k == "service_id" { v.parse().ok() } else { None }
         })
         .unwrap_or(0)
+}
+
+/// Transport values originate from the configured API and bot identity.
+pub(crate) struct LarkIngressTransport {
+    pub app_id: String,
+    pub bot_open_id: String,
+    pub ingress: Option<Arc<dyn DurableChannelIngress>>,
+}
+
+pub(crate) async fn accept_data_frame(
+    frame: &PbFrame,
+    fragments: &mut FragmentCache,
+    transport: &LarkIngressTransport,
+    messages: &mpsc::Sender<UnifiedIncomingMessage>,
+    confirms: &mpsc::Sender<(String, String)>,
+    dedup: &Arc<Mutex<HashMap<String, Instant>>>,
+) -> Result<Option<PbFrame>, ChannelError> {
+    let message_id = get_header(&frame.headers, "message_id").unwrap_or_default();
+    let sum = get_header(&frame.headers, "sum")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1);
+    let seq = get_header(&frame.headers, "seq")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    if sum == 0 || sum > 1024 || seq >= sum {
+        return Err(ChannelError::InvalidConfig("Invalid event fragments".into()));
+    }
+    fragments.cleanup(Duration::from_secs(60));
+    let Some(payload) = fragments.push(message_id, sum, seq, &frame.payload) else {
+        return Ok(None);
+    };
+    let frame_type = get_header(&frame.headers, "type").unwrap_or_default();
+    let payload =
+        String::from_utf8(payload).map_err(|_| ChannelError::InvalidConfig("Invalid event encoding".into()))?;
+    if let Some(ingress) = &transport.ingress {
+        // A UNIQUE database key handles redelivery. No in-memory dedup entry is
+        // installed before commit, so a failed insert can be retried safely.
+        let envelope: serde_json::Value = serde_json::from_str(&payload)?;
+        let event_id = envelope
+            .pointer("/header/event_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(message_id);
+        if event_id.is_empty() {
+            return Err(ChannelError::InvalidConfig("Missing transport event identity".into()));
+        }
+        ingress
+            .accept(DurableIngressEvent {
+                id: format!("{}:{frame_type}:{event_id}", transport.app_id),
+                owner_user_id: String::new(),
+                app_id: transport.app_id.clone(),
+                bot_open_id: transport.bot_open_id.clone(),
+                frame_type: frame_type.into(),
+                payload,
+            })
+            .await?;
+    } else if matches!(frame_type, "event" | "card") {
+        handle_ws_text(&payload, frame_type, messages, confirms, dedup).await;
+    }
+    Ok(Some(build_ack_frame(frame)))
+}
+
+pub(crate) async fn decode_durable_ingress(event: &DurableIngressEvent) -> Vec<UnifiedIncomingMessage> {
+    let (messages, mut receiver) = mpsc::channel(16);
+    let (confirms, _legacy_confirms) = mpsc::channel(16);
+    let dedup = Arc::new(Mutex::new(HashMap::new()));
+    handle_ws_text(&event.payload, &event.frame_type, &messages, &confirms, &dedup).await;
+    let mut decoded = Vec::new();
+    while let Ok(mut message) = receiver.try_recv() {
+        message.owner_user_id = Some(event.owner_user_id.clone());
+        let raw = message.raw.get_or_insert_with(|| serde_json::json!({}));
+        if !raw.is_object() {
+            *raw = serde_json::json!({});
+        }
+        raw["feishu_transport"] = serde_json::json!({"app_id":event.app_id,"bot_open_id":event.bot_open_id});
+        decoded.push(message);
+    }
+    decoded
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,5 +1415,54 @@ mod tests {
         assert!(plugin.last_error().is_none());
         assert_eq!(plugin.plugin_type(), PluginType::Lark);
         assert_eq!(plugin.active_user_count(), 0);
+    }
+    #[tokio::test]
+    async fn schema_two_card_callback_preserves_bound_chat_and_identity() {
+        let (message_tx, mut messages) = mpsc::channel(4);
+        let (confirm_tx, mut confirmations) = mpsc::channel(4);
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let envelope = serde_json::json!({
+            "schema":"2.0",
+            "header":{"event_id":"card_event","event_type":"card.action.trigger","app_id":"cli_app","tenant_key":"tenant"},
+            "event":{
+                "operator":{"open_id":"ou_member","union_id":"on_member","tenant_key":"tenant"},
+                "action":{"tag":"button","value":{"action":"system:feishu.confirm:token=ABC,option=1"}},
+                "context":{"open_chat_id":"oc_group","open_message_id":"om_card"}
+            }
+        });
+        handle_ws_text(&envelope.to_string(), "event", &message_tx, &confirm_tx, &cache).await;
+        let message = messages.try_recv().unwrap();
+        assert_eq!(message.chat_id, "oc_group");
+        assert_eq!(message.user.id, "ou_member");
+        let action = message.action.unwrap();
+        assert_eq!(action.action, "feishu.confirm");
+        assert_eq!(action.context.message_id.as_deref(), Some("om_card"));
+        assert_eq!(message.raw.as_ref().unwrap()["feishu_event"]["union_id"], "on_member");
+        assert_eq!(message.raw.as_ref().unwrap()["feishu_event"]["tenant_key"], "tenant");
+        assert!(
+            confirmations.try_recv().is_err(),
+            "bound callbacks must not ride the legacy unscoped confirmation channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_identity_metadata_keeps_owner_union_and_bot_mentions() {
+        let (message_tx, mut messages) = mpsc::channel(4);
+        let (confirm_tx, _) = mpsc::channel(4);
+        let cache = Arc::new(Mutex::new(HashMap::new()));
+        let envelope = serde_json::json!({
+            "header":{"event_id":"message_identity","event_type":"im.message.receive_v1","app_id":"cli_app"},
+            "event":{
+                "sender":{"sender_id":{"open_id":"ou_owner","union_id":"on_owner"},"sender_type":"user","tenant_key":"tenant"},
+                "message":{"message_id":"om_input","chat_id":"oc_group","chat_type":"group","message_type":"text","content":"{\"text\":\"@_bot /bind ABC\"}","mentions":[{"key":"@_bot","id":{"open_id":"ou_bot"},"name":"Bot"}]}
+            }
+        });
+        handle_ws_text(&envelope.to_string(), "event", &message_tx, &confirm_tx, &cache).await;
+        let message = messages.try_recv().unwrap();
+        assert_eq!(message.content.text.trim(), "/bind ABC");
+        let metadata = &message.raw.as_ref().unwrap()["feishu_event"];
+        assert_eq!(metadata["app_id"], "cli_app");
+        assert_eq!(metadata["union_id"], "on_owner");
+        assert_eq!(metadata["mentioned_ids"], serde_json::json!(["ou_bot"]));
     }
 }

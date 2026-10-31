@@ -158,6 +158,25 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
+/// Human-managed capabilities must never inherit the helper CLI's runtime
+/// authority or its CSRF exemption, including requests carrying both headers.
+pub async fn user_session_auth_middleware(
+    State(mut state): State<AuthState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if request.headers().contains_key(RUNTIME_TOKEN_HEADER) {
+        return Err(ApiError::coded(
+            StatusCode::UNAUTHORIZED,
+            "USER_SESSION_REQUIRED",
+            "A user login session is required",
+            None,
+        ));
+    }
+    state.runtime_token_verifier = None;
+    auth_middleware(State(state), request, next).await
+}
+
 /// Insert [`RealUser`] and the effective [`CurrentUser`] for a JWT-authenticated
 /// request, honouring [`ACT_AS_HEADER`].
 ///

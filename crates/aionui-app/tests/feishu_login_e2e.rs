@@ -14,6 +14,133 @@ use aionui_app::{AppConfig, AppServices};
 
 const ADMIN_PW: &str = "AdminP@ss123";
 
+async fn mock_in_app_feishu(ctx: &Ctx, code: &str, union: &str, tenant: &str) {
+    mock_feishu(ctx, code, union, "飞书用户", tenant).await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/auth/v3/app_access_token/internal"))
+        .and(body_partial_json(
+            serde_json::json!({"app_id":"cli_test","app_secret":"sec_test"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code":0,"app_access_token":"app-token-test","expire":7200
+        })))
+        .mount(&ctx.feishu)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/open-apis/authen/v1/access_token"))
+        .and(has_header("authorization", "Bearer app-token-test"))
+        .and(body_partial_json(
+            serde_json::json!({"grant_type":"authorization_code","code":code}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "code":0,"data":{"access_token":format!("u-token-{code}")}
+        })))
+        .mount(&ctx.feishu)
+        .await;
+}
+
+async fn in_app_login(ctx: &Ctx, code: &str, origin: &str, csrf: bool) -> Resp {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/api/auth/feishu/in-app")
+        .header("content-type", "application/json")
+        .header("origin", origin);
+    if csrf {
+        request = request
+            .header("cookie", "aionui-csrf-token=in-app-test-csrf")
+            .header("x-csrf-token", "in-app-test-csrf");
+    }
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            request
+                .body(Body::from(serde_json::json!({"code":code}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let cookies = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .collect();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    Resp {
+        status,
+        location: String::new(),
+        cookies,
+        json: serde_json::from_slice(&body).unwrap_or_default(),
+    }
+}
+
+#[tokio::test]
+async fn in_app_uses_existing_web_account_and_sets_http_only_session() {
+    let ctx = setup().await;
+    configure(&ctx, "open").await;
+    mock_feishu(&ctx, "web-existing", "on_same_person", "原用户", "tenant-corp").await;
+    let existing = feishu_login(&ctx, "web-existing").await;
+    let existing_user = me(&ctx, &existing).await;
+    mock_in_app_feishu(&ctx, "in-app-existing", "on_same_person", "tenant-corp").await;
+    let login = in_app_login(&ctx, "in-app-existing", "https://aidi.example.com", true).await;
+    assert_eq!(login.status, StatusCode::OK, "{}", login.json);
+    assert_eq!(me(&ctx, &login).await["id"], existing_user["id"]);
+    assert!(
+        login
+            .cookies
+            .iter()
+            .any(|c| c.starts_with("aionui-session=") && c.contains("HttpOnly"))
+    );
+    assert!(!login.json.to_string().contains("u-token-"));
+    let status = call(&ctx.app, "GET", "/api/auth/feishu/status", None, None, None).await;
+    assert_eq!(status.json["data"]["app_id"], "cli_test");
+    assert!(cookie_value(&status.cookies, "aionui-csrf-token").is_some());
+}
+
+#[tokio::test]
+async fn in_app_requires_csrf_and_canonical_origin_even_when_global_csrf_is_disabled() {
+    let ctx = setup().await;
+    configure(&ctx, "open").await;
+    let missing = in_app_login(&ctx, "unused", "https://aidi.example.com", false).await;
+    assert_eq!(missing.status, StatusCode::FORBIDDEN);
+    assert_eq!(missing.json["code"], "CSRF_INVALID");
+    let wrong = in_app_login(&ctx, "unused", "https://attacker.example.com", true).await;
+    assert_eq!(wrong.status, StatusCode::FORBIDDEN);
+    assert_eq!(wrong.json["code"], "FEISHU_LOGIN_ORIGIN");
+}
+
+#[tokio::test]
+async fn in_app_rejects_other_tenant_without_creating_an_account() {
+    let ctx = setup().await;
+    configure(&ctx, "open").await;
+    mock_feishu(&ctx, "tenant-anchor", "on_anchor", "原用户", "tenant-corp").await;
+    feishu_login(&ctx, "tenant-anchor").await;
+    mock_in_app_feishu(&ctx, "wrong-tenant", "on_foreign", "tenant-other").await;
+    let denied = in_app_login(&ctx, "wrong-tenant", "https://aidi.example.com", true).await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+    assert_eq!(denied.json["code"], "FEISHU_LOGIN_TENANT");
+    assert!(
+        ctx._services
+            .user_repo
+            .find_live_local_by_external_id("feishu:on_foreign")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn in_app_does_not_lock_an_unconfigured_tenant_to_the_first_visitor() {
+    let ctx = setup().await;
+    configure(&ctx, "open").await;
+    let denied = in_app_login(&ctx, "unused", "https://aidi.example.com", true).await;
+    assert_eq!(denied.status, StatusCode::FORBIDDEN);
+    assert_eq!(denied.json["code"], "FEISHU_LOGIN_TENANT_UNCONFIGURED");
+    assert!(ctx.feishu.received_requests().await.unwrap().is_empty());
+}
+
 struct Ctx {
     app: axum::Router,
     _services: AppServices,

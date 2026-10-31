@@ -34,6 +34,9 @@ pub enum ChannelError {
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 
+    #[error("FEISHU_BINDING_UNSUPPORTED: {0}")]
+    UnsupportedConversation(String),
+
     #[error("Credential encryption failed: {0}")]
     EncryptionFailed(String),
 

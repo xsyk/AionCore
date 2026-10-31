@@ -693,6 +693,7 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
 
 async fn upload_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let fields = extract_upload_multipart(multipart).await?;
@@ -701,9 +702,24 @@ async fn upload_file(
         ApiError::BadRequest("missing file name: provide 'file_name' or a multipart filename".to_owned())
     })?;
 
+    if file_name.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest("file name contains unsupported characters".into()));
+    }
+    if fields
+        .conversation_id
+        .as_deref()
+        .is_some_and(|id| id == "." || id == ".." || id.contains(['/', '\\']) || id.chars().any(char::is_control))
+    {
+        return Err(ApiError::BadRequest("invalid conversation id".into()));
+    }
+    // A client-supplied conversation id cannot establish file ownership.
+    // Stage uploads under the authenticated account; the send boundary later
+    // copies explicitly attached files into that conversation's directory.
+    let namespace = aionui_common::user_upload_dir_name(&user.id)
+        .map_err(|_| ApiError::BadRequest("invalid upload account".into()))?;
     let path = state
         .file_service
-        .create_upload_file(&file_name, &fields.file_data, fields.conversation_id.as_deref())
+        .create_upload_file(&file_name, &fields.file_data, Some(&namespace))
         .await?;
     Ok(Json(ApiResponse::ok(path)))
 }

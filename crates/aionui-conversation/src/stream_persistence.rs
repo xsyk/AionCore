@@ -48,6 +48,7 @@ pub(crate) struct TextSegmentState {
 #[derive(Debug, Clone)]
 pub(crate) struct PersistedTextSegment {
     pub id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -171,7 +172,7 @@ impl StreamPersistenceAdapter {
             return;
         }
 
-        let content = json!({ "content": segment.buffer }).to_string();
+        let content = json!({ "content": &segment.buffer }).to_string();
 
         if segment.record_created {
             let update = MessageRowUpdate {
@@ -215,7 +216,7 @@ impl StreamPersistenceAdapter {
             return None;
         }
 
-        let content = json!({ "content": segment.buffer }).to_string();
+        let content = json!({ "content": &segment.buffer }).to_string();
         if segment.record_created {
             let update = MessageRowUpdate {
                 content: Some(content),
@@ -249,7 +250,10 @@ impl StreamPersistenceAdapter {
             }
         }
 
-        Some(PersistedTextSegment { id: segment.id })
+        Some(PersistedTextSegment {
+            id: segment.id,
+            text: segment.buffer,
+        })
     }
 
     #[tracing::instrument(skip_all)]
@@ -268,7 +272,7 @@ impl StreamPersistenceAdapter {
         let mut overrides = Vec::new();
         if let Some(primary_segment) = text_segments.first() {
             if rewrite_segments {
-                let content = json!({ "content": final_text }).to_string();
+                let content = json!({ "content": final_text, "__aion_finalized": true }).to_string();
                 let update = MessageRowUpdate {
                     content: Some(content),
                     status: Some(Some(status.to_owned())),
@@ -308,8 +312,12 @@ impl StreamPersistenceAdapter {
                 }
             } else {
                 for segment in text_segments {
+                    // A closed segment can still be rewritten by terminal
+                    // middleware. Mark it final in the same successful write
+                    // only after that middleware has converged (also applies
+                    // to background turns which intentionally have no claim).
                     let status_update = MessageRowUpdate {
-                        content: None,
+                        content: Some(json!({ "content": &segment.text, "__aion_finalized": true }).to_string()),
                         status: Some(Some(status.to_owned())),
                         hidden: Some(false),
                     };
@@ -328,7 +336,7 @@ impl StreamPersistenceAdapter {
                 conversation_id: self.conversation_id.clone(),
                 msg_id: Some(self.msg_id.clone()),
                 r#type: "text".into(),
-                content: json!({ "content": final_text }).to_string(),
+                content: json!({ "content": final_text, "__aion_finalized": true }).to_string(),
                 position: Some("left".into()),
                 status: Some(status.to_owned()),
                 hidden: false,

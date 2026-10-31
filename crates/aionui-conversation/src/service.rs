@@ -3727,8 +3727,11 @@ impl ConversationService {
         agent: AgentInstance,
         active_turn_id: String,
         inject_skills: Vec<String>,
+        transport_message_id: Option<&str>,
     ) -> Result<MidturnOutcome, ConversationError> {
-        let user_msg_id = Self::mint_msg_id();
+        let user_msg_id = transport_message_id
+            .map(str::to_owned)
+            .unwrap_or_else(Self::mint_msg_id);
         let persisted = self
             .runtime_persistence()
             .allows(conversation_id, RuntimeWriteKind::UserMessage);
@@ -3738,7 +3741,7 @@ impl ConversationService {
                 conversation_id: conversation_id.to_owned(),
                 msg_id: Some(user_msg_id.clone()),
                 r#type: "text".into(),
-                content: serde_json::json!({ "content": resolved.content }).to_string(),
+                content: serde_json::json!({ "content": resolved.content, "files": resolved.files }).to_string(),
                 position: Some("right".into()),
                 status: Some(MIDTURN_STATUS_QUEUED.into()),
                 hidden,
@@ -3862,6 +3865,32 @@ impl ConversationService {
         req: SendMessageRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<SendMessageResponse, ConversationError> {
+        self.send_message_inner(user_id, conversation_id, req, task_manager, None)
+            .await
+    }
+
+    /// Trusted transport boundary. The stable origin is not accepted by any HTTP DTO.
+    /// Retrying after persistence acknowledges the existing row without another agent turn.
+    pub async fn send_transport_message(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SendMessageRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+        transport_message_id: &str,
+    ) -> Result<SendMessageResponse, ConversationError> {
+        self.send_message_inner(user_id, conversation_id, req, task_manager, Some(transport_message_id))
+            .await
+    }
+
+    async fn send_message_inner(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SendMessageRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+        transport_message_id: Option<&str>,
+    ) -> Result<SendMessageResponse, ConversationError> {
         if req.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Message content must not be empty".into(),
@@ -3892,6 +3921,23 @@ impl ConversationService {
         }
 
         reject_deprecated_runtime_row(&row)?;
+        if let Some(id) = transport_message_id
+            && self
+                .conversation_repo
+                .get_message(user_id, conversation_id, id)
+                .await?
+                .is_some()
+        {
+            return Ok(self
+                .send_message_response(
+                    conversation_id,
+                    id.to_owned(),
+                    self.runtime_state
+                        .active_turn_id_for(conversation_id)
+                        .unwrap_or_default(),
+                )
+                .await);
+        }
 
         // `@@` references resolve at the same boundary and with the same
         // atomicity as file attachments. Sender workspace comes from the row so
@@ -3922,9 +3968,10 @@ impl ConversationService {
         // Resolve file attachments at the send boundary before any persist/claim
         // (atomic: a bad reference fails the whole send). Produces the inlined
         // `[[AION_FILES]]` content used for persistence, broadcast, and the turn.
-        let resolved = self
+        let mut resolved = self
             .resolve_message_attachments(user_id, &content_with_sessions, &req.files)
             .await?;
+        crate::share::scope_upload_attachments(user_id, conversation_id, &req.files, &mut resolved).await?;
 
         // ── Mid-turn delivery (B5, spec §4.3) ────────────────────────────
         // An ACTIVE turn + a backend that supports mid-turn delivery → the
@@ -3970,6 +4017,7 @@ impl ConversationService {
                         agent,
                         active_turn_id,
                         req.inject_skills.clone(),
+                        transport_message_id,
                     )
                     .await?
                 {
@@ -3997,13 +4045,17 @@ impl ConversationService {
         // A mid-turn TurnEnded fallback already persisted + broadcast the
         // message — reuse its id instead of writing a duplicate row.
         let was_fallback = fallback_user_msg.is_some();
-        let user_msg_id = fallback_user_msg.unwrap_or_else(Self::mint_msg_id);
+        let user_msg_id = fallback_user_msg.unwrap_or_else(|| {
+            transport_message_id
+                .map(str::to_owned)
+                .unwrap_or_else(Self::mint_msg_id)
+        });
         let user_msg = aionui_db::models::MessageRow {
             id: user_msg_id.clone(),
             conversation_id: conversation_id.to_owned(),
             msg_id: Some(user_msg_id.clone()),
             r#type: "text".into(),
-            content: serde_json::json!({ "content": resolved.content }).to_string(),
+            content: serde_json::json!({ "content": resolved.content, "files": resolved.files }).to_string(),
             position: Some("right".into()),
             status: Some("finish".into()),
             hidden: req.hidden,
@@ -5862,7 +5914,9 @@ pub(crate) async fn persist_session_key(
     }
 }
 
-fn legacy_cron_trigger_to_artifact(row: MessageRow) -> Result<ConversationArtifactResponse, ConversationError> {
+pub(crate) fn legacy_cron_trigger_to_artifact(
+    row: MessageRow,
+) -> Result<ConversationArtifactResponse, ConversationError> {
     let payload: serde_json::Value = serde_json::from_str(&row.content)
         .map_err(|e| ConversationError::internal(format!("Invalid legacy cron trigger payload JSON: {e}")))?;
     let cron_job_id = payload

@@ -40,7 +40,8 @@ impl FragmentCache {
                 .iter()
                 .flat_map(|f| f.as_ref().unwrap().iter().copied())
                 .collect();
-            self.entries.remove(message_id);
+            // Retain completed fragments until TTL: a 500 response may cause
+            // only the last fragment to be redelivered (official SDK cache semantics).
             Some(merged)
         } else {
             None

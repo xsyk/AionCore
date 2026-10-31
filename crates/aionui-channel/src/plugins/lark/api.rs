@@ -44,6 +44,10 @@ pub(crate) struct LarkApi {
 }
 
 impl LarkApi {
+    pub(crate) fn app_id(&self) -> &str {
+        &self.app_id
+    }
+
     /// Create a new Lark API client.
     pub fn new(client: Client, app_id: &str, app_secret: &str) -> Self {
         Self {
@@ -189,12 +193,23 @@ impl LarkApi {
     /// Uses `receive_id_type=chat_id` to address by chat ID.
     /// Returns the message ID of the sent card.
     pub async fn send_card(&self, chat_id: &str, card_content: &str) -> Result<SendMessageData, ChannelError> {
+        self.send_card_idempotent(chat_id, card_content, None).await
+    }
+
+    // Feishu's official SDK documents a one-hour deduplication window for uuid.
+    pub async fn send_card_idempotent(
+        &self,
+        chat_id: &str,
+        card_content: &str,
+        uuid: Option<&str>,
+    ) -> Result<SendMessageData, ChannelError> {
         let token = self.get_token().await?;
         let url = format!("{LARK_OPEN_API_BASE}/im/v1/messages?receive_id_type=chat_id");
 
         debug!(chat_id, "Sending Lark card message");
 
         let body = SendCardRequest {
+            uuid: uuid.map(str::to_owned),
             receive_id: chat_id.to_string(),
             msg_type: "interactive".into(),
             content: card_content.to_string(),

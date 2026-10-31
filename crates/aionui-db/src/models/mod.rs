@@ -5,6 +5,7 @@ mod channel;
 mod client_preference;
 mod conversation;
 mod conversation_artifact;
+mod conversation_share;
 mod cron_job;
 mod feishu_login;
 mod mcp_server;
@@ -32,6 +33,7 @@ pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, Pairi
 pub use client_preference::ClientPreference;
 pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, UpsertConversationAssistantSnapshotParams};
 pub use conversation_artifact::ConversationArtifactRow;
+pub use conversation_share::ConversationShareRow;
 pub use cron_job::CronJobRow;
 pub use feishu_login::{FeishuLoginConfigRow, FeishuSignupPolicy};
 pub use mcp_server::McpServerRow;
@@ -45,3 +47,9 @@ pub use system_settings::SystemSettings;
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
 pub use user::{ExternalUserProjection, User, UserStatus, UserType};
 pub use user_order::{OrderItemType, OrderScene, UserOrderRow};
+
+mod feishu_binding;
+pub use feishu_binding::{
+    FeishuBindingCodeRow, FeishuBindingRow, FeishuInboxRow, FeishuIngressRow, FeishuOutboxRow,
+    RedeemFeishuBindingParams,
+};

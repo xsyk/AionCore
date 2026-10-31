@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, Weak};
 
 use aionui_api_types::{PluginStatusChangedPayload, PluginStatusResponse, WebSocketMessage};
 use aionui_common::{decrypt_string, encrypt_string, now_ms};
@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::error::ChannelError;
-use crate::plugin::{ChannelPlugin, PluginCallbacks};
+use crate::plugin::{ChannelPlugin, DurableChannelIngress, DurableIngressEvent, PluginCallbacks};
 use crate::types::{PluginConfig, PluginStatus, PluginType, UnifiedIncomingMessage};
 
 /// Manages the lifecycle of channel plugins.
@@ -25,6 +25,7 @@ use crate::types::{PluginConfig, PluginStatus, PluginType, UnifiedIncomingMessag
 /// Plugin instances are stored as `Box<dyn ChannelPlugin>` behind a
 /// `DashMap` for lock-free concurrent access.
 pub struct ChannelManager {
+    durable_ingress: RwLock<Option<Weak<dyn DurableChannelIngress>>>,
     repo: Arc<dyn IChannelRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     encryption_key: [u8; 32],
@@ -80,6 +81,7 @@ impl ChannelManager {
         confirm_tx: mpsc::Sender<(String, String)>,
     ) -> Self {
         Self {
+            durable_ingress: RwLock::new(None),
             repo,
             broadcaster,
             encryption_key,
@@ -87,6 +89,10 @@ impl ChannelManager {
             message_tx,
             confirm_tx,
         }
+    }
+
+    pub fn set_durable_ingress(&self, ingress: Weak<dyn DurableChannelIngress>) {
+        *self.durable_ingress.write().expect("ingress lock poisoned") = Some(ingress);
     }
 
     /// Returns the status of all registered plugins from the database.
@@ -279,6 +285,7 @@ impl ChannelManager {
         let (msg_tx, _msg_rx) = mpsc::channel(1);
         let (confirm_tx, _confirm_rx) = mpsc::channel(1);
         let callbacks = PluginCallbacks {
+            durable_ingress: None,
             message_tx: msg_tx,
             confirm_tx,
         };
@@ -469,9 +476,10 @@ impl ChannelManager {
         ChannelRuntimeKey::new(owner_user_id, plugin_id)
     }
 
-    fn callbacks_for_owner(&self, owner_user_id: &str) -> PluginCallbacks {
+    pub(crate) fn callbacks_for_owner(&self, owner_user_id: &str) -> PluginCallbacks {
         let (plugin_msg_tx, mut plugin_msg_rx) = mpsc::channel::<UnifiedIncomingMessage>(64);
         let message_tx = self.message_tx.clone();
+        let ingress_owner = owner_user_id.to_owned();
         let owner_user_id = owner_user_id.to_owned();
         tokio::spawn(async move {
             while let Some(mut msg) = plugin_msg_rx.recv().await {
@@ -483,6 +491,17 @@ impl ChannelManager {
         });
 
         PluginCallbacks {
+            durable_ingress: self
+                .durable_ingress
+                .read()
+                .expect("ingress lock poisoned")
+                .clone()
+                .map(|target| {
+                    Arc::new(OwnerIngress {
+                        owner: ingress_owner,
+                        target,
+                    }) as Arc<dyn DurableChannelIngress>
+                }),
             message_tx: plugin_msg_tx,
             confirm_tx: self.confirm_tx.clone(),
         }
@@ -651,6 +670,21 @@ impl crate::stream_relay::ChannelSender for ChannelManager {
         self.send_message(owner_user_id, plugin_id, chat_id, message).await
     }
 
+    async fn send_message_idempotent(
+        &self,
+        owner: &str,
+        plugin_id: &str,
+        chat: &str,
+        message: crate::types::UnifiedOutgoingMessage,
+        uuid: &str,
+    ) -> Result<String, ChannelError> {
+        let plugin = self
+            .plugins
+            .get(&Self::runtime_key(owner, plugin_id))
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.into()))?;
+        plugin.send_message_idempotent(chat, message, uuid).await
+    }
+
     async fn edit_message(
         &self,
         owner_user_id: &str,
@@ -660,6 +694,22 @@ impl crate::stream_relay::ChannelSender for ChannelManager {
         message: crate::types::UnifiedOutgoingMessage,
     ) -> Result<(), crate::error::ChannelError> {
         self.edit_message(owner_user_id, plugin_id, chat_id, message_id, message)
+            .await
+    }
+}
+
+struct OwnerIngress {
+    owner: String,
+    target: Weak<dyn DurableChannelIngress>,
+}
+#[async_trait::async_trait]
+impl DurableChannelIngress for OwnerIngress {
+    async fn accept(&self, mut event: DurableIngressEvent) -> Result<(), ChannelError> {
+        event.owner_user_id = self.owner.clone();
+        self.target
+            .upgrade()
+            .ok_or_else(|| ChannelError::ConnectionFailed("Durable ingress is unavailable".into()))?
+            .accept(event)
             .await
     }
 }

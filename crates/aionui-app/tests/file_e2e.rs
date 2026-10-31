@@ -987,8 +987,9 @@ async fn upload_accepts_small_png_and_returns_readable_path() {
     ];
 
     let conv_id = format!("conv-upload-{}", std::process::id());
+    let png_name = format!("paste-{}.png", std::process::id());
     let (content_type, body) = UploadMultipart::new()
-        .add_file("file", "paste.png", "image/png", &png_bytes)
+        .add_file("file", &png_name, "image/png", &png_bytes)
         .add_text("conversation_id", &conv_id)
         .build();
 
@@ -1001,9 +1002,14 @@ async fn upload_accepts_small_png_and_returns_readable_path() {
     let path = json["data"].as_str().expect("data should be a string path");
     let p = std::path::Path::new(path);
     assert!(p.is_absolute(), "returned path must be absolute: {path}");
-    assert_eq!(p.file_name().unwrap().to_string_lossy(), "paste.png");
-    // conversation_id routing produced a sub-directory of that name.
-    assert_eq!(p.parent().unwrap().file_name().unwrap().to_string_lossy(), conv_id);
+    assert_eq!(p.file_name().unwrap().to_string_lossy(), png_name);
+    // A caller-supplied conversation id must not establish upload ownership.
+    // The authenticated account owns staging until the send boundary copies it.
+    assert_eq!(
+        p.parent().unwrap().file_name().unwrap().to_string_lossy(),
+        "owner_system_default_user"
+    );
+    assert!(!p.components().any(|part| part.as_os_str() == conv_id.as_str()));
     // File contents must match what we uploaded.
     let on_disk = std::fs::read(p).expect("uploaded file should be readable");
     assert_eq!(on_disk, png_bytes);

@@ -142,6 +142,7 @@ pub struct ModuleStates {
     pub hub: HubRouterState,
     pub skill: SkillRouterState,
     pub channel: ChannelRouterState,
+    pub feishu_bridge: Arc<aionui_channel::feishu_bridge::FeishuBridge>,
     pub team: TeamRouterState,
     pub session_message: SessionMessageRouterState,
     pub skill_runtime: SkillRuntimeRouterState,
@@ -197,6 +198,7 @@ pub struct ChannelOrchestratorComponents {
     pub manager: Arc<aionui_channel::manager::ChannelManager>,
     pub plugin_factory: Arc<aionui_channel::manager::PluginFactory>,
     pub owner_user_id: Option<String>,
+    pub feishu_bridge: Arc<aionui_channel::feishu_bridge::FeishuBridge>,
 }
 
 /// Build all default `ModuleStates` from application services.
@@ -320,6 +322,7 @@ pub async fn build_module_states(
         hub: hub_state,
         skill: skill_state,
         channel: channel_state,
+        feishu_bridge: channel_components.feishu_bridge.clone(),
         team: build_module_state_phase(&boot, "team", || {
             build_team_state(
                 services,
@@ -807,12 +810,31 @@ pub async fn build_channel_state(
 
     let message_service = build_channel_message_service(services, Arc::clone(&channel_settings)).await;
 
+    let feishu_bridge = Arc::new(aionui_channel::feishu_bridge::FeishuBridge::new(
+        aionui_channel::feishu_bridge::FeishuBridgeDependencies {
+            bindings: Arc::new(aionui_db::SqliteFeishuBindingRepository::new(
+                services.database.pool().clone(),
+            )),
+            conversations: Arc::new(services.conversation_service.clone()),
+            conversation_repo: services.conversation_repo.clone(),
+            users: services.user_repo.clone(),
+            login_config: Arc::new(aionui_db::SqliteFeishuLoginRepository::new(
+                services.database.pool().clone(),
+            )),
+            tasks: services.worker_task_manager.clone(),
+            sender: manager.clone(),
+        },
+    ));
+    let ingress: Arc<dyn aionui_channel::plugin::DurableChannelIngress> = feishu_bridge.clone();
+    manager.set_durable_ingress(Arc::downgrade(&ingress));
+
     let orchestrator = aionui_channel::orchestrator::ChannelOrchestrator::new(
         action_executor,
         message_service,
         Arc::clone(&session_manager),
         manager.clone() as Arc<dyn aionui_channel::stream_relay::ChannelSender>,
-    );
+    )
+    .with_feishu_bridge(feishu_bridge.clone());
 
     let state = ChannelRouterState {
         manager: Arc::clone(&manager),
@@ -831,6 +853,7 @@ pub async fn build_channel_state(
         manager,
         plugin_factory,
         owner_user_id: startup_owner_user_id,
+        feishu_bridge,
     };
 
     (state, components)

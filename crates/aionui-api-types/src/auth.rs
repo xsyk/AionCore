@@ -112,6 +112,20 @@ pub struct FeishuLoginStatus {
     /// Configured site URL while enabled, `None` otherwise. A login page served
     /// from another address starts the flow there.
     pub public_base_url: Option<String>,
+    /// Public application identifier used by the in-client JSAPI.
+    pub app_id: Option<String>,
+}
+
+/// A short-lived authorization code issued by Feishu's in-client JSAPI.
+#[derive(Debug, Deserialize)]
+pub struct FeishuInAppLoginRequest {
+    pub code: String,
+}
+
+/// In-client login returns the local identity; credentials stay in HttpOnly cookies.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FeishuInAppLoginResponse {
+    pub user: PublicUser,
 }
 
 /// `GET/PUT /api/admin/feishu-login` response. Never carries the app secret.

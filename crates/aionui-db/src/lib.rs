@@ -24,6 +24,7 @@ pub use error::{
     message_indicates_unique_violation,
 };
 pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
+pub use models::ConversationShareRow;
 pub use models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
     AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams,
@@ -67,6 +68,9 @@ pub use repository::{
     SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore,
     SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository,
 };
+pub use repository::{IConversationShareRepository, SqliteConversationShareRepository};
 
 // Re-export sqlx pool type for downstream crates
 pub use sqlx::SqlitePool;
+
+pub use repository::{IFeishuBindingRepository, SqliteFeishuBindingRepository};

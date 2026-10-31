@@ -41,4 +41,5 @@ base64 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
+sqlx.workspace = true
 aionui-ai-agent = { workspace = true, features = ["test-support"] }

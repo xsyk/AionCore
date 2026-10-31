@@ -5,6 +5,7 @@ pub mod action;
 pub mod channel_settings;
 pub mod constants;
 pub mod error;
+pub mod feishu_bridge;
 pub mod formatter;
 pub mod manager;
 pub mod message_service;

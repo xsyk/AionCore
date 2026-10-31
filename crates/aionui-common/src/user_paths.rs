@@ -37,6 +37,12 @@ pub fn user_dir_name(user_id: &str) -> Result<String, UserDirNameError> {
     Ok(name.to_owned())
 }
 
+/// Namespace for new managed uploads. Shared by the authenticated upload edge
+/// and attachment resolution so one account cannot reference another's staging.
+pub fn user_upload_dir_name(user_id: &str) -> Result<String, UserDirNameError> {
+    Ok(format!("owner_{}", user_dir_name(user_id)?))
+}
+
 fn is_filename_safe(name: &str) -> bool {
     if name == "." || name == ".." {
         return false;

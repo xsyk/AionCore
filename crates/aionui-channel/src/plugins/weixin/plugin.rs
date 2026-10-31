@@ -636,6 +636,10 @@ mod tests {
     fn make_callbacks() -> PluginCallbacks {
         let (message_tx, _) = tokio::sync::mpsc::channel(16);
         let (confirm_tx, _) = tokio::sync::mpsc::channel(16);
-        PluginCallbacks { message_tx, confirm_tx }
+        PluginCallbacks {
+            durable_ingress: None,
+            message_tx,
+            confirm_tx,
+        }
     }
 }

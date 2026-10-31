@@ -13,7 +13,8 @@ use aionui_api_types::SessionMcpServer;
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{
-    ConversationService, SharedSessionMcpSource, runtime_state::ConversationRuntimeStateService,
+    ConversationService, ConversationShareService, SharedSessionMcpSource,
+    runtime_state::ConversationRuntimeStateService,
 };
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
@@ -96,6 +97,7 @@ pub struct AppServices {
     pub task_manager_delete_hook: Option<Arc<dyn OnConversationDelete>>,
     pub agent_registry: Arc<AgentRegistry>,
     pub conversation_repo: Arc<dyn IConversationRepository>,
+    pub conversation_share_service: ConversationShareService,
     pub acp_session_sync: Arc<AcpSessionSyncService>,
     /// Raw storage-encryption secret string, used to derive the AES-256-GCM
     /// key for at-rest credentials. Decoupled from the JWT signing secret held
@@ -362,6 +364,9 @@ impl AppServices {
 
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
+        let conversation_share_service = ConversationShareService::new(Arc::new(
+            aionui_db::SqliteConversationShareRepository::new(database.pool().clone()),
+        ));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
 
         // Roots that held temp workspaces before the work dir moved away from the
@@ -556,6 +561,7 @@ impl AppServices {
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
+            conversation_share_service,
             acp_session_sync: acp_agent_service,
             encryption_secret_raw: encryption_secret,
             data_dir,

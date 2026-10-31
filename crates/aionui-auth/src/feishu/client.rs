@@ -3,6 +3,7 @@
 use serde::Deserialize;
 
 use super::FeishuLoginError;
+use super::ResolvedConfig;
 
 /// Identity returned by `authen/v1/user_info`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +51,65 @@ struct UserInfoData {
 
 fn non_empty(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+/// JSAPI codes use the app-authenticated exchange, rather than a fabricated
+/// OAuth redirect URI or PKCE verifier. Contract verified against the official
+/// SDK's authen/v1/model/create_access_token_request{,_body}.py:
+/// https://github.com/larksuite/oapi-sdk-python/tree/v2_main/lark_oapi/api/authen/v1/model
+pub async fn exchange_in_app_code(
+    http: &reqwest::Client,
+    cfg: &ResolvedConfig,
+    code: &str,
+) -> Result<String, FeishuLoginError> {
+    #[derive(Deserialize)]
+    struct AppToken {
+        code: i64,
+        app_access_token: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct UserToken {
+        code: i64,
+        data: Option<UserTokenData>,
+    }
+    #[derive(Deserialize)]
+    struct UserTokenData {
+        access_token: String,
+    }
+
+    let app_response = http
+        .post(format!("{}/open-apis/auth/v3/app_access_token/internal", cfg.api_base))
+        .json(&serde_json::json!({"app_id":cfg.app_id,"app_secret":cfg.app_secret}))
+        .send()
+        .await
+        .map_err(|_| FeishuLoginError::Upstream("application credential request failed".into()))?;
+    let app_status = app_response.status();
+    let app: AppToken = app_response
+        .json()
+        .await
+        .map_err(|_| FeishuLoginError::Upstream("application credential response unreadable".into()))?;
+    let app_token = app
+        .app_access_token
+        .filter(|token| !token.is_empty())
+        .filter(|_| app_status.is_success() && app.code == 0)
+        .ok_or_else(|| FeishuLoginError::Upstream("application credential rejected".into()))?;
+    let response = http
+        .post(format!("{}/open-apis/authen/v1/access_token", cfg.api_base))
+        .bearer_auth(app_token)
+        .json(&serde_json::json!({"grant_type":"authorization_code","code":code}))
+        .send()
+        .await
+        .map_err(|_| FeishuLoginError::Upstream("in-client code exchange failed".into()))?;
+    let status = response.status();
+    let token: UserToken = response
+        .json()
+        .await
+        .map_err(|_| FeishuLoginError::Upstream("in-client code response unreadable".into()))?;
+    token
+        .data
+        .map(|data| data.access_token)
+        .filter(|value| !value.is_empty() && status.is_success() && token.code == 0)
+        .ok_or_else(|| FeishuLoginError::Upstream("in-client authorization rejected".into()))
 }
 
 /// Fields of the token request.

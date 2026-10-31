@@ -111,6 +111,29 @@ impl ProjectService {
                 if !path_within(upload_root, candidate) {
                     return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
                 }
+                let expected = aionui_common::user_upload_dir_name(user_id)
+                    .map_err(|_| ProjectError::UploadPathOutsideRoot { path: path.clone() })?;
+                let canonical_root = std::fs::canonicalize(upload_root)
+                    .map_err(|_| ProjectError::UploadPathOutsideRoot { path: path.clone() })?;
+                let canonical_path = std::fs::canonicalize(candidate)
+                    .map_err(|_| ProjectError::UploadPathOutsideRoot { path: path.clone() })?;
+                // Enforce new namespaces on both lexical and canonical paths:
+                // a symlink from an old directory must not bypass the guard.
+                for relative in [
+                    candidate.strip_prefix(upload_root).ok(),
+                    canonical_path.strip_prefix(&canonical_root).ok(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if let Some(std::path::Component::Normal(namespace)) = relative.components().next()
+                        && let Some(namespace) = namespace.to_str()
+                        && namespace.starts_with("owner_")
+                        && namespace != expected
+                    {
+                        return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
+                    }
+                }
                 Ok(path.clone())
             }
             ChatFileRef::Local { path } => {

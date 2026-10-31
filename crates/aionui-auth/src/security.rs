@@ -45,10 +45,9 @@ pub async fn security_headers_middleware(request: Request, next: Next) -> Respon
     }
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(X_XSS_PROTECTION, HeaderValue::from_static("1; mode=block"));
-    headers.insert(
-        REFERRER_POLICY,
-        HeaderValue::from_static("strict-origin-when-cross-origin"),
-    );
+    headers
+        .entry(REFERRER_POLICY)
+        .or_insert(HeaderValue::from_static("strict-origin-when-cross-origin"));
 
     response
 }

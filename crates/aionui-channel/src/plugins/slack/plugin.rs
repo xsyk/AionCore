@@ -151,6 +151,7 @@ impl ChannelPlugin for SlackPlugin {
         // Slack MVP does not surface interactive tool confirmations; drop the
         // confirm sender clone.
         let PluginCallbacks {
+            durable_ingress: _,
             message_tx,
             confirm_tx: _,
         } = callbacks;

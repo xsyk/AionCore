@@ -21,9 +21,17 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     ("acp_session", "conversation_id", "conversations"),
     ("conversation_artifacts", "conversation_id", "conversations"),
     ("conversation_assistant_snapshots", "conversation_id", "conversations"),
+    ("conversation_shares", "conversation_id", "conversations"),
     // `cron_job_runs.owner_id` is the scheduler's run-lease holder, NOT a
     // user reference — ownership flows from `job_id`.
     ("cron_job_runs", "job_id", "cron_jobs"),
+    (
+        "feishu_binding_baseline_messages",
+        "binding_id",
+        "feishu_conversation_bindings",
+    ),
+    ("feishu_inbox", "binding_id", "feishu_conversation_bindings"),
+    ("feishu_outbox", "binding_id", "feishu_conversation_bindings"),
     ("mailbox", "team_id", "teams"),
     ("messages", "conversation_id", "conversations"),
     ("team_tasks", "team_id", "teams"),
@@ -37,10 +45,19 @@ const GLOBAL_TABLES: &[(&str, &str)] = &[
     ("folders", "global canonical path registry"),
     // Single-row Feishu web-login settings owned by the super admin, not a user.
     ("feishu_login_config", "machine-wide feishu login settings"),
+    // Only immutable app/message replay keys; no user identity or message body.
+    ("feishu_message_receipts", "app-scoped transport deduplication registry"),
     // Server-wide settings managed by the super admin (e.g. the image
     // generation model), shared by every user rather than owned by one.
     ("global_settings", "server-wide settings, not owned by any user"),
 ];
+
+/// These tables carry a Core owner inside a serialized transport envelope,
+/// before a relational parent can exist (/bind creates that parent). Adoption
+/// must explicitly rekey this identity alongside its plugin. They are neither
+/// machine-global data nor automatically covered by the column-name sweep.
+const EMBEDDED_CORE_OWNER_TABLES: &[(&str, &str, &str)] =
+    &[("feishu_ingress_events", "payload", "$.event.owner_user_id")];
 
 /// Tables whose `user_id` column is NOT a Core-user ownership column — it
 /// foreign-keys a non-Core identity table (a channel/platform user). The row's
@@ -93,6 +110,7 @@ async fn every_table_is_classified_for_aionpro_adoption() {
         let parent_scoped = PARENT_SCOPED.iter().any(|(name, _, _)| *name == table);
         let global = GLOBAL_TABLES.iter().any(|(name, _)| *name == table);
         let infra = INFRA_TABLES.contains(&table.as_str());
+        let embedded_core_owner = EMBEDDED_CORE_OWNER_TABLES.iter().any(|(name, _, _)| *name == table);
 
         let categories = [
             owned_by_user_id,
@@ -101,6 +119,7 @@ async fn every_table_is_classified_for_aionpro_adoption() {
             global,
             infra,
             non_core_user_id,
+            embedded_core_owner,
         ]
         .iter()
         .filter(|hit| **hit)
@@ -122,7 +141,7 @@ async fn every_table_is_classified_for_aionpro_adoption() {
         "NEW TABLE(S) WITHOUT AN AIONPRO ADOPTION DECISION: {unclassified:?}\n\
          Every table must either carry an ownership column (`user_id` / `owner_user_id`,\n\
          adopted automatically), or be declared in this test as parent-scoped (with its\n\
-         parent column), machine-global (with a rationale), or infrastructure.\n\
+         parent column), explicitly handled embedded owner, machine-global (with a rationale), or infrastructure.\n\
          See crates/aionui-db/tests/adoption_coverage.rs."
     );
 
@@ -145,7 +164,7 @@ async fn parent_scoped_declarations_match_the_live_schema() {
             "parent-scoped table {table} lost its declared parent column {parent_column}"
         );
         assert!(
-            has_column(pool, owned_root, "user_id").await,
+            has_column(pool, owned_root, "user_id").await || has_column(pool, owned_root, "owner_user_id").await,
             "parent-scoped table {table} points at root {owned_root}, which is not user-owned"
         );
         // A parent-scoped table must NOT quietly grow its own ownership column
@@ -160,6 +179,21 @@ async fn parent_scoped_declarations_match_the_live_schema() {
         assert!(
             tables.iter().any(|name| name == table),
             "global-table declaration references missing table {table}"
+        );
+    }
+
+    for (table, column, path) in EMBEDDED_CORE_OWNER_TABLES {
+        assert!(
+            tables.iter().any(|name| name == table),
+            "embedded-owner declaration references missing table {table}"
+        );
+        assert!(
+            has_column(pool, table, column).await,
+            "{table} lost its embedded-owner column {column}"
+        );
+        assert!(
+            !path.is_empty(),
+            "{table} must declare the exact embedded Core owner path"
         );
     }
 
@@ -180,6 +214,36 @@ async fn parent_scoped_declarations_match_the_live_schema() {
         );
     }
 
+    db.close().await;
+}
+
+#[tokio::test]
+async fn feishu_parent_and_connector_foreign_keys_match_the_ownership_model() {
+    let db = init_database_memory().await.unwrap();
+    for (table, column, parent) in [
+        ("conversation_shares", "conversation_id", "conversations"),
+        (
+            "feishu_binding_baseline_messages",
+            "binding_id",
+            "feishu_conversation_bindings",
+        ),
+        ("feishu_inbox", "binding_id", "feishu_conversation_bindings"),
+        ("feishu_outbox", "binding_id", "feishu_conversation_bindings"),
+        ("feishu_conversation_bindings", "owner_user_id", "users"),
+        ("feishu_conversation_bindings", "connector_user_id", "users"),
+        ("feishu_conversation_binding_codes", "owner_user_id", "users"),
+    ] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list(?) WHERE \"from\"=? AND \"table\"=? AND \"to\"='id'",
+        )
+        .bind(table)
+        .bind(column)
+        .bind(parent)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "{table}.{column} must reference {parent}.id");
+    }
     db.close().await;
 }
 
@@ -419,5 +483,175 @@ async fn empty_first_sweep_still_consumes_the_adoption_opportunity() {
         .unwrap();
     assert!(!repo.is_default_data_adopter(&other.id).await.unwrap());
 
+    db.close().await;
+}
+
+async fn seed_feishu_adoption_graph(pool: &sqlx::SqlitePool) {
+    sqlx::raw_sql(
+        "INSERT INTO users(id,user_type,username,password_hash,created_at,updated_at) VALUES('other-local','local','other-local','hash',1,1);
+         INSERT INTO conversations(id,user_id,name,type,created_at,updated_at) VALUES('adopt-shared','system_default_user','Shared','acp',1,1),('other-shared','other-local','Other','acp',1,1);
+         INSERT INTO conversation_shares(conversation_id,token,enabled,created_at,updated_at) VALUES('adopt-shared','fixed-share-token',1,1,1);
+         INSERT INTO assistant_plugins(id,owner_user_id,type,name,enabled,config,created_at,updated_at) VALUES('lark','system_default_user','lark','Bot',1,'sealed-original-config',1,1);
+         INSERT INTO feishu_conversation_bindings(id,conversation_id,owner_user_id,connector_user_id,app_id,tenant_key,chat_id,chat_type,bound_at) VALUES('adopt-binding','adopt-shared','system_default_user','system_default_user','app','tenant','chat','group',1),('other-binding','other-shared','other-local','other-local','other-app','tenant','other-chat','group',1);
+         INSERT INTO feishu_conversation_binding_codes(code,conversation_id,owner_user_id,expires_at) VALUES('pending-code','adopt-shared','system_default_user',9999);
+         INSERT INTO feishu_binding_baseline_messages(binding_id,message_id) VALUES('adopt-binding','baseline-message');
+         INSERT INTO feishu_inbox(id,binding_id,content) VALUES('input','adopt-binding','system_default_user is literal conversation text');
+         INSERT INTO feishu_outbox(id,binding_id,message_id,part,content) VALUES('output','adopt-binding','reply',0,'system_default_user is literal reply text');
+         INSERT INTO feishu_message_receipts(app_id,message_id,received_at) VALUES('app','receipt',1);"
+    ).execute(pool).await.unwrap();
+    for (id, owner) in [
+        ("pending-connector", "system_default_user"),
+        ("other-connector", "other-local"),
+    ] {
+        let payload = serde_json::json!({
+            "event": {"id": id, "owner_user_id": owner, "app_id": "app", "bot_open_id": "bot", "frame_type": "event", "payload": "system_default_user is platform payload text"},
+            "binding_generation": "adopt-binding"
+        });
+        sqlx::query("INSERT INTO feishu_ingress_events(id,payload) VALUES(?,?)")
+            .bind(id)
+            .bind(payload.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    // Old malformed/unscoped receipts are discarded by replay, so adoption
+    // must preserve them rather than guessing at an unrelated identity field.
+    sqlx::query("INSERT INTO feishu_ingress_events(id,payload) VALUES('malformed','not-json'),('legacy','{\"owner_user_id\":\"system_default_user\"}')")
+        .execute(pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn adoption_keeps_feishu_connector_aliases_and_parent_scoped_queues_consistent() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool();
+    let repo = SqliteUserRepository::new(pool.clone());
+    seed_feishu_adoption_graph(pool).await;
+    let user = repo
+        .ensure_external_user(UserType::Aionpro, "feishu-adopter", ExternalUserProjection::default())
+        .await
+        .unwrap();
+    repo.adopt_system_default_data(&user.id).await.unwrap();
+
+    let owner: String = sqlx::query_scalar("SELECT owner_user_id FROM assistant_plugins WHERE id='lark'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(owner, user.id);
+    let binding: (String, String) = sqlx::query_as(
+        "SELECT owner_user_id,connector_user_id FROM feishu_conversation_bindings WHERE id='adopt-binding'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(binding.0, user.id);
+    assert_eq!(
+        binding.1, user.id,
+        "connector alias must follow the adopted plugin, or replies use a missing connector"
+    );
+    let other: (String, String) = sqlx::query_as(
+        "SELECT owner_user_id,connector_user_id FROM feishu_conversation_bindings WHERE id='other-binding'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(other, ("other-local".into(), "other-local".into()));
+    let code_owner: String =
+        sqlx::query_scalar("SELECT owner_user_id FROM feishu_conversation_binding_codes WHERE code='pending-code'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(code_owner, user.id);
+    let ingress: String = sqlx::query_scalar("SELECT payload FROM feishu_ingress_events WHERE id='pending-connector'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let ingress: serde_json::Value = serde_json::from_str(&ingress).unwrap();
+    assert_eq!(ingress["event"]["owner_user_id"], user.id);
+    assert_eq!(
+        ingress["event"]["payload"],
+        "system_default_user is platform payload text"
+    );
+    assert_eq!(ingress["binding_generation"], "adopt-binding");
+    let other_ingress: String = sqlx::query_scalar(
+        "SELECT json_extract(payload,'$.event.owner_user_id') FROM feishu_ingress_events WHERE id='other-connector'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(other_ingress, "other-local");
+    let malformed: String = sqlx::query_scalar("SELECT payload FROM feishu_ingress_events WHERE id='malformed'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(malformed, "not-json");
+    let legacy: String = sqlx::query_scalar("SELECT payload FROM feishu_ingress_events WHERE id='legacy'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(legacy, "{\"owner_user_id\":\"system_default_user\"}");
+
+    let inherited: (String, String, String, String) = sqlx::query_as("SELECT c.user_id,s.token,i.content,o.content FROM conversations c JOIN conversation_shares s ON s.conversation_id=c.id JOIN feishu_conversation_bindings b ON b.conversation_id=c.id JOIN feishu_inbox i ON i.binding_id=b.id JOIN feishu_outbox o ON o.binding_id=b.id WHERE c.id='adopt-shared'").fetch_one(pool).await.unwrap();
+    assert_eq!(
+        inherited,
+        (
+            user.id.clone(),
+            "fixed-share-token".into(),
+            "system_default_user is literal conversation text".into(),
+            "system_default_user is literal reply text".into()
+        )
+    );
+    let baseline: String =
+        sqlx::query_scalar("SELECT message_id FROM feishu_binding_baseline_messages WHERE binding_id='adopt-binding'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(baseline, "baseline-message");
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM feishu_message_receipts WHERE app_id='app' AND message_id='receipt'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(receipts, 1);
+    assert_eq!(repo.adopt_system_default_data(&user.id).await.unwrap(), 0);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn adoption_does_not_retarget_a_connector_when_its_plugin_was_not_adopted() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool();
+    let repo = SqliteUserRepository::new(pool.clone());
+    seed_feishu_adoption_graph(pool).await;
+    let user = repo
+        .ensure_external_user(UserType::Aionpro, "feishu-collision", ExternalUserProjection::default())
+        .await
+        .unwrap();
+    // UPDATE OR IGNORE deliberately leaves the local connector in place when
+    // the adopter already has a different Lark configuration under the same ID.
+    sqlx::query("INSERT INTO assistant_plugins(id,owner_user_id,type,name,enabled,config,created_at,updated_at) VALUES('lark',?,'lark','Existing bot',1,'sealed-existing-config',1,1)")
+        .bind(&user.id).execute(pool).await.unwrap();
+    repo.adopt_system_default_data(&user.id).await.unwrap();
+    let connector: String =
+        sqlx::query_scalar("SELECT connector_user_id FROM feishu_conversation_bindings WHERE id='adopt-binding'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        connector, "system_default_user",
+        "a retained local plugin must keep its actual connector identity"
+    );
+    let ingress_owner: String = sqlx::query_scalar(
+        "SELECT json_extract(payload,'$.event.owner_user_id') FROM feishu_ingress_events WHERE id='pending-connector'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(ingress_owner, "system_default_user");
+    let config: String = sqlx::query_scalar("SELECT config FROM assistant_plugins WHERE id='lark' AND owner_user_id=?")
+        .bind(&user.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(config, "sealed-existing-config");
     db.close().await;
 }

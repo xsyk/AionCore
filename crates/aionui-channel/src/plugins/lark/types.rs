@@ -274,6 +274,8 @@ pub(crate) struct OperatorId {
 /// Request body for sending an interactive card message.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SendCardRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
     pub receive_id: String,
     pub msg_type: String,
     pub content: String,
@@ -321,8 +323,8 @@ pub(crate) fn build_interactive_card(text: &str, buttons: Option<&[Vec<crate::ty
     })];
 
     if let Some(button_rows) = buttons {
-        let mut actions = Vec::new();
         for row in button_rows {
+            let mut actions = Vec::new();
             for btn in row {
                 let callback_value = format_lark_callback(&btn.action, btn.params.as_ref());
                 actions.push(serde_json::json!({
@@ -332,12 +334,12 @@ pub(crate) fn build_interactive_card(text: &str, buttons: Option<&[Vec<crate::ty
                     "value": { "action": callback_value }
                 }));
             }
-        }
-        if !actions.is_empty() {
-            elements.push(serde_json::json!({
-                "tag": "action",
-                "actions": actions
-            }));
+            if !actions.is_empty() {
+                elements.push(serde_json::json!({
+                    "tag": "action",
+                    "actions": actions
+                }));
+            }
         }
     }
 
@@ -734,6 +736,7 @@ mod tests {
     #[test]
     fn send_card_request_serializes() {
         let req = SendCardRequest {
+            uuid: None,
             receive_id: "oc_chat1".into(),
             msg_type: "interactive".into(),
             content: "{}".into(),
@@ -765,5 +768,25 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["app_id"], "cli_123");
         assert_eq!(json["app_secret"], "secret_456");
+    }
+    #[test]
+    fn interactive_card_preserves_button_rows() {
+        use crate::types::ActionButton;
+        let rows = vec![
+            vec![ActionButton {
+                label: "Question 1".into(),
+                action: "feishu.select".into(),
+                params: None,
+            }],
+            vec![ActionButton {
+                label: "Submit".into(),
+                action: "feishu.submit".into(),
+                params: None,
+            }],
+        ];
+        let card: serde_json::Value = serde_json::from_str(&build_interactive_card("Questions", Some(&rows))).unwrap();
+        assert_eq!(card["elements"].as_array().unwrap().len(), 3);
+        assert_eq!(card["elements"][1]["actions"][0]["text"]["content"], "Question 1");
+        assert_eq!(card["elements"][2]["actions"][0]["text"]["content"], "Submit");
     }
 }

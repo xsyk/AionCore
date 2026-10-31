@@ -47,6 +47,17 @@ pub trait ChannelSender: Send + Sync {
         message: UnifiedOutgoingMessage,
     ) -> Result<String, ChannelError>;
 
+    async fn send_message_idempotent(
+        &self,
+        owner: &str,
+        plugin: &str,
+        chat: &str,
+        message: UnifiedOutgoingMessage,
+        _uuid: &str,
+    ) -> Result<String, ChannelError> {
+        self.send_message(owner, plugin, chat, message).await
+    }
+
     async fn edit_message(
         &self,
         owner_user_id: &str,

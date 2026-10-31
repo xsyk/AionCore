@@ -22,13 +22,15 @@ use aionui_assistant::assistant_routes;
 use aionui_auth::{
     AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, RefreshCoalescer,
     SystemDefaultFilesystemAdopter, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
+    user_session_auth_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
 use aionui_channel::weixin_login_route;
 use aionui_common::ApiErrorLogContext;
 use aionui_conversation::{
-    ConversationRuntimeRouterState, conversation_ops_routes, conversation_routes, conversation_runtime_routes,
+    ConversationRuntimeRouterState, ShareRouterState, conversation_ops_routes, conversation_routes,
+    conversation_runtime_routes, conversation_share_routes, public_conversation_share_routes,
 };
 use aionui_cron::cron_routes;
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
@@ -130,6 +132,12 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: module states built");
 
     // Start channel orchestrator (message loop)
+    tokio::spawn(
+        channel_components
+            .feishu_bridge
+            .clone()
+            .run(services.event_bus.subscribe()),
+    );
     tokio::spawn(
         channel_components
             .orchestrator
@@ -304,6 +312,17 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let conversation_ops_authenticated = conversation_ops_routes(states.conversation)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    let share_state = ShareRouterState {
+        service: services.conversation_share_service.clone(),
+    };
+    let share_authenticated = conversation_share_routes(share_state.clone())
+        .route_layer(from_fn_with_state(services.cookie_config.clone(), csrf_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), user_session_auth_middleware));
+    let public_shares = public_conversation_share_routes(share_state);
+    let feishu_bindings_authenticated = aionui_channel::feishu_bridge::feishu_binding_routes(states.feishu_bridge)
+        .route_layer(from_fn_with_state(services.cookie_config.clone(), csrf_middleware))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), user_session_auth_middleware));
+
     // Remote agent routes protected by auth middleware
     let remote_agent_authenticated = remote_agent_routes(states.remote_agent)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -419,6 +438,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(system_authenticated)
         .merge(conversation_authenticated)
         .merge(conversation_ops_authenticated)
+        .merge(share_authenticated)
+        .merge(public_shares)
+        .merge(feishu_bindings_authenticated)
         .merge(remote_agent_authenticated)
         .merge(agent_authenticated)
         .merge(connection_test_authenticated)

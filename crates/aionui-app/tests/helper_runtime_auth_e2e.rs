@@ -13,6 +13,39 @@ use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 
 const CONVERSATION_ID: &str = "conv-helper-auth";
 
+#[tokio::test]
+async fn helper_token_cannot_manage_sharing_or_feishu_bindings_of_any_conversation() {
+    let (app, services, user_id) = build_aionpro_app().await;
+    sqlx::query("INSERT INTO conversations(id,user_id,name,type,extra,status,created_at,updated_at) VALUES ('other-owned-conversation',?,'Other conversation','acp','{}','pending',1,1)")
+        .bind(&user_id).execute(services.database.pool()).await.unwrap();
+    let issued = services.runtime_token_service.issue(
+        &user_id,
+        CONVERSATION_ID,
+        TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+        [RuntimeTokenScope::ConversationHelper],
+    );
+    for (method, suffix) in [
+        ("GET", "share"),
+        ("PUT", "share"),
+        ("GET", "feishu-binding"),
+        ("POST", "feishu-binding"),
+        ("DELETE", "feishu-binding"),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(format!("/api/conversations/other-owned-conversation/{suffix}"))
+            .header("content-type", "application/json")
+            .header("x-aionui-runtime-token", &issued.token)
+            .header("x-aionui-user-id", &user_id)
+            .header("x-aionui-conversation-id", CONVERSATION_ID)
+            .body(Body::from(r#"{"enabled":true}"#))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method} {suffix}");
+        assert_eq!(body_json(response).await["code"], "USER_SESSION_REQUIRED");
+    }
+}
+
 async fn build_aionpro_app() -> (axum::Router, aionui_app::AppServices, String) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let config = aionui_app::AppConfig {

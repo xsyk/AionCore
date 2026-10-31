@@ -73,6 +73,7 @@ pub use csrf::csrf_middleware;
 pub use middleware::{
     ACT_AS_HEADER, AuthIdentityMode, AuthState, CurrentUser, IRuntimeTokenVerifier, RUNTIME_CONVERSATION_ID_HEADER,
     RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, RealUser, auth_middleware, local_auth_middleware,
+    user_session_auth_middleware,
 };
 
 // QR token store

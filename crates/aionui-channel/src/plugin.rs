@@ -1,4 +1,21 @@
 use crate::error::ChannelError;
+use std::sync::Arc;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DurableIngressEvent {
+    pub id: String,
+    pub owner_user_id: String,
+    pub app_id: String,
+    pub bot_open_id: String,
+    pub frame_type: String,
+    pub payload: String,
+}
+
+#[async_trait::async_trait]
+pub trait DurableChannelIngress: Send + Sync {
+    async fn accept(&self, event: DurableIngressEvent) -> Result<(), ChannelError>;
+}
+
 use crate::types::{BotInfo, PluginConfig, PluginStatus, PluginType, UnifiedIncomingMessage, UnifiedOutgoingMessage};
 
 /// Callback channels for a channel plugin.
@@ -11,6 +28,7 @@ use crate::types::{BotInfo, PluginConfig, PluginStatus, PluginType, UnifiedIncom
 /// callbacks are mapped to channel-based injection.
 #[derive(Clone)]
 pub struct PluginCallbacks {
+    pub durable_ingress: Option<Arc<dyn DurableChannelIngress>>,
     /// Sender for incoming messages from the platform.
     pub message_tx: tokio::sync::mpsc::Sender<UnifiedIncomingMessage>,
     /// Sender for tool confirmation callbacks (callId, value).
@@ -51,6 +69,16 @@ pub trait ChannelPlugin: Send + Sync {
 
     /// Send a message to a specific chat. Returns the platform message ID.
     async fn send_message(&self, chat_id: &str, message: UnifiedOutgoingMessage) -> Result<String, ChannelError>;
+
+    /// Stable request ID for transports that support request deduplication.
+    async fn send_message_idempotent(
+        &self,
+        chat: &str,
+        message: UnifiedOutgoingMessage,
+        _uuid: &str,
+    ) -> Result<String, ChannelError> {
+        self.send_message(chat, message).await
+    }
 
     /// Edit an existing message on the platform.
     ///
@@ -191,7 +219,11 @@ mod tests {
     fn make_test_callbacks() -> PluginCallbacks {
         let (message_tx, _message_rx) = mpsc::channel(16);
         let (confirm_tx, _confirm_rx) = mpsc::channel(16);
-        PluginCallbacks { message_tx, confirm_tx }
+        PluginCallbacks {
+            durable_ingress: None,
+            message_tx,
+            confirm_tx,
+        }
     }
 
     fn make_test_outgoing() -> UnifiedOutgoingMessage {

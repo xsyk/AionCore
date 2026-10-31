@@ -15,6 +15,7 @@ mod chat_file;
 mod confirmation;
 mod connection_test;
 mod conversation;
+mod conversation_share;
 mod conversation_tools;
 mod cron;
 mod custom_agent;
@@ -79,10 +80,11 @@ pub use auth::{
     AdminConversationOwner, AdminConversationView, AdminCreateUserRequest, AdminResetPasswordRequest, AdminUserView,
     AuthStatusResponse, ChangePasswordRequest, CurrentUserInfo, EnsureExternalSessionRequest,
     EnsureExternalSessionResponse, EnsureExternalUserRequest, EnsureExternalUserResponse, ExternalUserType,
-    FeishuLoginConfigUpdate, FeishuLoginConfigView, FeishuLoginStatus, InternalAuthErrorCode, LoginRequest,
-    LoginResponse, PublicUser, QrLoginRequest, RefreshResponse, RefreshTokenRequest, RevokeExternalSessionRequest,
-    RevokeExternalSessionResponse, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
-    WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
+    FeishuInAppLoginRequest, FeishuInAppLoginResponse, FeishuLoginConfigUpdate, FeishuLoginConfigView,
+    FeishuLoginStatus, InternalAuthErrorCode, LoginRequest, LoginResponse, PublicUser, QrLoginRequest, RefreshResponse,
+    RefreshTokenRequest, RevokeExternalSessionRequest, RevokeExternalSessionResponse, UserInfoResponse,
+    WebuiChangePasswordRequest, WebuiChangeUsernameRequest, WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse,
+    WebuiResetPasswordResponse, WsTokenResponse,
 };
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelAssistantSettingResponse,
@@ -104,6 +106,10 @@ pub use conversation::{
     ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
     MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery,
     SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
+};
+pub use conversation_share::{
+    ConversationShareStatus, PublicShareMessagesQuery, PublicSharedConversation, ShareResourceQuery,
+    UpdateConversationShareRequest,
 };
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,
@@ -244,3 +250,6 @@ mod public_contract_tests {
         assert_eq!(resolution.target, Some(AgentErrorResolutionTarget::Feedback));
     }
 }
+
+mod feishu_binding;
+pub use feishu_binding::{FeishuBindingCode, FeishuBindingStatus, FeishuConversationBinding};

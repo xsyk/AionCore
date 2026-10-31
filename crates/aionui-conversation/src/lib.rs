@@ -21,6 +21,7 @@ pub mod service;
 mod service_ops;
 pub(crate) mod session_context;
 pub mod session_mentions;
+pub mod share;
 mod shared_session_mcp;
 pub mod skill_resolver;
 pub mod skill_snapshot;
@@ -44,6 +45,9 @@ pub use service::is_temp_session_workspace;
 pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
+};
+pub use share::{
+    ConversationShareService, ShareError, ShareRouterState, conversation_share_routes, public_conversation_share_routes,
 };
 pub use shared_session_mcp::{SharedSessionMcpSource, merge_shared_session_mcp};
 pub use state::ConversationRouterState;

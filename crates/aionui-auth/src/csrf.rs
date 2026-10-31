@@ -96,7 +96,7 @@ pub async fn csrf_middleware(
 }
 
 /// Generate a cryptographically random 32-byte CSRF token as a hex string.
-fn generate_csrf_token() -> String {
+pub(crate) fn generate_csrf_token() -> String {
     let mut buf = [0u8; 32];
     getrandom::getrandom(&mut buf).expect("OS entropy source unavailable");
     let mut hex = String::with_capacity(64);

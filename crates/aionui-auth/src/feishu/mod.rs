@@ -250,6 +250,16 @@ impl FeishuLogin {
         client::fetch_user(&self.http, &cfg.api_base, &token).await
     }
 
+    /// Exchange a JSAPI code separately from the browser OAuth/PKCE flow.
+    pub async fn exchange_in_app_and_fetch(
+        &self,
+        cfg: &ResolvedConfig,
+        code: &str,
+    ) -> Result<client::FeishuUser, FeishuLoginError> {
+        let token = client::exchange_in_app_code(&self.http, cfg, code).await?;
+        client::fetch_user(&self.http, &cfg.api_base, &token).await
+    }
+
     /// Enforce the allowed tenant; the first successful login locks it when unset.
     pub async fn check_tenant(&self, cfg: &ResolvedConfig, tenant_key: &str) -> Result<(), FeishuLoginError> {
         match cfg.tenant_key.as_deref() {

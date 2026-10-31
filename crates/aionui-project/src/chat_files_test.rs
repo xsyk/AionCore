@@ -217,6 +217,43 @@ async fn upload_under_root_is_accepted() {
 }
 
 #[tokio::test]
+async fn owner_scoped_upload_rejects_another_users_reference() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    let owner_dir = upload_root.path().join("owner_system_default_user");
+    let foreign_dir = upload_root.path().join("owner_other_user");
+    std::fs::create_dir_all(&owner_dir).unwrap();
+    std::fs::create_dir_all(&foreign_dir).unwrap();
+    let owned = owner_dir.join("owned.png");
+    let foreign = foreign_dir.join("private.png");
+    std::fs::write(&owned, b"owned").unwrap();
+    std::fs::write(&foreign, b"private").unwrap();
+    let output = service
+        .resolve_chat_message(
+            "system_default_user",
+            "",
+            &[ChatFileRef::Upload {
+                path: owned.to_string_lossy().into_owned(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.files.len(), 1);
+    let error = service
+        .resolve_chat_message(
+            "system_default_user",
+            "",
+            &[ChatFileRef::Upload {
+                path: foreign.to_string_lossy().into_owned(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProjectError::UploadPathOutsideRoot { .. }));
+}
+
+#[tokio::test]
 async fn local_readable_file_resolves_and_inlines_marker() {
     let (service, _pe, _dir, upload_root) = setup().await;
     // A file anywhere on disk (outside the managed upload root) — `local` has no
