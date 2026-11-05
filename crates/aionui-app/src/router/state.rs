@@ -271,7 +271,7 @@ pub async fn build_module_states(
         ext_state.registry.clone(),
         Some(generated_assistant_materializer),
     )
-    .await;
+    .await?;
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: channel state built");
 
     let backend_binary_path = services.backend_binary_path();
@@ -770,7 +770,47 @@ pub async fn build_channel_state(
     generated_assistant_materializer: Option<
         Arc<dyn aionui_channel::channel_settings::ChannelGeneratedAssistantMaterializer>,
     >,
-) -> (ChannelRouterState, ChannelOrchestratorComponents) {
+) -> Result<(ChannelRouterState, ChannelOrchestratorComponents), RouterBuildError> {
+    #[cfg(feature = "lark")]
+    let gateway = aionui_channel::gateway::GatewayConfig::from_env()
+        .and_then(|config| config.map(aionui_channel::gateway::GatewayClient::new).transpose())
+        .map_err(|error| {
+            RouterBuildError::new("router.channel.gateway", "invalid shared Feishu gateway configuration")
+                .with_source(error)
+        })?
+        .map(Arc::new);
+    #[cfg(feature = "lark")]
+    let gateway_enabled = gateway.is_some();
+    #[cfg(not(feature = "lark"))]
+    let gateway_enabled = {
+        if std::env::var_os("AION_FEISHU_ROUTE_CONFIG").is_some() {
+            return Err(RouterBuildError::new(
+                "router.channel.gateway",
+                "shared Feishu gateway requires Lark support",
+            ));
+        }
+        false
+    };
+    #[cfg(feature = "lark")]
+    let gateway_repository: Option<Arc<dyn aionui_db::IFeishuGatewayRepository>> = if let Some(client) = &gateway {
+        let repository = Arc::new(aionui_db::SqliteFeishuGatewayRepository::new(
+            services.database.pool().clone(),
+        ));
+        aionui_db::IFeishuGatewayRepository::ensure_identity(
+            repository.as_ref(),
+            client.node_id(),
+            client.app_id(),
+            client.tenant_key(),
+        )
+        .await
+        .map_err(|error| {
+            RouterBuildError::new("router.channel.gateway", "shared Feishu gateway identity mismatch")
+                .with_source(error)
+        })?;
+        Some(repository)
+    } else {
+        None
+    };
     let pool = services.database.pool().clone();
     let repo: Arc<dyn aionui_db::IChannelRepository> = Arc::new(aionui_db::SqliteChannelRepository::new(pool));
     let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
@@ -778,13 +818,16 @@ pub async fn build_channel_state(
     let (message_tx, message_rx) = tokio::sync::mpsc::channel(256);
     let (confirm_tx, confirm_rx) = tokio::sync::mpsc::channel(256);
 
-    let manager = Arc::new(aionui_channel::manager::ChannelManager::new(
-        repo.clone(),
-        services.event_bus.clone(),
-        encryption_key,
-        message_tx,
-        confirm_tx,
-    ));
+    let manager = Arc::new(
+        aionui_channel::manager::ChannelManager::new(
+            repo.clone(),
+            services.event_bus.clone(),
+            encryption_key,
+            message_tx,
+            confirm_tx,
+        )
+        .with_feishu_gateway_mode(gateway_enabled),
+    );
 
     let pairing_service = Arc::new(aionui_channel::pairing::PairingService::new(
         repo.clone(),
@@ -823,6 +866,10 @@ pub async fn build_channel_state(
             )),
             tasks: services.worker_task_manager.clone(),
             sender: manager.clone(),
+            #[cfg(feature = "lark")]
+            gateway,
+            #[cfg(feature = "lark")]
+            gateway_repository,
         },
     ));
     let ingress: Arc<dyn aionui_channel::plugin::DurableChannelIngress> = feishu_bridge.clone();
@@ -856,7 +903,7 @@ pub async fn build_channel_state(
         feishu_bridge,
     };
 
-    (state, components)
+    Ok((state, components))
 }
 
 /// Backlog of assistant MCP binding changes held between the event bus and the

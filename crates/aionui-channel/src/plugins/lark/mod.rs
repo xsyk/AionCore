@@ -5,6 +5,7 @@ mod types;
 mod ws_session;
 
 pub use plugin::LarkPlugin;
+pub(crate) use types::{build_interactive_card, parse_lark_callback};
 
 #[cfg(test)]
 pub(crate) use frame::{METHOD_DATA, PbFrame, PbHeader};

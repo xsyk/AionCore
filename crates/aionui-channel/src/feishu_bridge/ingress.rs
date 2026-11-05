@@ -16,6 +16,12 @@ struct AcceptedIngress {
 #[async_trait::async_trait]
 impl DurableChannelIngress for FeishuBridge {
     async fn accept(&self, event: DurableIngressEvent) -> Result<(), ChannelError> {
+        #[cfg(feature = "lark")]
+        if self.deps.gateway.is_some() {
+            return Err(ChannelError::InvalidConfig(
+                "Direct Feishu ingress is disabled in gateway mode".into(),
+            ));
+        }
         if event.owner_user_id.is_empty() || event.app_id.is_empty() {
             return Err(ChannelError::InvalidConfig("Missing trusted connector identity".into()));
         }

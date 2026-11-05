@@ -25,6 +25,7 @@ use crate::types::{PluginConfig, PluginStatus, PluginType, UnifiedIncomingMessag
 /// Plugin instances are stored as `Box<dyn ChannelPlugin>` behind a
 /// `DashMap` for lock-free concurrent access.
 pub struct ChannelManager {
+    feishu_gateway_mode: bool,
     durable_ingress: RwLock<Option<Weak<dyn DurableChannelIngress>>>,
     repo: Arc<dyn IChannelRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
@@ -81,6 +82,7 @@ impl ChannelManager {
         confirm_tx: mpsc::Sender<(String, String)>,
     ) -> Self {
         Self {
+            feishu_gateway_mode: false,
             durable_ingress: RwLock::new(None),
             repo,
             broadcaster,
@@ -93,6 +95,12 @@ impl ChannelManager {
 
     pub fn set_durable_ingress(&self, ingress: Weak<dyn DurableChannelIngress>) {
         *self.durable_ingress.write().expect("ingress lock poisoned") = Some(ingress);
+    }
+
+    /// Select the shared gateway before any platform connections are started.
+    pub fn with_feishu_gateway_mode(mut self, enabled: bool) -> Self {
+        self.feishu_gateway_mode = enabled;
+        self
     }
 
     /// Returns the status of all registered plugins from the database.
@@ -133,6 +141,12 @@ impl ChannelManager {
     ) -> Result<(), ChannelError> {
         let plugin_type =
             PluginType::from_str_opt(plugin_id).ok_or_else(|| ChannelError::InvalidPluginType(plugin_id.to_owned()))?;
+
+        if self.feishu_gateway_mode && plugin_type == PluginType::Lark {
+            return Err(ChannelError::InvalidConfig(
+                "Feishu is managed by the shared gateway. Link a conversation from its connection panel.".into(),
+            ));
+        }
 
         // Resolve the effective config. The Settings re-enable toggle sends an
         // empty config and expects the previously stored credentials to be
@@ -316,6 +330,10 @@ impl ChannelManager {
         info!(owner_user_id = %owner_user_id, count = enabled.len(), "restoring enabled plugins");
 
         for row in enabled {
+            if self.feishu_gateway_mode && PluginType::from_str_opt(&row.r#type) == Some(PluginType::Lark) {
+                info!(plugin_id = %row.id, "shared Feishu gateway selected; direct client restore skipped");
+                continue;
+            }
             if PluginType::from_str_opt(&row.r#type).is_none() {
                 info!(
                     plugin_id = %row.id,
@@ -1042,6 +1060,42 @@ mod tests {
         let (confirm_tx, _confirm_rx) = mpsc::channel(16);
         let mgr = ChannelManager::new(repo.clone(), broadcaster.clone(), test_key(), msg_tx, confirm_tx);
         (mgr, repo, broadcaster)
+    }
+
+    #[tokio::test]
+    async fn gateway_mode_rejects_direct_lark_before_persisting_credentials() {
+        let (manager, repository, _) = make_manager();
+        let manager = manager.with_feishu_gateway_mode(true);
+        let error = manager
+            .enable_plugin(OWNER_ID, "lark", &make_test_config(), &make_factory())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ChannelError::InvalidConfig(ref message) if message.contains("shared gateway")));
+        assert!(repository.plugins.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_mode_skips_restoring_lark_and_preserves_other_channels() {
+        let (manager, repository, _) = make_manager();
+        let manager = manager.with_feishu_gateway_mode(true);
+        let encrypted = encrypt_string(&serde_json::to_string(&make_plugin_config()).unwrap(), &test_key()).unwrap();
+        for plugin_id in ["lark", "telegram"] {
+            repository.plugins.lock().unwrap().push(ChannelPluginRow {
+                id: plugin_id.into(),
+                owner_user_id: OWNER_ID.into(),
+                r#type: plugin_id.into(),
+                name: plugin_id.into(),
+                enabled: true,
+                config: encrypted.clone(),
+                status: Some("stopped".into()),
+                last_connected: None,
+                created_at: now_ms(),
+                updated_at: now_ms(),
+            });
+        }
+        manager.restore_plugins(OWNER_ID, &make_factory()).await.unwrap();
+        assert!(!manager.is_plugin_running(OWNER_ID, "lark"));
+        assert!(manager.is_plugin_running(OWNER_ID, "telegram"));
     }
 
     fn make_test_config() -> serde_json::Value {

@@ -12,7 +12,7 @@ use crate::types::{ActionButton, UnifiedAction, UnifiedIncomingMessage};
 
 const INTERACTION_TTL_MS: i64 = 30 * 60 * 1000;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct Question {
     text: String,
     options: Vec<String>,
@@ -20,13 +20,13 @@ pub(super) struct Question {
     selected: Vec<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) enum InteractionKind {
     Permission(Vec<(String, Value)>),
     Ask(Vec<Question>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct PendingInteraction {
     pub binding: FeishuBindingRow,
     pub request_id: String,
@@ -208,15 +208,21 @@ impl FeishuBridge {
     }
 
     async fn register_interaction(&self, pending: PendingInteraction) -> Result<(), ChannelError> {
+        #[cfg(feature = "lark")]
+        if self.deps.gateway.is_some() {
+            self.restore_gateway_interactions().await?;
+        }
+        self.expire_interactions().await?;
         let mut interactions = self.interactions.lock().await;
-        interactions.retain(|_, pending| pending.expires_at > now_ms());
         if interactions
             .values()
             .any(|current| current.binding.id == pending.binding.id && current.request_id == pending.request_id)
         {
             return Ok(());
         }
-        interactions.insert(random_token()?, pending);
+        let token = random_token()?;
+        self.persist_interaction(&token, &pending).await?;
+        interactions.insert(token, pending);
         Ok(())
     }
 
@@ -251,6 +257,7 @@ impl FeishuBridge {
                 .ok()
                 .flatten();
             if current.as_ref().map(|row| row.id.as_str()) != Some(pending.binding.id.as_str()) {
+                let _ = self.delete_persisted_interaction(&token).await;
                 self.interactions.lock().await.remove(&token);
                 continue;
             }
@@ -260,14 +267,10 @@ impl FeishuBridge {
             let mut prefixes_delivered = true;
             for (index, part) in parts.into_iter().enumerate() {
                 if self
-                    .deps
-                    .sender
-                    .send_message_idempotent(
-                        &pending.binding.connector_user_id,
-                        "lark",
-                        &pending.binding.chat_id,
+                    .send_bound_message(
+                        &pending.binding,
                         outgoing(&part, None),
-                        &format!("{token}-prefix-{index}"),
+                        Some(&format!("{token}-prefix-{index}")),
                     )
                     .await
                     .is_err()
@@ -280,20 +283,22 @@ impl FeishuBridge {
                 continue;
             }
             card.text = Some(last);
-            if let Ok(id) = self
-                .deps
-                .sender
-                .send_message_idempotent(
-                    &pending.binding.connector_user_id,
-                    "lark",
-                    &pending.binding.chat_id,
-                    card,
-                    &format!("{token}-card"),
-                )
-                .await
-                && let Some(current) = self.interactions.lock().await.get_mut(&token)
-            {
-                current.message_id = Some(id);
+            if let Ok(id) = self.send_interaction_card(&pending, &token, card).await {
+                let updated = {
+                    let mut interactions = self.interactions.lock().await;
+                    interactions.get_mut(&token).map(|current| {
+                        current.message_id = Some(id);
+                        current.clone()
+                    })
+                };
+                if let Some(updated) = updated
+                    && self.persist_interaction(&token, &updated).await.is_err()
+                {
+                    tracing::warn!(
+                        code = "GATEWAY_INTERACTION_PERSIST_FAILED",
+                        "feishu: card receipt will recover using its stable idempotency key"
+                    );
+                }
             }
         }
     }
@@ -333,22 +338,21 @@ impl FeishuBridge {
                         question.selected = vec![label];
                     }
                 }
+                if pending.message_id.is_none() {
+                    pending.message_id = message
+                        .action
+                        .as_ref()
+                        .and_then(|action| action.context.message_id.clone());
+                }
                 pending.clone()
             };
+            self.persist_interaction(token, &updated).await?;
             if let Some(message_id) = message
                 .action
                 .as_ref()
                 .and_then(|action| action.context.message_id.as_deref())
             {
-                self.deps
-                    .sender
-                    .edit_message(
-                        &binding.connector_user_id,
-                        "lark",
-                        &binding.chat_id,
-                        message_id,
-                        updated.card(token),
-                    )
+                self.edit_bound_message(binding, message_id, updated.card(token))
                     .await?;
             }
             return Ok(());
@@ -386,9 +390,16 @@ impl FeishuBridge {
                 self.send_text(binding, "请先为每个问题选择答案，再提交。").await?;
                 return Ok(());
             };
-            let pending = interactions.remove(token).expect("checked above while holding mutex");
+            let mut pending = interactions.remove(token).expect("checked above while holding mutex");
+            if pending.message_id.is_none() {
+                pending.message_id = message
+                    .action
+                    .as_ref()
+                    .and_then(|action| action.context.message_id.clone());
+            }
             (pending, response)
         };
+        self.delete_persisted_interaction(token).await?;
         self.deliver_interaction(token, pending, response).await
     }
 
@@ -443,6 +454,7 @@ impl FeishuBridge {
             let pending = interactions.remove(token).expect("checked above while holding mutex");
             (pending, answers)
         };
+        self.delete_persisted_interaction(token).await?;
         self.deliver_interaction(token, pending, InteractionResponse::Ask(Some(answers)))
             .await
     }
@@ -511,20 +523,13 @@ impl FeishuBridge {
             Ok(()) => {
                 if let Some(message_id) = pending.message_id.as_deref() {
                     let _ = self
-                        .deps
-                        .sender
-                        .edit_message(
-                            &binding.connector_user_id,
-                            "lark",
-                            &binding.chat_id,
-                            message_id,
-                            outgoing("该事项已处理。", None),
-                        )
+                        .edit_bound_message(binding, message_id, outgoing("该事项已处理。", None))
                         .await;
                 }
                 Ok(())
             }
             Err(error) => {
+                self.persist_interaction(token, &pending).await?;
                 self.interactions.lock().await.insert(token.into(), pending);
                 Err(ChannelError::MessageSendFailed(error.to_string()))
             }
@@ -534,6 +539,136 @@ impl FeishuBridge {
     async fn send_expired(&self, binding: &FeishuBindingRow) -> Result<(), ChannelError> {
         self.send_text(binding, "该事项已处理、已过期，或会话绑定已变更。")
             .await?;
+        Ok(())
+    }
+}
+
+impl FeishuBridge {
+    async fn send_interaction_card(
+        &self,
+        pending: &PendingInteraction,
+        token: &str,
+        card: crate::types::UnifiedOutgoingMessage,
+    ) -> Result<String, ChannelError> {
+        #[cfg(feature = "lark")]
+        if self.deps.gateway.is_some() {
+            return self
+                .send_gateway_message(
+                    &pending.binding,
+                    card,
+                    Some(&format!("{token}-card")),
+                    Some(crate::gateway::GatewayInteraction {
+                        id: token.into(),
+                        request_id: pending.request_id.clone(),
+                        kind: if matches!(&pending.kind, InteractionKind::Ask(_)) {
+                            "ask"
+                        } else {
+                            "permission"
+                        }
+                        .into(),
+                        expires_at: pending.expires_at,
+                    }),
+                )
+                .await;
+        }
+        self.send_bound_message(&pending.binding, card, Some(&format!("{token}-card")))
+            .await
+    }
+
+    async fn persist_interaction(&self, token: &str, pending: &PendingInteraction) -> Result<(), ChannelError> {
+        let _ = (token, pending);
+        #[cfg(feature = "lark")]
+        if self.deps.gateway.is_some() {
+            self.gateway_repository()?
+                .save_interaction(
+                    token,
+                    &pending.binding.id,
+                    &serde_json::to_string(pending)?,
+                    pending.expires_at,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_persisted_interaction(&self, token: &str) -> Result<(), ChannelError> {
+        let _ = token;
+        #[cfg(feature = "lark")]
+        if self.deps.gateway.is_some() {
+            self.gateway_repository()?.delete_interaction(token).await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn discard_conversation_interactions(
+        &self,
+        conversation: &str,
+        request: Option<&str>,
+    ) -> Result<(), ChannelError> {
+        let tokens: Vec<_> = self
+            .interactions
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, pending)| {
+                pending.binding.conversation_id == conversation
+                    && request.is_none_or(|request| pending.request_id == request)
+            })
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in tokens {
+            self.delete_persisted_interaction(&token).await?;
+            self.interactions.lock().await.remove(&token);
+        }
+        Ok(())
+    }
+
+    pub(super) async fn expire_interactions(&self) -> Result<(), ChannelError> {
+        let tokens: Vec<_> = self
+            .interactions
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, pending)| pending.expires_at <= now_ms())
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in tokens {
+            self.delete_persisted_interaction(&token).await?;
+            self.interactions.lock().await.remove(&token);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "lark")]
+    pub(super) async fn discard_gateway_interaction(&self, token: &str) -> Result<(), ChannelError> {
+        self.delete_persisted_interaction(token).await?;
+        self.interactions.lock().await.remove(token);
+        Ok(())
+    }
+
+    #[cfg(feature = "lark")]
+    pub(super) async fn restore_gateway_interactions(&self) -> Result<(), ChannelError> {
+        let mut restored = self.gateway_restored.lock().await;
+        if *restored {
+            return Ok(());
+        }
+        for row in self.gateway_repository()?.list_interactions(now_ms()).await? {
+            let pending: PendingInteraction = serde_json::from_str(&row.payload)?;
+            let current = self
+                .deps
+                .bindings
+                .get_by_conversation(&pending.binding.owner_user_id, &pending.binding.conversation_id)
+                .await?;
+            if pending.binding.id != row.binding_id
+                || pending.expires_at != row.expires_at
+                || current.as_ref().map(|binding| &binding.id) != Some(&row.binding_id)
+            {
+                self.gateway_repository()?.delete_interaction(&row.token).await?;
+                continue;
+            }
+            self.interactions.lock().await.entry(row.token).or_insert(pending);
+        }
+        *restored = true;
         Ok(())
     }
 }

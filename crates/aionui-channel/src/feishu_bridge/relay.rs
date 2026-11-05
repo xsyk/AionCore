@@ -43,18 +43,42 @@ impl FeishuBridge {
                     warn!(error = %error, "feishu: pending delivery retained for retry");
                 }
                 self.flush_interactions().await;
-                self.interactions
-                    .lock()
-                    .await
-                    .retain(|_, pending| pending.expires_at > now_ms());
+                if self.expire_interactions().await.is_err() {
+                    warn!(
+                        code = "FEISHU_INTERACTION_CLEANUP_FAILED",
+                        "feishu: expired interaction cleanup will retry"
+                    );
+                }
             }
         };
         // Dropping either future on shutdown also cancels its in-flight request;
         // a future restart retries the durable queue using the same request ID.
+        #[cfg(feature = "lark")]
+        {
+            let gateway = async {
+                if self.deps.gateway.is_none() {
+                    std::future::pending::<()>().await;
+                }
+                let mut tick = tokio::time::interval(Duration::from_millis(750));
+                loop {
+                    tick.tick().await;
+                    if self.flush_gateway().await.is_err() {
+                        warn!(
+                            code = "GATEWAY_SYNC_FAILED",
+                            "feishu: gateway synchronization will retry"
+                        );
+                    }
+                }
+            };
+            tokio::select! { _ = consume => {}, _ = deliver => {}, _ = gateway => {} }
+        }
+        #[cfg(not(feature = "lark"))]
         tokio::select! { _ = consume => {}, _ = deliver => {} }
     }
 
     pub async fn handle_event(&self, event: WebSocketMessage<Value>) -> Result<(), ChannelError> {
+        #[cfg(feature = "lark")]
+        self.ensure_gateway_identity().await?;
         if !matches!(
             event.name.as_str(),
             "message.stream" | "turn.completed" | "confirmation.remove"
@@ -78,17 +102,15 @@ impl FeishuBridge {
         let Some(binding) = self.deps.bindings.get_by_conversation(owner, conversation).await? else {
             return Ok(());
         };
+        #[cfg(feature = "lark")]
+        if !self.gateway_binding_active(&binding.id).await? {
+            return Ok(());
+        }
         if event.name == "confirmation.remove" {
             let id = event.data.get("id").and_then(Value::as_str).unwrap_or_default();
-            self.interactions
-                .lock()
-                .await
-                .retain(|_, pending| pending.binding.conversation_id != conversation || pending.request_id != id);
+            self.discard_conversation_interactions(conversation, Some(id)).await?;
         } else if event.name == "turn.completed" {
-            self.interactions
-                .lock()
-                .await
-                .retain(|_, pending| pending.binding.conversation_id != conversation);
+            self.discard_conversation_interactions(conversation, None).await?;
         } else {
             let msg_id = event.data.get("msg_id").and_then(Value::as_str).unwrap_or_default();
             let data = &event.data["data"];
@@ -122,12 +144,20 @@ impl FeishuBridge {
     }
 
     pub(super) async fn flush_deliveries(&self) -> Result<(), ChannelError> {
+        #[cfg(feature = "lark")]
+        self.ensure_gateway_identity().await?;
         let _delivery = self.delivery_lock.lock().await;
         #[cfg(feature = "lark")]
-        self.flush_ingress().await?;
+        if self.deps.gateway.is_none() {
+            self.flush_ingress().await?;
+        }
         self.flush_inbox().await?;
         let bindings = self.deps.bindings.list_bindings().await?;
         for binding in &bindings {
+            #[cfg(feature = "lark")]
+            if !self.gateway_binding_active(&binding.id).await? {
+                continue;
+            }
             let before = self
                 .deps
                 .conversations
@@ -172,11 +202,18 @@ impl FeishuBridge {
                 self.deps.bindings.enqueue_outbox(&rows).await?;
             }
         }
-        let parked = self
-            .deps
-            .bindings
-            .park_expired_outbox(now_ms() - 55 * 60 * 1000)
-            .await?;
+        #[cfg(feature = "lark")]
+        let park_all = self.deps.gateway.is_none();
+        #[cfg(not(feature = "lark"))]
+        let park_all = true;
+        let parked = if park_all {
+            self.deps
+                .bindings
+                .park_expired_outbox(now_ms() - 55 * 60 * 1000)
+                .await?
+        } else {
+            0
+        };
         if parked > 0 {
             warn!(
                 parked,
@@ -191,12 +228,17 @@ impl FeishuBridge {
             let Some(binding) = bindings.iter().find(|binding| binding.id == row.binding_id) else {
                 continue;
             };
-            // uuid deduplication is documented by Feishu for one hour only.
-            // Unknown outcomes beyond that bound remain pending for inspection;
-            // blindly resending would be a duplicate. Never mark them delivered.
-            if row
-                .first_attempt_at
-                .is_some_and(|time| now_ms().saturating_sub(time) >= 55 * 60 * 1000)
+            #[cfg(feature = "lark")]
+            if !self.gateway_binding_active(&binding.id).await? {
+                continue;
+            }
+            // The legacy provider UUID expires after one hour. Gateway retries
+            // use its durable key and provider attempt time: a local attempt may
+            // have failed before the gateway received anything.
+            if park_all
+                && row
+                    .first_attempt_at
+                    .is_some_and(|time| now_ms().saturating_sub(time) >= 55 * 60 * 1000)
             {
                 warn!(delivery_id = %row.id, conversation_id = %binding.conversation_id, "feishu: delivery outcome unknown beyond idempotency window; retained for inspection");
                 self.deps.bindings.park_outbox(&row.id).await?;
@@ -225,15 +267,7 @@ impl FeishuBridge {
             }
             self.deps.bindings.start_outbox_attempt(&row.id, now_ms()).await?;
             match self
-                .deps
-                .sender
-                .send_message_idempotent(
-                    &binding.connector_user_id,
-                    "lark",
-                    &binding.chat_id,
-                    outgoing(&row.content, None),
-                    &row.id,
-                )
+                .send_bound_message(binding, outgoing(&row.content, None), Some(&row.id))
                 .await
             {
                 Ok(id) => self.deps.bindings.complete_outbox(&row.id, &id).await?,
@@ -247,11 +281,17 @@ impl FeishuBridge {
     }
 
     pub(super) async fn flush_inbox(&self) -> Result<(), ChannelError> {
+        #[cfg(feature = "lark")]
+        self.ensure_gateway_identity().await?;
         let bindings = self.deps.bindings.list_bindings().await?;
         for row in self.deps.bindings.pending_inbox().await? {
             let Some(binding) = bindings.iter().find(|binding| binding.id == row.binding_id) else {
                 continue;
             };
+            #[cfg(feature = "lark")]
+            if !self.gateway_binding_active(&binding.id).await? {
+                continue;
+            }
             let lock = self
                 .conversation_locks
                 .entry(binding.conversation_id.clone())
@@ -295,6 +335,8 @@ impl FeishuBridge {
                 self.deps.bindings.complete_inbox(&row.id).await?;
                 continue;
             }
+            #[cfg(feature = "lark")]
+            self.ensure_gateway_identity().await?;
             self.deps
                 .bindings
                 .start_inbox_attempt(&row.id, &self.process_epoch)

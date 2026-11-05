@@ -1,0 +1,35 @@
+{
+  "source": {
+    "commit": "9251f2ca8fa68786ef8753218c6e488f063efe76",
+    "manifest_sha256": "40a44484bc5276bf5817e113d4b4cf1bd17f5154e9567b39324adcf6bc9f0280",
+    "verified_source_files": 62,
+    "binary_sha256": "795d9df3a67d442986bda6da49ab95807c28eca459bd0ae5f2ddb8554af0c5a9",
+    "go_version": "go version go1.27.3 darwin/arm64",
+    "binary_version": "contract-capture-9251f2c",
+    "mode": "offline",
+    "capture": "actual loopback HTTP using fresh SQLite; body strings are byte-for-byte responses"
+  },
+  "responses": [
+    {
+      "name": "prepare",
+      "method": "GET",
+      "path": "/api/node/deliveries?limit=8",
+      "status": 200,
+      "body": "{\"deliveries\":[{\"id\":\"d_23fd5594dc962534514e9733ebfaa101\",\"node_id\":\"node_b1d11a209dbe7c9b988e5db0d4f57bcf\",\"kind\":\"binding.prepare\",\"route\":{\"id\":\"r_ed3db0568922942e3df608a2f1aaac86\",\"generation\":\"g_4304f1ede26fcf8fad69129cf2d6cc7f\",\"app_id\":\"cli_offline\",\"tenant_key\":\"offline\",\"chat_id\":\"capture-chat\",\"chat_type\":\"group\",\"node_id\":\"node_b1d11a209dbe7c9b988e5db0d4f57bcf\",\"conversation_id\":\"capture-conversation\",\"owner_union_id\":\"capture-owner-union\",\"status\":\"preparing\",\"created_at\":1793887465365},\"event\":{\"id\":\"capture-bind-event\",\"kind\":\"message\",\"app_id\":\"cli_offline\",\"tenant_key\":\"offline\",\"actor_union_id\":\"capture-owner-union\",\"actor_open_id\":\"capture-owner-open\",\"actor_type\":\"user\",\"chat_id\":\"capture-chat\",\"chat_type\":\"group\",\"mentioned_bot\":true,\"text\":\"/bind 93aa656b7a6166b5b00205ab67a43452\",\"occurred_at\":1793887465365},\"created_at\":1793887465365}]}\n"
+    },
+    {
+      "name": "answer",
+      "method": "GET",
+      "path": "/api/node/deliveries?limit=8",
+      "status": 200,
+      "body": "{\"deliveries\":[{\"id\":\"d_4abf1a3b14ee0b73ee4f992d64ae15ee\",\"node_id\":\"node_b1d11a209dbe7c9b988e5db0d4f57bcf\",\"kind\":\"interaction\",\"route\":{\"id\":\"r_ed3db0568922942e3df608a2f1aaac86\",\"generation\":\"g_4304f1ede26fcf8fad69129cf2d6cc7f\",\"app_id\":\"cli_offline\",\"tenant_key\":\"offline\",\"chat_id\":\"capture-chat\",\"chat_type\":\"group\",\"node_id\":\"node_b1d11a209dbe7c9b988e5db0d4f57bcf\",\"conversation_id\":\"capture-conversation\",\"owner_union_id\":\"capture-owner-union\",\"status\":\"active\",\"prepared_at\":1793887465367,\"created_at\":1793887465365},\"event\":{\"id\":\"capture-answer-event\",\"kind\":\"interaction\",\"app_id\":\"cli_offline\",\"tenant_key\":\"offline\",\"actor_union_id\":\"capture-owner-union\",\"actor_open_id\":\"capture-owner-open\",\"actor_type\":\"user\",\"chat_id\":\"capture-chat\",\"chat_type\":\"group\",\"mentioned_bot\":true,\"text\":\"/answer capture-interaction A\",\"interaction_id\":\"capture-interaction\",\"action\":\"answer\",\"occurred_at\":1793887465871},\"created_at\":1793887465872,\"expires_at\":1793887525367}]}\n"
+    },
+    {
+      "name": "revoke",
+      "method": "GET",
+      "path": "/api/node/deliveries?limit=8",
+      "status": 200,
+      "body": "{\"deliveries\":[{\"id\":\"d_793951bfd9b475a16feb82cb7e25d23c\",\"node_id\":\"node_b1d11a209dbe7c9b988e5db0d4f57bcf\",\"kind\":\"binding.revoke\",\"route\":{\"id\":\"r_ed3db0568922942e3df608a2f1aaac86\",\"generation\":\"g_4304f1ede26fcf8fad69129cf2d6cc7f\",\"app_id\":\"cli_offline\",\"tenant_key\":\"offline\",\"chat_id\":\"capture-chat\",\"chat_type\":\"group\",\"node_id\":\"node_b1d11a209dbe7c9b988e5db0d4f57bcf\",\"conversation_id\":\"capture-conversation\",\"owner_union_id\":\"capture-owner-union\",\"status\":\"revoking\",\"prepared_at\":1793887465367,\"created_at\":1793887465365},\"created_at\":1793887465878}]}\n"
+    }
+  ]
+}

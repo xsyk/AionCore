@@ -7,6 +7,8 @@ pub mod constants;
 pub mod error;
 pub mod feishu_bridge;
 pub mod formatter;
+#[cfg(feature = "lark")]
+pub mod gateway;
 pub mod manager;
 pub mod message_service;
 pub mod orchestrator;

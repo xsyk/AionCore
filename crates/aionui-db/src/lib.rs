@@ -74,3 +74,4 @@ pub use repository::{IConversationShareRepository, SqliteConversationShareReposi
 pub use sqlx::SqlitePool;
 
 pub use repository::{IFeishuBindingRepository, SqliteFeishuBindingRepository};
+pub use repository::{IFeishuGatewayRepository, SqliteFeishuGatewayRepository};

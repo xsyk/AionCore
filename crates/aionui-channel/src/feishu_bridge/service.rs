@@ -93,6 +93,18 @@ impl FeishuBridge {
             binding_management_lock: Mutex::new(()),
             process_epoch: aionui_common::generate_id(),
             conversation_locks: dashmap::DashMap::new(),
+            #[cfg(feature = "lark")]
+            gateway_restored: Mutex::new(false),
+            #[cfg(feature = "lark")]
+            gateway_attempts: Mutex::new(HashMap::new()),
+            #[cfg(feature = "lark")]
+            gateway_auth_rejected: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "lark")]
+            gateway_identity_checked: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "lark")]
+            gateway_reconcile_cursor: Mutex::new(0),
+            #[cfg(feature = "lark")]
+            gateway_settled_routes: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -113,6 +125,10 @@ impl FeishuBridge {
 
     pub async fn status(&self, owner: &str, conversation: &str) -> Result<FeishuBindingStatus, ChannelError> {
         self.ensure_owner(owner, conversation).await?;
+        #[cfg(feature = "lark")]
+        if self.deps.gateway.is_some() {
+            return self.gateway_binding_status(owner, conversation).await;
+        }
         let binding = self.deps.bindings.get_by_conversation(owner, conversation).await?;
         Ok(FeishuBindingStatus {
             binding: binding.map(|row| FeishuConversationBinding {
@@ -154,7 +170,8 @@ impl FeishuBridge {
         if user.status != UserStatus::Active {
             return Err(ChannelError::UserNotAuthorized("Account is disabled".into()));
         }
-        self.deps
+        let login = self
+            .deps
             .login_config
             .get()
             .await?
@@ -162,6 +179,38 @@ impl FeishuBridge {
             .ok_or_else(|| {
                 ChannelError::InvalidConfig("Configure Feishu login and the allowed enterprise first".into())
             })?;
+        #[cfg(feature = "lark")]
+        if let Some(gateway) = &self.deps.gateway {
+            self.ensure_gateway_identity().await?;
+            if login.app_id != gateway.app_id() || login.tenant_key.as_deref() != Some(gateway.tenant_key()) {
+                return Err(ChannelError::InvalidConfig(
+                    "Gateway application identity does not match Feishu login".into(),
+                ));
+            }
+            let union = user
+                .external_user_id
+                .as_deref()
+                .and_then(|id| id.strip_prefix("feishu:"))
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| ChannelError::UserNotAuthorized("Feishu identity is unavailable".into()))?;
+            let intent = gateway.create_intent(conversation, union).await.inspect_err(|error| {
+                self.note_gateway_auth_error(error);
+            })?;
+            if intent.node_id != gateway.node_id()
+                || intent.conversation_id != conversation
+                || intent.owner_union_id != union
+            {
+                return Err(ChannelError::InvalidConfig(
+                    "Gateway binding response identity mismatch".into(),
+                ));
+            }
+            return Ok(FeishuBindingCode {
+                bind_code: intent.code,
+                expires_at: intent.expires_at,
+            });
+        }
+        #[cfg(not(feature = "lark"))]
+        let _ = login;
         let bind_code = random_token()?;
         let expires_at = now_ms() + BINDING_TTL_MS;
         self.deps
@@ -182,6 +231,10 @@ impl FeishuBridge {
     }
 
     pub async fn unbind(&self, owner: &str, conversation: &str) -> Result<(), ChannelError> {
+        #[cfg(feature = "lark")]
+        if self.deps.gateway.is_some() {
+            return self.gateway_unbind(owner, conversation).await;
+        }
         self.unbind_generation(owner, conversation, None).await
     }
 
@@ -212,10 +265,7 @@ impl FeishuBridge {
             return Ok(());
         }
         self.deps.bindings.delete_binding(owner, conversation).await?;
-        self.interactions
-            .lock()
-            .await
-            .retain(|_, pending| pending.binding.conversation_id != conversation);
+        self.discard_conversation_interactions(conversation, None).await?;
         info!(
             owner_user_id = owner,
             conversation_id = conversation,
@@ -247,6 +297,14 @@ impl FeishuBridge {
     pub async fn handle_incoming(&self, message: &UnifiedIncomingMessage) -> bool {
         if message.platform != PluginType::Lark {
             return false;
+        }
+        #[cfg(feature = "lark")]
+        if self.deps.gateway.is_some() {
+            tracing::warn!(
+                code = "FEISHU_DIRECT_INGRESS_DISABLED",
+                "feishu: direct ingress rejected in gateway mode"
+            );
+            return true;
         }
         let Some(identity) = FeishuIdentity::from_message(message) else {
             return message
@@ -438,13 +496,50 @@ impl FeishuBridge {
     }
 
     pub(super) async fn send_text(&self, binding: &FeishuBindingRow, text: &str) -> Result<String, ChannelError> {
+        self.send_bound_message(binding, outgoing(text, None), None).await
+    }
+
+    pub(super) async fn send_bound_message(
+        &self,
+        binding: &FeishuBindingRow,
+        message: UnifiedOutgoingMessage,
+        key: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        #[cfg(feature = "lark")]
+        if self.deps.gateway.is_some() {
+            return self.send_gateway_message(binding, message, key, None).await;
+        }
+        if let Some(key) = key {
+            return self
+                .deps
+                .sender
+                .send_message_idempotent(&binding.connector_user_id, "lark", &binding.chat_id, message, key)
+                .await;
+        }
         self.deps
             .sender
-            .send_message(
+            .send_message(&binding.connector_user_id, "lark", &binding.chat_id, message)
+            .await
+    }
+
+    pub(super) async fn edit_bound_message(
+        &self,
+        binding: &FeishuBindingRow,
+        message_id: &str,
+        message: UnifiedOutgoingMessage,
+    ) -> Result<(), ChannelError> {
+        #[cfg(feature = "lark")]
+        if self.deps.gateway.is_some() {
+            return self.edit_gateway_message(binding, message_id, message).await;
+        }
+        self.deps
+            .sender
+            .edit_message(
                 &binding.connector_user_id,
                 "lark",
                 &binding.chat_id,
-                outgoing(text, None),
+                message_id,
+                message,
             )
             .await
     }

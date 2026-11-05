@@ -32,6 +32,18 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     ),
     ("feishu_inbox", "binding_id", "feishu_conversation_bindings"),
     ("feishu_outbox", "binding_id", "feishu_conversation_bindings"),
+    ("feishu_gateway_baseline_messages", "route_id", "feishu_gateway_routes"),
+    // Delivery audit rows intentionally outlive bindings, and a prepare can
+    // precede its local route projection. Their owner is still the route's
+    // conversation owner; serialized remote identities are never Core IDs.
+    ("feishu_gateway_deliveries", "route_id", "feishu_gateway_routes"),
+    // The relational owner follows the binding. Its serialized binding has
+    // additional Core-owner aliases, explicitly rekeyed and tested below.
+    (
+        "feishu_gateway_interactions",
+        "binding_id",
+        "feishu_conversation_bindings",
+    ),
     ("mailbox", "team_id", "teams"),
     ("messages", "conversation_id", "conversations"),
     ("team_tasks", "team_id", "teams"),
@@ -47,6 +59,12 @@ const GLOBAL_TABLES: &[(&str, &str)] = &[
     ("feishu_login_config", "machine-wide feishu login settings"),
     // Only immutable app/message replay keys; no user identity or message body.
     ("feishu_message_receipts", "app-scoped transport deduplication registry"),
+    // This is the machine's node/app/tenant credential pin, with no Core-user
+    // principal or message content. Adopting a user must not re-register a node.
+    (
+        "feishu_gateway_identity",
+        "machine node/application/tenant identity pin",
+    ),
     // Server-wide settings managed by the super admin (e.g. the image
     // generation model), shared by every user rather than owned by one.
     ("global_settings", "server-wide settings, not owned by any user"),
@@ -654,4 +672,220 @@ async fn adoption_does_not_retarget_a_connector_when_its_plugin_was_not_adopted(
         .unwrap();
     assert_eq!(config, "sealed-existing-config");
     db.close().await;
+}
+
+async fn seed_gateway_adoption_graph(pool: &sqlx::SqlitePool) -> String {
+    sqlx::raw_sql(
+        "INSERT INTO conversations(id,user_id,name,type,created_at,updated_at) VALUES('gateway-shared','system_default_user','Gateway','acp',1,1),('gateway-other','other-local','Other gateway','acp',1,1),('gateway-prepared','system_default_user','Prepared gateway','acp',1,1);
+         INSERT INTO feishu_gateway_identity(id,node_id,app_id,tenant_key) VALUES(1,'node-fixed','gateway-app','gateway-tenant');
+         INSERT INTO feishu_gateway_routes(route_id,generation,node_id,conversation_id,owner_user_id,owner_union_id,app_id,tenant_key,chat_id,chat_type,status,prepared_at) VALUES('r-adopt','g-adopt','node-fixed','gateway-shared','system_default_user','platform-union-adopt','gateway-app','gateway-tenant','gateway-chat','group','active',1),('r-other','g-other','node-fixed','gateway-other','other-local','platform-union-other','gateway-app','gateway-tenant','gateway-other-chat','group','active',1),('r-prepared','g-prepared','node-fixed','gateway-prepared','system_default_user','platform-union-prepared','gateway-app','gateway-tenant','gateway-prepared-chat','group','prepared',1);
+         INSERT INTO feishu_conversation_bindings(id,conversation_id,owner_user_id,connector_user_id,app_id,tenant_key,chat_id,chat_type,bound_at) VALUES('g-adopt','gateway-shared','system_default_user','system_default_user','gateway-app','gateway-tenant','gateway-chat','group',1),('g-other','gateway-other','other-local','other-local','gateway-app','gateway-tenant','gateway-other-chat','group',1);
+         INSERT INTO feishu_gateway_baseline_messages(route_id,message_id) VALUES('r-adopt','system_default_user-is-a-message-id'),('r-prepared','prepared-baseline');"
+    ).execute(pool).await.unwrap();
+    let delivery = serde_json::json!({
+        "id": "gateway-input", "kind": "message",
+        "route": {"id": "r-adopt", "generation": "g-adopt", "owner_union_id": "platform-union-adopt"},
+        "event": {"text": "system_default_user is literal platform text", "actor_union_id": "platform-participant"}
+    })
+    .to_string();
+    sqlx::query("INSERT INTO feishu_gateway_deliveries(id,route_id,generation,kind,payload,attempt_epoch) VALUES('gateway-input','r-adopt','g-adopt','message',?,'original-epoch')")
+        .bind(&delivery).execute(pool).await.unwrap();
+    for (token, generation, conversation, owner, chat) in [
+        (
+            "gateway-card",
+            "g-adopt",
+            "gateway-shared",
+            "system_default_user",
+            "gateway-chat",
+        ),
+        (
+            "other-gateway-card",
+            "g-other",
+            "gateway-other",
+            "other-local",
+            "gateway-other-chat",
+        ),
+    ] {
+        let payload = serde_json::json!({
+            "binding": {"id":generation,"conversation_id":conversation,"owner_user_id":owner,"connector_user_id":owner,"app_id":"gateway-app","tenant_key":"gateway-tenant","chat_id":chat,"chat_type":"group","bound_at":1},
+            "request_id":"native-question", "msg_id":"message", "expires_at":9999,
+            "kind":{"Ask":[{"text":"system_default_user is a literal question","options":["A","B"],"multiple":true,"selected":["A"]}]},
+            "title":"system_default_user is literal card text", "message_id":"om-original"
+        });
+        sqlx::query("INSERT INTO feishu_gateway_interactions(token,binding_id,payload,expires_at) VALUES(?,?,?,9999)")
+            .bind(token)
+            .bind(generation)
+            .bind(payload.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    let mismatched: String =
+        sqlx::query_scalar("SELECT payload FROM feishu_gateway_interactions WHERE token='gateway-card'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let mut mismatched: serde_json::Value = serde_json::from_str(&mismatched).unwrap();
+    mismatched["binding"]["id"] = serde_json::json!("g-other");
+    sqlx::query("INSERT INTO feishu_gateway_interactions(token,binding_id,payload,expires_at) VALUES('mismatched-card','g-adopt',?,9999),('malformed-card','g-adopt','not-json',9999)")
+        .bind(mismatched.to_string()).execute(pool).await.unwrap();
+    delivery
+}
+
+#[tokio::test]
+async fn gateway_adoption_rekeys_only_correlated_core_aliases_without_a_direct_lark_connector() {
+    use aionui_db::{
+        IFeishuBindingRepository, IFeishuGatewayRepository, SqliteFeishuBindingRepository,
+        SqliteFeishuGatewayRepository,
+    };
+
+    // Gateway connector keys are local owners, independently of whether an
+    // obsolete direct Lark plugin exists or can be adopted.
+    for colliding_lark_plugin in [false, true] {
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool();
+        seed_feishu_adoption_graph(pool).await;
+        let original_delivery = seed_gateway_adoption_graph(pool).await;
+        let repository = SqliteUserRepository::new(pool.clone());
+        let user = repository
+            .ensure_external_user(UserType::Aionpro, "gateway-adopter", ExternalUserProjection::default())
+            .await
+            .unwrap();
+        if colliding_lark_plugin {
+            sqlx::query("INSERT INTO assistant_plugins(id,owner_user_id,type,name,enabled,config,created_at,updated_at) VALUES('lark',?,'lark','Existing bot',1,'sealed-existing-config',1,1)")
+                .bind(&user.id).execute(pool).await.unwrap();
+        } else {
+            sqlx::query("DELETE FROM assistant_plugins WHERE id='lark' AND owner_user_id='system_default_user'")
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        let mismatched_before: String =
+            sqlx::query_scalar("SELECT payload FROM feishu_gateway_interactions WHERE token='mismatched-card'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        repository.adopt_system_default_data(&user.id).await.unwrap();
+        let gateway = SqliteFeishuGatewayRepository::new(pool.clone());
+        let bindings = SqliteFeishuBindingRepository::new(pool.clone());
+        let adopted = gateway.route_by_generation("g-adopt").await.unwrap().unwrap();
+        assert_eq!(adopted.owner_user_id, user.id);
+        assert_eq!(adopted.owner_union_id, "platform-union-adopt");
+        let binding = bindings
+            .get_by_conversation(&user.id, "gateway-shared")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            binding.connector_user_id, user.id,
+            "gateway aliases must move even if the old direct plugin cannot"
+        );
+        assert_eq!(
+            gateway
+                .route_by_generation("g-other")
+                .await
+                .unwrap()
+                .unwrap()
+                .owner_user_id,
+            "other-local"
+        );
+        assert_eq!(
+            bindings
+                .get_by_conversation("other-local", "gateway-other")
+                .await
+                .unwrap()
+                .unwrap()
+                .connector_user_id,
+            "other-local"
+        );
+
+        let snapshots = gateway.list_interactions(100).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_str(
+            &snapshots
+                .iter()
+                .find(|row| row.token == "gateway-card")
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(payload["binding"]["owner_user_id"], user.id);
+        assert_eq!(payload["binding"]["connector_user_id"], user.id);
+        assert_eq!(payload["binding"]["id"], "g-adopt");
+        assert_eq!(payload["message_id"], "om-original");
+        assert_eq!(payload["title"], "system_default_user is literal card text");
+        assert_eq!(payload["kind"]["Ask"][0]["selected"], serde_json::json!(["A"]));
+        let restored = bindings
+            .get_by_conversation(
+                payload["binding"]["owner_user_id"].as_str().unwrap(),
+                payload["binding"]["conversation_id"].as_str().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.unwrap().id,
+            "g-adopt",
+            "the restored snapshot must resolve its adopted binding"
+        );
+        let other: serde_json::Value = serde_json::from_str(
+            &snapshots
+                .iter()
+                .find(|row| row.token == "other-gateway-card")
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        assert_eq!(other["binding"]["owner_user_id"], "other-local");
+        let malformed: String =
+            sqlx::query_scalar("SELECT payload FROM feishu_gateway_interactions WHERE token='malformed-card'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(malformed, "not-json");
+        let mismatched_after: String =
+            sqlx::query_scalar("SELECT payload FROM feishu_gateway_interactions WHERE token='mismatched-card'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            mismatched_after, mismatched_before,
+            "unrelated embedded binding identities must not be repaired into authority"
+        );
+
+        let receipt: (String, String, i64) =
+            sqlx::query_as("SELECT payload,attempt_epoch,done FROM feishu_gateway_deliveries WHERE id='gateway-input'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(receipt, (original_delivery, "original-epoch".into(), 0));
+        let parent_owner: String = sqlx::query_scalar("SELECT g.owner_user_id FROM feishu_gateway_deliveries d JOIN feishu_gateway_routes g ON g.route_id=d.route_id WHERE d.id='gateway-input'").fetch_one(pool).await.unwrap();
+        assert_eq!(parent_owner, user.id);
+        let baseline: (String, String) = sqlx::query_as("SELECT h.message_id,g.owner_user_id FROM feishu_gateway_baseline_messages h JOIN feishu_gateway_routes g ON g.route_id=h.route_id WHERE h.route_id='r-adopt'").fetch_one(pool).await.unwrap();
+        assert_eq!(
+            baseline,
+            ("system_default_user-is-a-message-id".into(), user.id.clone())
+        );
+        let prepared = gateway.route_by_generation("g-prepared").await.unwrap().unwrap();
+        assert_eq!(prepared.owner_user_id, user.id);
+        assert_eq!(prepared.status, "prepared");
+        let identity: (String, String, String) =
+            sqlx::query_as("SELECT node_id,app_id,tenant_key FROM feishu_gateway_identity WHERE id=1")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            identity,
+            ("node-fixed".into(), "gateway-app".into(), "gateway-tenant".into())
+        );
+        let legacy_connector: String =
+            sqlx::query_scalar("SELECT connector_user_id FROM feishu_conversation_bindings WHERE id='adopt-binding'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            legacy_connector, "system_default_user",
+            "the unrelated unavailable direct connector retains its prior policy"
+        );
+        assert_eq!(repository.adopt_system_default_data(&user.id).await.unwrap(), 0);
+        db.close().await;
+    }
 }

@@ -241,6 +241,21 @@ impl IUserRepository for SqliteUserRepository {
         .fetch_one(&mut *tx)
         .await?;
 
+        // Gateway connectors use the conversation's Core owner, not a direct
+        // Lark plugin owner. Capture only correlated local generations before
+        // the ownership sweep so an adopter's pre-existing data cannot match.
+        let adopting_gateway_bindings: Vec<crate::models::FeishuBindingRow> = sqlx::query_as(
+            "SELECT b.* FROM feishu_conversation_bindings b \
+             JOIN feishu_gateway_routes g ON g.generation=b.id \
+               AND g.conversation_id=b.conversation_id AND g.app_id=b.app_id \
+               AND g.tenant_key=b.tenant_key AND g.chat_id=b.chat_id \
+               AND g.chat_type=b.chat_type \
+             WHERE g.status='active' AND g.owner_user_id='system_default_user' \
+               AND b.owner_user_id='system_default_user' AND b.connector_user_id='system_default_user'",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
         // Discover ownership tables from the live schema rather than a
         // hand-maintained list, so user-scoped tables added by future
         // migrations are adopted automatically. Convention (root-scope
@@ -296,6 +311,60 @@ impl IUserRepository for SqliteUserRepository {
                             THEN json_extract(payload,'$.event.owner_user_id') END='system_default_user'",
             )
             .bind(owner_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+
+        for binding in adopting_gateway_bindings {
+            moved += sqlx::query(
+                "UPDATE feishu_conversation_bindings SET connector_user_id=? \
+                 WHERE id=? AND owner_user_id=? AND connector_user_id='system_default_user'",
+            )
+            .bind(owner_id)
+            .bind(&binding.id)
+            .bind(owner_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+            // Rekey only a complete snapshot of this exact adopted binding.
+            // Titles, answers, platform union IDs and delivery envelopes are
+            // content/remote identities, not Core-user aliases. Malformed or
+            // mismatched snapshots retain their existing recovery policy.
+            moved += sqlx::query(
+                "UPDATE feishu_gateway_interactions \
+                 SET payload=json_set(payload,'$.binding.owner_user_id',?,'$.binding.connector_user_id',?) \
+                 WHERE binding_id=? \
+                   AND EXISTS(SELECT 1 FROM feishu_conversation_bindings b \
+                              JOIN feishu_gateway_routes g ON g.generation=b.id \
+                              WHERE b.id=feishu_gateway_interactions.binding_id \
+                                AND b.owner_user_id=? AND b.connector_user_id=? AND g.owner_user_id=?) \
+                   AND CASE WHEN json_valid(payload) THEN \
+                       json_extract(payload,'$.binding.id')=? \
+                       AND json_extract(payload,'$.binding.conversation_id')=? \
+                       AND json_extract(payload,'$.binding.owner_user_id')='system_default_user' \
+                       AND json_extract(payload,'$.binding.connector_user_id')='system_default_user' \
+                       AND json_extract(payload,'$.binding.app_id')=? \
+                       AND json_extract(payload,'$.binding.tenant_key')=? \
+                       AND json_extract(payload,'$.binding.chat_id')=? \
+                       AND json_extract(payload,'$.binding.chat_type')=? \
+                       AND json_extract(payload,'$.binding.bound_at')=? \
+                       ELSE 0 END",
+            )
+            .bind(owner_id)
+            .bind(owner_id)
+            .bind(&binding.id)
+            .bind(owner_id)
+            .bind(owner_id)
+            .bind(owner_id)
+            .bind(&binding.id)
+            .bind(&binding.conversation_id)
+            .bind(&binding.app_id)
+            .bind(&binding.tenant_key)
+            .bind(&binding.chat_id)
+            .bind(&binding.chat_type)
+            .bind(binding.bound_at)
             .execute(&mut *tx)
             .await?
             .rows_affected();

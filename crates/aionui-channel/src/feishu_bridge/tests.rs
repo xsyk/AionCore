@@ -32,6 +32,11 @@ use crate::types::{
     UnifiedMessageContent, UnifiedOutgoingMessage, UnifiedUser,
 };
 
+#[cfg(feature = "lark")]
+mod gateway_cases {
+    include!("gateway_tests.rs");
+}
+
 #[derive(Default)]
 struct RecordingSender {
     sent: Mutex<Vec<UnifiedOutgoingMessage>>,
@@ -304,6 +309,10 @@ async fn fixture() -> Fixture {
         login_config: login,
         tasks,
         sender: sender.clone(),
+        #[cfg(feature = "lark")]
+        gateway: None,
+        #[cfg(feature = "lark")]
+        gateway_repository: None,
     }));
     Fixture {
         _database: db,
@@ -314,6 +323,70 @@ async fn fixture() -> Fixture {
         sender,
         agent,
     }
+}
+
+#[cfg(feature = "lark")]
+#[test]
+fn gateway_callback_preserves_native_action_and_form_values() {
+    let value = json!({
+        "tag":"multi_select_static", "options":["A","B"],
+        "form_value":{"targets":["A","B"]}, "input_value":"details",
+        "value":{"action":"feishu.select","params":{"token":"original","question":"0","option":"1"}}
+    });
+    let event: crate::gateway::GatewayEvent = serde_json::from_value(json!({
+        "id":"event", "kind":"interaction", "app_id":"app", "tenant_key":"tenant",
+        "actor_open_id":"member", "actor_type":"user", "chat_id":"chat", "chat_type":"group",
+        "interaction_id":"original", "platform_message_id":"card", "action":"feishu.select",
+        "occurred_at":now_ms(), "value":value
+    }))
+    .unwrap();
+    let message = super::gateway_runtime::gateway_message(&event, "owner").unwrap();
+    let action = message.action.unwrap();
+    assert_eq!(action.action, "feishu.select");
+    assert_eq!(action.params.unwrap()["token"], "original");
+    assert_eq!(message.raw.unwrap()["gateway_action"], value);
+    let mut forged = event.clone();
+    forged.value["value"]["params"]["token"] = json!("another-interaction");
+    assert!(super::gateway_runtime::gateway_message(&forged, "owner").is_err());
+}
+
+#[cfg(feature = "lark")]
+#[test]
+fn gateway_delivery_rejects_wrong_node_and_event_chat() {
+    let mut delivery: crate::gateway::GatewayDelivery = serde_json::from_value(json!({
+        "id":"delivery", "kind":"message", "created_at":now_ms(), "expires_at":now_ms()+300000,
+        "route":{"id":"route","generation":"generation","node_id":"node","conversation_id":"conversation",
+          "owner_union_id":"owner","app_id":"app","tenant_key":"tenant","chat_id":"chat","chat_type":"group","status":"active","created_at":now_ms()},
+        "event":{"id":"event","kind":"message","app_id":"app","tenant_key":"tenant","chat_id":"chat",
+          "chat_type":"group","actor_open_id":"member","actor_type":"user","mentioned_bot":true,"text":"hello","occurred_at":now_ms()}
+    })).unwrap();
+    assert!(super::gateway_runtime::validate_gateway_delivery("node", "app", "tenant", &delivery).is_ok());
+    assert!(super::gateway_runtime::validate_gateway_delivery("other", "app", "tenant", &delivery).is_err());
+    delivery.event.as_mut().unwrap().chat_id = "another-chat".into();
+    assert!(super::gateway_runtime::validate_gateway_delivery("node", "app", "tenant", &delivery).is_err());
+}
+
+#[cfg(feature = "lark")]
+#[test]
+fn gateway_card_registers_original_token_in_button_value() {
+    let card = super::gateway_send::gateway_card(&super::service::outgoing(
+        "Question",
+        Some(vec![vec![crate::types::ActionButton {
+            label: "Choose".into(),
+            action: "feishu.select".into(),
+            params: Some(HashMap::from([
+                ("token".into(), "original".into()),
+                ("option".into(), "1".into()),
+            ])),
+        }]]),
+    ))
+    .unwrap();
+    assert_eq!(card["elements"][1]["actions"][0]["value"]["action"], "feishu.select");
+    assert_eq!(
+        card["elements"][1]["actions"][0]["value"]["params"]["token"],
+        "original"
+    );
+    assert_eq!(card["elements"][1]["actions"][0]["value"]["interaction_id"], "original");
 }
 
 fn incoming(fixture: &Fixture, union: &str, text: &str, chat: &str) -> UnifiedIncomingMessage {
