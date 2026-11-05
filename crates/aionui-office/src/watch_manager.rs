@@ -580,13 +580,15 @@ mod tests {
     struct MockProcessHandle {
         alive: AtomicBool,
         killed: AtomicBool,
+        listener: std::sync::Mutex<Option<std::net::TcpListener>>,
     }
 
     impl MockProcessHandle {
-        fn new() -> Self {
+        fn new(listener: Option<std::net::TcpListener>) -> Self {
             Self {
                 alive: AtomicBool::new(true),
                 killed: AtomicBool::new(false),
+                listener: std::sync::Mutex::new(listener),
             }
         }
     }
@@ -595,6 +597,7 @@ mod tests {
         fn kill(&self) {
             self.alive.store(false, Ordering::SeqCst);
             self.killed.store(true, Ordering::SeqCst);
+            self.listener.lock().unwrap().take();
         }
 
         fn is_alive(&self) -> bool {
@@ -605,6 +608,8 @@ mod tests {
     struct MockSpawner {
         installed: AtomicBool,
         spawn_count: AtomicU32,
+        real_collision_count: AtomicU32,
+        successful_spawn_count: AtomicU32,
         install_count: AtomicU32,
         update_count: AtomicU32,
         fail_spawn: AtomicBool,
@@ -617,12 +622,25 @@ mod tests {
             Self {
                 installed: AtomicBool::new(true),
                 spawn_count: AtomicU32::new(0),
+                real_collision_count: AtomicU32::new(0),
+                successful_spawn_count: AtomicU32::new(0),
                 install_count: AtomicU32::new(0),
                 update_count: AtomicU32::new(0),
                 fail_spawn: AtomicBool::new(false),
                 fail_with_address_in_use_once: AtomicBool::new(false),
                 start_listener: AtomicBool::new(true),
             }
+        }
+
+        fn assert_spawn_counts(&self, expected_attempts: u32, expected_successes: u32) {
+            // allocate_port releases its reservation before the mock binds.
+            // Count only observed OS address collisions as permitted retries;
+            // injected failures and any extra successful spawn still count.
+            assert_eq!(
+                self.spawn_count.load(Ordering::SeqCst),
+                expected_attempts + self.real_collision_count.load(Ordering::SeqCst),
+            );
+            assert_eq!(self.successful_spawn_count.load(Ordering::SeqCst), expected_successes);
         }
     }
 
@@ -648,13 +666,22 @@ mod tests {
                 return Err(OfficeError::OfficecliNotFound);
             }
 
-            if self.start_listener.load(Ordering::SeqCst) {
-                let listener = std::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-                    .map_err(|e| OfficeError::StartFailed(e.to_string()))?;
-                std::mem::forget(listener);
-            }
+            let listener = if self.start_listener.load(Ordering::SeqCst) {
+                match std::net::TcpListener::bind(format!("127.0.0.1:{port}")) {
+                    Ok(listener) => Some(listener),
+                    Err(error) => {
+                        if error.kind() == std::io::ErrorKind::AddrInUse {
+                            self.real_collision_count.fetch_add(1, Ordering::SeqCst);
+                        }
+                        return Err(OfficeError::StartFailed(error.to_string()));
+                    }
+                }
+            } else {
+                None
+            };
 
-            Ok(Box::new(MockProcessHandle::new()))
+            self.successful_spawn_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(MockProcessHandle::new(listener)))
         }
 
         async fn install_officecli(&self) -> Result<(), OfficeError> {
@@ -784,7 +811,7 @@ mod tests {
         let port = mgr.start(file.to_str().unwrap(), DocType::Word).await.unwrap();
         assert!(port > 0);
         assert_eq!(mgr.active_session_count(), 1);
-        assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 1);
+        spawner.assert_spawn_counts(1, 1);
     }
 
     #[tokio::test]
@@ -801,7 +828,7 @@ mod tests {
         let p2 = mgr.start(file.to_str().unwrap(), DocType::Word).await.unwrap();
 
         assert_eq!(p1, p2);
-        assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 1);
+        spawner.assert_spawn_counts(1, 1);
     }
 
     #[tokio::test]
@@ -820,7 +847,7 @@ mod tests {
 
         assert_ne!(user_a_port, user_b_port);
         assert_eq!(mgr.active_session_count(), 2);
-        assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 2);
+        spawner.assert_spawn_counts(2, 2);
 
         mgr.stop_for_user("user-a", path, DocType::Word).await;
         assert_eq!(mgr.active_session_count(), 1);
@@ -849,7 +876,7 @@ mod tests {
 
         assert!(port > 0);
         assert!(mgr.is_active_port(port, DocType::Word));
-        assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 2);
+        spawner.assert_spawn_counts(2, 1);
     }
 
     #[tokio::test]
@@ -867,7 +894,7 @@ mod tests {
 
         assert_ne!(p1, p2);
         assert_eq!(mgr.active_session_count(), 2);
-        assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 2);
+        spawner.assert_spawn_counts(2, 2);
     }
 
     #[tokio::test]
@@ -990,7 +1017,7 @@ mod tests {
         assert!(port > 0);
         assert_eq!(spawner.install_count.load(Ordering::SeqCst), 1);
         // First spawn fails (not installed), then install, then second spawn succeeds
-        assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 2);
+        spawner.assert_spawn_counts(2, 1);
     }
 
     #[tokio::test]

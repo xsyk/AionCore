@@ -16,18 +16,28 @@ use tempfile::TempDir;
 // ---------------------------------------------------------------------------
 
 /// Create a shell script at `dir/path` with the given body and make it executable.
-fn write_script(dir: &Path, rel_path: &str, body: &str) {
+async fn write_script(dir: &Path, rel_path: &str, body: &str) {
     let full = dir.join(rel_path);
     if let Some(parent) = full.parent() {
         fs::create_dir_all(parent).unwrap();
     }
     let content = format!("#!/bin/sh\n{body}\n");
-    fs::write(&full, content).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Keep writable script FDs out of this multithreaded test process so
+        // another fork cannot inherit one: rust-lang/rust#114554.
+        let mut writer = aionui_runtime::Builder::clean_cli("/bin/sh");
+        writer
+            .args(["-c", "printf '%s' \"$2\" > \"$1\"", "fixture-writer"])
+            .arg(&full)
+            .arg(&content);
+        let output = writer.output().await.unwrap();
+        assert!(output.status.success(), "fixture writer failed: {:?}", output.status);
         fs::set_permissions(&full, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    #[cfg(not(unix))]
+    fs::write(&full, content).unwrap();
 }
 
 fn setup_ext_dir() -> TempDir {
@@ -46,7 +56,8 @@ async fn lh1_first_install_executes_on_install() {
         dir.path(),
         "scripts/install.sh",
         &format!("touch '{}'", marker.display()),
-    );
+    )
+    .await;
 
     let hooks = LifecycleHooks {
         on_install: Some("scripts/install.sh".into()),
@@ -74,7 +85,8 @@ async fn lh2_version_change_executes_on_install() {
         dir.path(),
         "scripts/install.sh",
         &format!("touch '{}'", marker.display()),
-    );
+    )
+    .await;
 
     let hooks = LifecycleHooks {
         on_install: Some("scripts/install.sh".into()),
@@ -112,7 +124,8 @@ async fn lh3_activate_executes_on_activate() {
         dir.path(),
         "scripts/activate.sh",
         &format!("echo 'activated' >> '{}'", counter_file.display()),
-    );
+    )
+    .await;
 
     let hooks = LifecycleHooks {
         on_activate: Some("scripts/activate.sh".into()),
@@ -146,7 +159,8 @@ async fn lh4_deactivate_executes_on_deactivate() {
         dir.path(),
         "scripts/deactivate.sh",
         &format!("touch '{}'", marker.display()),
-    );
+    )
+    .await;
 
     let hooks = LifecycleHooks {
         on_deactivate: Some("scripts/deactivate.sh".into()),
@@ -167,7 +181,7 @@ async fn lh4_deactivate_executes_on_deactivate() {
 async fn lh5_hook_timeout() {
     let dir = setup_ext_dir();
     // Script that sleeps for a long time
-    write_script(dir.path(), "scripts/slow.sh", "sleep 120");
+    write_script(dir.path(), "scripts/slow.sh", "sleep 120").await;
 
     // We can't easily override the built-in timeout constants in the public API,
     // so we test the timeout mechanism by using tokio::time::timeout directly
@@ -232,7 +246,7 @@ fn resolve_hook_path_none_when_not_declared() {
 #[tokio::test]
 async fn hook_nonzero_exit_returns_hook_failed() {
     let dir = setup_ext_dir();
-    write_script(dir.path(), "scripts/fail.sh", "echo 'setup failed' >&2; exit 42");
+    write_script(dir.path(), "scripts/fail.sh", "echo 'setup failed' >&2; exit 42").await;
 
     let result = execute_hook(dir.path(), "scripts/fail.sh", HookKind::OnInstall, "failing-ext").await;
 
@@ -259,7 +273,7 @@ async fn hook_nonzero_exit_returns_hook_failed() {
 #[tokio::test]
 async fn hook_working_directory_is_ext_dir() {
     let dir = setup_ext_dir();
-    write_script(dir.path(), "check_dir.sh", "pwd > cwd_out.txt");
+    write_script(dir.path(), "check_dir.sh", "pwd > cwd_out.txt").await;
 
     let result = execute_hook(dir.path(), "check_dir.sh", HookKind::OnActivate, "cwd-ext").await;
     assert!(result.is_ok());
