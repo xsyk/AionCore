@@ -171,6 +171,26 @@ mod tests {
     use super::*;
     use tokio::process::Command;
 
+    async fn write_script(path: &Path, contents: &str) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // Keep writable script FDs out of this multithreaded test process
+            // so another fork cannot inherit one: rust-lang/rust#114554.
+            let mut writer = CmdBuilder::clean_cli("/bin/sh");
+            writer
+                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "fixture-writer"])
+                .arg(path)
+                .arg(contents);
+            let output = writer.output().await.unwrap();
+            assert!(output.status.success(), "fixture writer failed: {:?}", output.status);
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::write(path, contents).unwrap();
+    }
+
     // -----------------------------------------------------------------------
     // needs_install_hook
     // -----------------------------------------------------------------------
@@ -268,13 +288,7 @@ mod tests {
     async fn test_execute_hook_success() {
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("hook.sh");
-        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_script(&script_path, "#!/bin/sh\nexit 0\n").await;
 
         let result = execute_hook(dir.path(), "hook.sh", HookKind::OnActivate, "test-ext").await;
 
@@ -285,13 +299,7 @@ mod tests {
     async fn test_execute_hook_nonzero_exit() {
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("fail.sh");
-        std::fs::write(&script_path, "#!/bin/sh\necho 'something broke' >&2\nexit 1\n").unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_script(&script_path, "#!/bin/sh\necho 'something broke' >&2\nexit 1\n").await;
 
         let result = execute_hook(dir.path(), "fail.sh", HookKind::OnInstall, "test-ext").await;
 
@@ -304,7 +312,7 @@ mod tests {
             } => {
                 assert_eq!(extension_name, "test-ext");
                 assert_eq!(hook, "onInstall");
-                assert!(reason.contains("something broke"));
+                assert!(reason.contains("something broke"), "{reason}");
             }
             other => panic!("expected HookFailed, got {other:?}"),
         }
@@ -315,13 +323,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("slow.sh");
         // Script that sleeps longer than we allow
-        std::fs::write(&script_path, "#!/bin/sh\nsleep 60\n").unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_script(&script_path, "#!/bin/sh\nsleep 60\n").await;
 
         // Use a very short timeout override via a direct timeout wrapper
         let ext_dir = dir.path().to_owned();
@@ -343,13 +345,7 @@ mod tests {
         let marker = dir.path().join("cwd_marker.txt");
         let script_path = dir.path().join("check_cwd.sh");
         // Write cwd to a file so we can verify it
-        std::fs::write(&script_path, "#!/bin/sh\npwd > cwd_marker.txt\n").unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_script(&script_path, "#!/bin/sh\npwd > cwd_marker.txt\n").await;
 
         let result = execute_hook(dir.path(), "check_cwd.sh", HookKind::OnActivate, "test-ext").await;
 
