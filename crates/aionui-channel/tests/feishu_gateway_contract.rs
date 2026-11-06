@@ -37,6 +37,7 @@ async fn captured_deliveries(name: &str) -> (Vec<GatewayDelivery>, Value) {
         token: NODE_TOKEN.into(),
         app_id: route["app_id"].as_str().unwrap().into(),
         tenant_key: route["tenant_key"].as_str().unwrap().into(),
+        identity: None,
     };
     let router = Router::new().route(
         "/api/node/deliveries",

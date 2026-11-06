@@ -57,6 +57,12 @@ const GLOBAL_TABLES: &[(&str, &str)] = &[
     ("folders", "global canonical path registry"),
     // Single-row Feishu web-login settings owned by the super admin, not a user.
     ("feishu_login_config", "machine-wide feishu login settings"),
+    // Login transactions bind a browser to a gateway node before any Core
+    // account is resolved. Adopting user data must not alter or revive them.
+    (
+        "feishu_identity_transactions",
+        "machine browser/node login transactions, no Core-user ownership",
+    ),
     // Only immutable app/message replay keys; no user identity or message body.
     ("feishu_message_receipts", "app-scoped transport deduplication registry"),
     // This is the machine's node/app/tenant credential pin, with no Core-user

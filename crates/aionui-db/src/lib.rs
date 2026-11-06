@@ -73,5 +73,10 @@ pub use repository::{IConversationShareRepository, SqliteConversationShareReposi
 // Re-export sqlx pool type for downstream crates
 pub use sqlx::SqlitePool;
 
+pub use models::{FeishuIdentityTransactionKind, FeishuIdentityTransactionRow};
+pub use repository::{
+    ConsumeFeishuIdentityTransactionParams, IFeishuIdentityTransactionRepository,
+    SqliteFeishuIdentityTransactionRepository,
+};
 pub use repository::{IFeishuBindingRepository, SqliteFeishuBindingRepository};
 pub use repository::{IFeishuGatewayRepository, SqliteFeishuGatewayRepository};

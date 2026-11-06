@@ -2,6 +2,8 @@
 
 mod antigravity_hook;
 mod clipboard_writer;
+#[cfg(feature = "lark")]
+mod feishu_identity;
 mod fs_monitor;
 mod health;
 mod item_revealer;

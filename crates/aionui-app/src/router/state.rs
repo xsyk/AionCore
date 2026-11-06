@@ -143,6 +143,7 @@ pub struct ModuleStates {
     pub skill: SkillRouterState,
     pub channel: ChannelRouterState,
     pub feishu_bridge: Arc<aionui_channel::feishu_bridge::FeishuBridge>,
+    pub gateway_identity: Option<Arc<aionui_auth::feishu::gateway_login::GatewayIdentityLogin>>,
     pub team: TeamRouterState,
     pub session_message: SessionMessageRouterState,
     pub skill_runtime: SkillRuntimeRouterState,
@@ -199,6 +200,7 @@ pub struct ChannelOrchestratorComponents {
     pub plugin_factory: Arc<aionui_channel::manager::PluginFactory>,
     pub owner_user_id: Option<String>,
     pub feishu_bridge: Arc<aionui_channel::feishu_bridge::FeishuBridge>,
+    pub gateway_identity: Option<Arc<aionui_auth::feishu::gateway_login::GatewayIdentityLogin>>,
 }
 
 /// Build all default `ModuleStates` from application services.
@@ -323,6 +325,7 @@ pub async fn build_module_states(
         skill: skill_state,
         channel: channel_state,
         feishu_bridge: channel_components.feishu_bridge.clone(),
+        gateway_identity: channel_components.gateway_identity.clone(),
         team: build_module_state_phase(&boot, "team", || {
             build_team_state(
                 services,
@@ -853,6 +856,10 @@ pub async fn build_channel_state(
 
     let message_service = build_channel_message_service(services, Arc::clone(&channel_settings)).await;
 
+    #[cfg(feature = "lark")]
+    let gateway_identity = super::feishu_identity::build(services, gateway.as_ref())?;
+    #[cfg(not(feature = "lark"))]
+    let gateway_identity = None;
     let feishu_bridge = Arc::new(aionui_channel::feishu_bridge::FeishuBridge::new(
         aionui_channel::feishu_bridge::FeishuBridgeDependencies {
             bindings: Arc::new(aionui_db::SqliteFeishuBindingRepository::new(
@@ -901,6 +908,7 @@ pub async fn build_channel_state(
         plugin_factory,
         owner_user_id: startup_owner_user_id,
         feishu_bridge,
+        gateway_identity,
     };
 
     Ok((state, components))

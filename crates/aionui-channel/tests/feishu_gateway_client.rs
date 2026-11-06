@@ -20,6 +20,7 @@ fn config(url: &str) -> GatewayConfig {
         token: "private-node-test-token-with-32-characters".into(),
         app_id: "cli_test".into(),
         tenant_key: "tenant_test".into(),
+        identity: None,
     }
 }
 

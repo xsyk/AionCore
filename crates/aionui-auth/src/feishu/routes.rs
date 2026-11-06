@@ -14,12 +14,13 @@ use axum::{Extension, Router};
 use serde::Deserialize;
 
 use aionui_api_types::{
-    ApiResponse, FeishuInAppLoginRequest, FeishuInAppLoginResponse, FeishuLoginConfigUpdate, FeishuLoginConfigView,
-    FeishuLoginStatus, PublicUser,
+    ApiResponse, FeishuIdentityKind, FeishuInAppLoginRequest, FeishuInAppLoginResponse, FeishuLoginConfigUpdate,
+    FeishuLoginConfigView, FeishuLoginStatus, PublicUser,
 };
 use aionui_common::ApiError;
 use aionui_common::constants::{CSRF_COOKIE_NAME, CSRF_HEADER_NAME};
 
+use super::gateway_login::GatewayLoginAttempt;
 use super::{FEISHU_STATE_COOKIE, FeishuLogin, FeishuLoginError, account, pkce};
 use crate::admin_routes::require_super_admin;
 use crate::extract::extract_cookie_value;
@@ -151,7 +152,7 @@ async fn in_app(
             None,
         ));
     }
-    if cfg.tenant_key.as_deref().is_none_or(|tenant| tenant.is_empty()) {
+    if svc.gateway().is_none() && cfg.tenant_key.as_deref().is_none_or(|tenant| tenant.is_empty()) {
         return Err(ApiError::coded(
             StatusCode::FORBIDDEN,
             "FEISHU_LOGIN_TENANT_UNCONFIGURED",
@@ -169,7 +170,29 @@ async fn in_app(
             None,
         ));
     }
-    let identity = svc.exchange_in_app_and_fetch(&cfg, code).await.map_err(in_app_error)?;
+    let identity = if let Some(gateway) = svc.gateway() {
+        let nonce =
+            pkce::random_token().ok_or_else(|| in_app_error(FeishuLoginError::Server("entropy unavailable".into())))?;
+        // The existing double-submit CSRF value binds this one-request H5
+        // transaction to the requesting browser without returning a hub token.
+        let transaction = gateway
+            .begin(FeishuIdentityKind::H5, &cfg.redirect_uri, &nonce, &cookie)
+            .await
+            .map_err(in_app_error)?;
+        gateway
+            .finish(GatewayLoginAttempt {
+                kind: FeishuIdentityKind::H5,
+                transaction_id: &transaction.transaction_id,
+                redirect_uri: &cfg.redirect_uri,
+                nonce: &nonce,
+                browser_binding: &cookie,
+                code,
+            })
+            .await
+            .map_err(in_app_error)?
+    } else {
+        svc.exchange_in_app_and_fetch(&cfg, code).await.map_err(in_app_error)?
+    };
     svc.check_tenant(&cfg, &identity.tenant_key)
         .await
         .map_err(in_app_error)?;
@@ -209,6 +232,25 @@ async fn start(State(state): State<AuthRouterState>) -> Response {
         Ok(cfg) => cfg,
         Err(err) => return login_error(&state, &err),
     };
+    if let Some(gateway) = svc.gateway() {
+        let (Some(nonce), Some(browser)) = (pkce::random_token(), pkce::random_token()) else {
+            return login_error(&state, &FeishuLoginError::Server("entropy unavailable".into()));
+        };
+        return match gateway
+            .begin(FeishuIdentityKind::Oauth, &cfg.redirect_uri, &nonce, &browser)
+            .await
+        {
+            Ok(transaction) => redirect(
+                transaction.authorization_url.as_deref().unwrap_or_default(),
+                &[state_cookie(
+                    &state,
+                    &format!("g1.{}.{}.{}", transaction.transaction_id, nonce, browser),
+                    STATE_MAX_AGE_SECS,
+                )],
+            ),
+            Err(error) => login_error(&state, &error),
+        };
+    }
     let (Some(nonce), Some(verifier)) = (pkce::random_token(), pkce::random_token()) else {
         return login_error(&state, &FeishuLoginError::Server("entropy unavailable".into()));
     };
@@ -247,6 +289,50 @@ async fn finish_login(
     let svc = service(state).ok_or(FeishuLoginError::Disabled)?;
     let cfg = svc.resolved().await?;
     let raw = extract_cookie_value(headers, FEISHU_STATE_COOKIE).unwrap_or_default();
+    if let Some(gateway) = svc.gateway() {
+        let parts: Vec<_> = raw.split('.').collect();
+        if parts.len() != 4
+            || parts[0] != "g1"
+            || parts[1..].iter().any(|part| !super::gateway_identity::opaque(part))
+            || !constant_time_eq(parts[1].as_bytes(), q.state.as_deref().unwrap_or_default().as_bytes())
+        {
+            return Err(FeishuLoginError::State);
+        }
+        let code = q
+            .code
+            .filter(|value| !value.is_empty())
+            .ok_or(FeishuLoginError::Cancelled)?;
+        let identity = gateway
+            .finish(GatewayLoginAttempt {
+                kind: FeishuIdentityKind::Oauth,
+                transaction_id: parts[1],
+                redirect_uri: &cfg.redirect_uri,
+                nonce: parts[2],
+                browser_binding: parts[3],
+                code: &code,
+            })
+            .await?;
+        svc.check_tenant(&cfg, &identity.tenant_key).await?;
+        let user = account::resolve_account(state.user_repo.as_ref(), &identity, cfg.signup_policy).await?;
+        let (_, [session, refresh]) = issue_session_cookies(state, &user)
+            .map_err(|_| FeishuLoginError::Server("FEISHU_GATEWAY_SESSION_FAILED".into()))?;
+        if state.user_repo.update_last_login(&user.id).await.is_err() {
+            tracing::warn!(
+                code = "FEISHU_GATEWAY_LAST_LOGIN_FAILED",
+                "feishu: login timestamp update failed"
+            );
+        }
+        tracing::info!(
+            code = "FEISHU_GATEWAY_LOGIN_SUCCEEDED",
+            "feishu: gateway login succeeded"
+        );
+        return Ok(vec![session, refresh, state_cookie(state, "", 0)]);
+    }
+    // A gateway-issued browser transaction can never fall back to direct OAuth
+    // if the feature configuration is removed before the callback returns.
+    if raw.starts_with("g1.") {
+        return Err(FeishuLoginError::State);
+    }
     let (expected, verifier) = pkce::decode_state_cookie(&raw).ok_or(FeishuLoginError::State)?;
     let got = q.state.unwrap_or_default();
     if !constant_time_eq(expected.as_bytes(), got.as_bytes()) {

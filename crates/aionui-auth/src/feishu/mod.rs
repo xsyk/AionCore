@@ -3,6 +3,8 @@
 
 pub mod account;
 pub mod client;
+pub mod gateway_identity;
+pub mod gateway_login;
 pub mod pkce;
 pub(crate) mod routes;
 #[cfg(test)]
@@ -94,6 +96,7 @@ pub struct FeishuLogin {
     repo: Arc<dyn IFeishuLoginRepository>,
     encryption_key: [u8; 32],
     http: reqwest::Client,
+    gateway: Option<Arc<gateway_login::GatewayIdentityLogin>>,
 }
 
 fn server(e: impl std::fmt::Display) -> FeishuLoginError {
@@ -126,7 +129,17 @@ impl FeishuLogin {
             repo,
             encryption_key,
             http,
+            gateway: None,
         }
+    }
+
+    pub fn with_gateway(mut self, gateway: Option<Arc<gateway_login::GatewayIdentityLogin>>) -> Self {
+        self.gateway = gateway;
+        self
+    }
+
+    pub fn gateway(&self) -> Option<&gateway_login::GatewayIdentityLogin> {
+        self.gateway.as_deref()
     }
 
     async fn row(&self) -> Result<FeishuLoginConfigRow, FeishuLoginError> {
@@ -178,7 +191,11 @@ impl FeishuLogin {
             signup_policy,
             updated_at: 0,
         };
-        if row.enabled && (row.app_id.is_empty() || row.app_secret_enc.is_none() || row.public_base_url.is_empty()) {
+        if row.enabled
+            && (row.app_id.is_empty()
+                || (self.gateway.is_none() && row.app_secret_enc.is_none())
+                || row.public_base_url.is_empty())
+        {
             return Err(FeishuLoginError::Invalid(
                 "app_id, app_secret and public_base_url are required to enable Feishu login".into(),
             ));
@@ -190,16 +207,26 @@ impl FeishuLogin {
     /// Usable configuration, or `Disabled` when off / incomplete / undecryptable.
     pub async fn resolved(&self) -> Result<ResolvedConfig, FeishuLoginError> {
         let row = self.row().await?;
-        let Some(secret_enc) = row.app_secret_enc.as_deref().filter(|_| row.enabled) else {
-            return Err(FeishuLoginError::Disabled);
-        };
-        if row.app_id.is_empty() || row.public_base_url.is_empty() {
+        if !row.enabled || row.app_id.is_empty() || row.public_base_url.is_empty() {
             return Err(FeishuLoginError::Disabled);
         }
-        let app_secret = decrypt_string(secret_enc, &self.encryption_key).map_err(|e| {
-            tracing::error!(error = %e, "feishu: stored app secret cannot be decrypted");
-            FeishuLoginError::Disabled
-        })?;
+        let app_secret = if let Some(gateway) = self.gateway() {
+            if row.app_id != gateway.trust().app_id
+                || row
+                    .tenant_key
+                    .as_deref()
+                    .is_some_and(|tenant| tenant != gateway.trust().tenant_key)
+            {
+                return Err(FeishuLoginError::Invalid("FEISHU_GATEWAY_LOGIN_CONFIG_MISMATCH".into()));
+            }
+            String::new()
+        } else {
+            let secret_enc = row.app_secret_enc.as_deref().ok_or(FeishuLoginError::Disabled)?;
+            decrypt_string(secret_enc, &self.encryption_key).map_err(|e| {
+                tracing::error!(error = %e, "feishu: stored app secret cannot be decrypted");
+                FeishuLoginError::Disabled
+            })?
+        };
         Ok(ResolvedConfig {
             app_secret,
             tenant_key: row.tenant_key,
@@ -235,6 +262,9 @@ impl FeishuLogin {
         code: &str,
         code_verifier: &str,
     ) -> Result<client::FeishuUser, FeishuLoginError> {
+        if self.gateway.is_some() {
+            return Err(FeishuLoginError::State);
+        }
         let token = client::exchange_code(
             &self.http,
             &cfg.api_base,
@@ -256,6 +286,9 @@ impl FeishuLogin {
         cfg: &ResolvedConfig,
         code: &str,
     ) -> Result<client::FeishuUser, FeishuLoginError> {
+        if self.gateway.is_some() {
+            return Err(FeishuLoginError::State);
+        }
         let token = client::exchange_in_app_code(&self.http, cfg, code).await?;
         client::fetch_user(&self.http, &cfg.api_base, &token).await
     }

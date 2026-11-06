@@ -253,3 +253,5 @@ mod public_contract_tests {
 
 mod feishu_binding;
 pub use feishu_binding::{FeishuBindingCode, FeishuBindingStatus, FeishuConversationBinding};
+mod feishu_identity;
+pub use feishu_identity::*;

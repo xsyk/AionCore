@@ -106,3 +106,8 @@ pub mod feishu_gateway;
 mod sqlite_feishu_gateway;
 pub use feishu_gateway::IFeishuGatewayRepository;
 pub use sqlite_feishu_gateway::SqliteFeishuGatewayRepository;
+
+pub mod feishu_identity;
+mod sqlite_feishu_identity;
+pub use feishu_identity::{ConsumeFeishuIdentityTransactionParams, IFeishuIdentityTransactionRepository};
+pub use sqlite_feishu_identity::SqliteFeishuIdentityTransactionRepository;

@@ -15,6 +15,16 @@ pub struct GatewayConfig {
     pub token: String,
     pub app_id: String,
     pub tenant_key: String,
+    #[serde(default)]
+    pub identity: Option<GatewayIdentityConfig>,
+}
+
+/// Provisioned independently from Begin responses. Not a trust-on-first-use key.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayIdentityConfig {
+    pub verification_key: String,
+    pub key_id: String,
 }
 
 impl fmt::Debug for GatewayConfig {

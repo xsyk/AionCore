@@ -94,7 +94,7 @@ fn bridge_with_gateway(fixture: &Fixture, url: &str, repository: Arc<dyn IFeishu
     Arc::new(FeishuBridge::new(FeishuBridgeDependencies {
         bindings: deps.bindings.clone(), conversations: deps.conversations.clone(), conversation_repo: deps.conversation_repo.clone(),
         users: deps.users.clone(), login_config: deps.login_config.clone(), tasks: deps.tasks.clone(), sender: deps.sender.clone(),
-        gateway: Some(Arc::new(GatewayClient::new(GatewayConfig { url:url.into(), node_id:"node".into(), app_id:"app".into(), tenant_key:"tenant".into(), token:"gateway-unit-test-credential-at-least-32-chars".into() }).unwrap())),
+        gateway: Some(Arc::new(GatewayClient::new(GatewayConfig { identity:None, url:url.into(), node_id:"node".into(), app_id:"app".into(), tenant_key:"tenant".into(), token:"gateway-unit-test-credential-at-least-32-chars".into() }).unwrap())),
         gateway_repository: Some(repository),
     }))
 }

@@ -1,0 +1,431 @@
+{
+  "app_id": "cli_contract_test_only",
+  "capture_kind": "actual Go HTTP response bodies over random-port loopback httptest server",
+  "cases": {
+    "h5": {
+      "begin": {
+        "method": "POST",
+        "path": "/api/node/identity/transactions",
+        "request_raw_body": "{\"kind\":\"h5\",\"redirect_uri\":\"https://node.contract.invalid/api/auth/feishu/callback\",\"nonce\":\"contract-h5-nonce-test-only-000000000001\"}",
+        "http_status": 201,
+        "content_type": "application/json; charset=utf-8",
+        "raw_body": "{\"transaction\":{\"transaction_id\":\"SCuAPtpCGKCEP63l7MyAp8U4rlvbo4P1UhwJ3sLEd60\",\"expires_at\":1793923800789,\"app_id\":\"cli_contract_test_only\",\"verification_key\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\",\"key_id\":\"If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk\"}}\n"
+      },
+      "exchange": {
+        "method": "POST",
+        "path": "/api/node/identity/exchange",
+        "request_raw_body": "{\"transaction_id\":\"SCuAPtpCGKCEP63l7MyAp8U4rlvbo4P1UhwJ3sLEd60\",\"code\":\"test-h5-code\",\"nonce\":\"contract-h5-nonce-test-only-000000000001\"}",
+        "http_status": 200,
+        "content_type": "application/json; charset=utf-8",
+        "raw_body": "{\"identity\":{\"identity\":{\"union_id\":\"union_contract_test_only\",\"open_id\":\"ou_contract_test_only\",\"tenant_key\":\"tenant_contract_test_only\",\"name\":\"契约测试用户\",\"email\":\"contract@example.invalid\",\"avatar_url\":\"https://avatar.contract.invalid/test.png\"},\"assertion\":\"eyJhbGciOiJFZERTQSIsImtpZCI6IklmNHgzNkZVb21GaWFfaFVCR19TSnh0NzdVdHF2a1dxV0lkLTlILVhJYmsiLCJ0eXAiOiJKV1QifQ.eyJhdWQiOiJub2RlXzUwYmYyNzcwYjA2MWM0ZjAzMTdkZmJlODZkNDExMzFmIiwiZXhwIjoxNzkzOTIzMzIwLCJpYXQiOjE3OTM5MjMyMDAsImlkZW50aXR5Ijp7InVuaW9uX2lkIjoidW5pb25fY29udHJhY3RfdGVzdF9vbmx5Iiwib3Blbl9pZCI6Im91X2NvbnRyYWN0X3Rlc3Rfb25seSIsInRlbmFudF9rZXkiOiJ0ZW5hbnRfY29udHJhY3RfdGVzdF9vbmx5IiwibmFtZSI6IuWlkee6pua1i-ivleeUqOaItyIsImVtYWlsIjoiY29udHJhY3RAZXhhbXBsZS5pbnZhbGlkIiwiYXZhdGFyX3VybCI6Imh0dHBzOi8vYXZhdGFyLmNvbnRyYWN0LmludmFsaWQvdGVzdC5wbmcifSwiaXNzIjoiYWlvbi1mZWlzaHUtcm91dGUiLCJqdGkiOiJTQ3VBUHRwQ0dLQ0VQNjNsN015QXA4VTRybHZibzRQMVVod0ozc0xFZDYwIiwibm9uY2VfaGFzaCI6IjBobl9GcFBTZVg0TmFNY3FzWDEtbGZJaGVnZTdJTWNOMVJPSEVSUmM1QXMiLCJzdWIiOiJmZWlzaHU6dW5pb25fY29udHJhY3RfdGVzdF9vbmx5IiwidGVuYW50X2tleSI6InRlbmFudF9jb250cmFjdF90ZXN0X29ubHkifQ.qDmHDq5LvTSBn1wz6UFbOOHVMIVu5OC4NeCH0l-LALSSEAObN4-bZynrbvOhHq7YqNMwEVmhTynV3AE7h8P5Bg\",\"expires_at\":1793923320789}}\n"
+      },
+      "kind": "h5",
+      "nonce": "contract-h5-nonce-test-only-000000000001",
+      "redirect_uri": "https://node.contract.invalid/api/auth/feishu/callback",
+      "replay": {
+        "method": "POST",
+        "path": "/api/node/identity/exchange",
+        "request_raw_body": "{\"transaction_id\":\"SCuAPtpCGKCEP63l7MyAp8U4rlvbo4P1UhwJ3sLEd60\",\"code\":\"test-h5-code\",\"nonce\":\"contract-h5-nonce-test-only-000000000001\"}",
+        "http_status": 410,
+        "content_type": "application/json; charset=utf-8",
+        "raw_body": "{\"error\":{\"code\":\"expired\",\"message\":\"Event or interaction expired.\"}}\n"
+      },
+      "transaction_id": "SCuAPtpCGKCEP63l7MyAp8U4rlvbo4P1UhwJ3sLEd60",
+      "verification": {
+        "aud_matches_node": true,
+        "ed25519_signature_valid": true,
+        "exp_matches_two_minutes": true,
+        "iat_matches_fixed_now": true,
+        "identity_matches_provider": true,
+        "jti_matches_transaction": true,
+        "nonce_hash_matches_request": true
+      },
+      "wrong_nonce": {
+        "method": "POST",
+        "path": "/api/node/identity/exchange",
+        "request_raw_body": "{\"transaction_id\":\"SCuAPtpCGKCEP63l7MyAp8U4rlvbo4P1UhwJ3sLEd60\",\"code\":\"test-h5-code\",\"nonce\":\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"}",
+        "http_status": 410,
+        "content_type": "application/json; charset=utf-8",
+        "raw_body": "{\"error\":{\"code\":\"expired\",\"message\":\"Event or interaction expired.\"}}\n"
+      }
+    },
+    "oauth": {
+      "begin": {
+        "method": "POST",
+        "path": "/api/node/identity/transactions",
+        "request_raw_body": "{\"kind\":\"oauth\",\"redirect_uri\":\"https://node.contract.invalid/api/auth/feishu/callback\",\"nonce\":\"contract-oauth-nonce-test-only-000000000001\"}",
+        "http_status": 201,
+        "content_type": "application/json; charset=utf-8",
+        "raw_body": "{\"transaction\":{\"transaction_id\":\"cJxCxyZiHWtTwaVIXC9RfHeLB1wQjqw1e6L0YC-H7Mw\",\"expires_at\":1793923800789,\"app_id\":\"cli_contract_test_only\",\"authorization_url\":\"https://accounts.feishu.cn/open-apis/authen/v1/authorize?client_id=cli_contract_test_only\\u0026code_challenge=WHQETqTT8gsyosdNhZQQKAGmW4-zuNr1tkgSQHemsGc\\u0026code_challenge_method=S256\\u0026redirect_uri=https%3A%2F%2Fnode.contract.invalid%2Fapi%2Fauth%2Ffeishu%2Fcallback\\u0026response_type=code\\u0026state=cJxCxyZiHWtTwaVIXC9RfHeLB1wQjqw1e6L0YC-H7Mw\",\"verification_key\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\",\"key_id\":\"If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk\"}}\n"
+      },
+      "exchange": {
+        "method": "POST",
+        "path": "/api/node/identity/exchange",
+        "request_raw_body": "{\"transaction_id\":\"cJxCxyZiHWtTwaVIXC9RfHeLB1wQjqw1e6L0YC-H7Mw\",\"code\":\"test-oauth-code\",\"nonce\":\"contract-oauth-nonce-test-only-000000000001\"}",
+        "http_status": 200,
+        "content_type": "application/json; charset=utf-8",
+        "raw_body": "{\"identity\":{\"identity\":{\"union_id\":\"union_contract_test_only\",\"open_id\":\"ou_contract_test_only\",\"tenant_key\":\"tenant_contract_test_only\",\"name\":\"契约测试用户\",\"email\":\"contract@example.invalid\",\"avatar_url\":\"https://avatar.contract.invalid/test.png\"},\"assertion\":\"eyJhbGciOiJFZERTQSIsImtpZCI6IklmNHgzNkZVb21GaWFfaFVCR19TSnh0NzdVdHF2a1dxV0lkLTlILVhJYmsiLCJ0eXAiOiJKV1QifQ.eyJhdWQiOiJub2RlXzUwYmYyNzcwYjA2MWM0ZjAzMTdkZmJlODZkNDExMzFmIiwiZXhwIjoxNzkzOTIzMzIwLCJpYXQiOjE3OTM5MjMyMDAsImlkZW50aXR5Ijp7InVuaW9uX2lkIjoidW5pb25fY29udHJhY3RfdGVzdF9vbmx5Iiwib3Blbl9pZCI6Im91X2NvbnRyYWN0X3Rlc3Rfb25seSIsInRlbmFudF9rZXkiOiJ0ZW5hbnRfY29udHJhY3RfdGVzdF9vbmx5IiwibmFtZSI6IuWlkee6pua1i-ivleeUqOaItyIsImVtYWlsIjoiY29udHJhY3RAZXhhbXBsZS5pbnZhbGlkIiwiYXZhdGFyX3VybCI6Imh0dHBzOi8vYXZhdGFyLmNvbnRyYWN0LmludmFsaWQvdGVzdC5wbmcifSwiaXNzIjoiYWlvbi1mZWlzaHUtcm91dGUiLCJqdGkiOiJjSnhDeHlaaUhXdFR3YVZJWEM5UmZIZUxCMXdRanF3MWU2TDBZQy1IN013Iiwibm9uY2VfaGFzaCI6ImFhQ3YwZXZqV2dHamp3WEk4d0I5aDF0XzFOS3MwaVEtdVYtUzZZamNrbFEiLCJzdWIiOiJmZWlzaHU6dW5pb25fY29udHJhY3RfdGVzdF9vbmx5IiwidGVuYW50X2tleSI6InRlbmFudF9jb250cmFjdF90ZXN0X29ubHkifQ.JMxckQpm_Wlu7hWZh9twvm2yzQ7TSQAS8WuldYJW4WYGonWPp78s8ixvoJ0gZdPPJp_ORuPsWE6wuL8P7SapCA\",\"expires_at\":1793923320789}}\n"
+      },
+      "kind": "oauth",
+      "nonce": "contract-oauth-nonce-test-only-000000000001",
+      "redirect_uri": "https://node.contract.invalid/api/auth/feishu/callback",
+      "replay": {
+        "method": "POST",
+        "path": "/api/node/identity/exchange",
+        "request_raw_body": "{\"transaction_id\":\"cJxCxyZiHWtTwaVIXC9RfHeLB1wQjqw1e6L0YC-H7Mw\",\"code\":\"test-oauth-code\",\"nonce\":\"contract-oauth-nonce-test-only-000000000001\"}",
+        "http_status": 410,
+        "content_type": "application/json; charset=utf-8",
+        "raw_body": "{\"error\":{\"code\":\"expired\",\"message\":\"Event or interaction expired.\"}}\n"
+      },
+      "transaction_id": "cJxCxyZiHWtTwaVIXC9RfHeLB1wQjqw1e6L0YC-H7Mw",
+      "verification": {
+        "aud_matches_node": true,
+        "ed25519_signature_valid": true,
+        "exp_matches_two_minutes": true,
+        "iat_matches_fixed_now": true,
+        "identity_matches_provider": true,
+        "jti_matches_transaction": true,
+        "nonce_hash_matches_request": true
+      },
+      "wrong_nonce": {
+        "method": "POST",
+        "path": "/api/node/identity/exchange",
+        "request_raw_body": "{\"transaction_id\":\"cJxCxyZiHWtTwaVIXC9RfHeLB1wQjqw1e6L0YC-H7Mw\",\"code\":\"test-oauth-code\",\"nonce\":\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"}",
+        "http_status": 410,
+        "content_type": "application/json; charset=utf-8",
+        "raw_body": "{\"error\":{\"code\":\"expired\",\"message\":\"Event or interaction expired.\"}}\n"
+      }
+    }
+  },
+  "contract_paths": {
+    "assertion": "identity.assertion",
+    "begin": "transaction",
+    "exchange_expires_at": "identity.expires_at",
+    "exchange_result": "identity",
+    "exchange_user": "identity.identity"
+  },
+  "fixed_now": {
+    "rfc3339": "2026-11-06T00:00:00.789Z",
+    "unix_millis": 1793923200789,
+    "unix_seconds": 1793923200
+  },
+  "listener": {
+    "external_dial_forbidden": true,
+    "loopback_verified": true,
+    "proxy_disabled": true,
+    "random_port": true,
+    "redirects_disabled": true
+  },
+  "node": {
+    "id": "node_50bf2770b061c4f0317dfbe86d41131f",
+    "name": "contract test node (isolated)",
+    "enabled": true,
+    "public_base_url": "https://node.contract.invalid",
+    "callback_urls": [
+      "https://node.contract.invalid/api/auth/feishu/callback"
+    ],
+    "created_at": 1793923200789
+  },
+  "now_ms": 1793923200789,
+  "pin": {
+    "algorithm": "Ed25519",
+    "key_id": "If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+    "key_source": "public RFC 8032 test vector 1 seed; never a deployment key",
+    "verification_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"
+  },
+  "provider": {
+    "h5_calls": 1,
+    "kind": "fixed pure test Provider; no Feishu HTTP client instantiated",
+    "oauth_calls": 1,
+    "oauth_pkce_binding_checked": true
+  },
+  "schema_version": 1,
+  "sensitive_data": "Authorization headers, administrator token, node token, PKCE verifier and SQLite files are deliberately omitted; all persisted identities/nonces/codes/assertions are isolated test data.",
+  "tenant_key": "tenant_contract_test_only",
+  "test_identity": {
+    "union_id": "union_contract_test_only",
+    "open_id": "ou_contract_test_only",
+    "tenant_key": "tenant_contract_test_only",
+    "name": "契约测试用户",
+    "email": "contract@example.invalid",
+    "avatar_url": "https://avatar.contract.invalid/test.png"
+  },
+  "source": {
+    "repository": "AionFeishuRoute",
+    "head_commit": "205d02875bfa941f3ee7fc768b34e5d53a84bf09",
+    "last_go_code_commit": "9251f2ca8fa68786ef8753218c6e488f063efe76",
+    "original_checkout_status_before": "",
+    "manifest_format": "UTF-8 lines: <sha256><two spaces><path><LF>, paths sorted lexicographically",
+    "manifest_sha256": "50ba72443bf764e794afd6efb656f65ca2cefd8d15e87309e6c2cc057a983b1b",
+    "files": [
+      {
+        "path": "cmd/aionfeishuroute/main.go",
+        "sha256": "4d13dc36794ae483d41dfda79b42f5d3ad718f6e894f05a175855727b2cdd680"
+      },
+      {
+        "path": "cmd/aionfeishuroute/main_test.go",
+        "sha256": "ceccde296671a38a77c8da85de6ede5a067347ae9014d3c65c62a34345d44a63"
+      },
+      {
+        "path": "go.mod",
+        "sha256": "2d11f379daf4f61845455217c1b448c3419e21c49e435a2f7f43c9c5360340ea"
+      },
+      {
+        "path": "go.sum",
+        "sha256": "9222ed05eb1c3377f5d92c669f2fede716900ed9aee99309cda2bcd7b3bf5702"
+      },
+      {
+        "path": "internal/config/config.go",
+        "sha256": "d90b47b133dea859b4fbdef22a2a0880137179bc6f22f6fd1686ac11e72952ec"
+      },
+      {
+        "path": "internal/config/config_test.go",
+        "sha256": "58bf9be8b0f9ba09b01078a04c1acd22d6dbe705fec5c080f97a5884a9f12ef8"
+      },
+      {
+        "path": "internal/domain/errors.go",
+        "sha256": "def4734a96b4488845a2841e862ff8657e5b6d39a80ef59c367f82e139562ebd"
+      },
+      {
+        "path": "internal/domain/models.go",
+        "sha256": "cf28d45067368406aaa42f96dc12b30a805145f1cd13f9e97e354be8f96b3d12"
+      },
+      {
+        "path": "internal/feishu/client.go",
+        "sha256": "5a19336e65855482283b2ac144c235c465c084485178de72af1b11fe2b2d6f90"
+      },
+      {
+        "path": "internal/feishu/client_test.go",
+        "sha256": "19f2e55bf15c003f7ad6135064743387f67eadefcfccbe0d58e474ba32eea5cb"
+      },
+      {
+        "path": "internal/feishu/events.go",
+        "sha256": "486a440f67dfd4eab3e52c770afc7c5956fb1aed6cd8cf298f64ccbb1543793f"
+      },
+      {
+        "path": "internal/feishu/events_store_test.go",
+        "sha256": "3d2c599fa8eced519ac7a1d5f92a99dcbd3bdc32aa0daec4703a3844cbd58ed6"
+      },
+      {
+        "path": "internal/feishu/events_test.go",
+        "sha256": "3032f740089f8d759ef6678f9d218f887b1034e190d0077424c91c08efbcc8e9"
+      },
+      {
+        "path": "internal/feishu/identity.go",
+        "sha256": "317ecf68af3648d9e8ef8d93117aab45b10a9624d02292d28d5eb42a9be47f6d"
+      },
+      {
+        "path": "internal/feishu/runtime.go",
+        "sha256": "3956567824fcc52c7b453a9969d0e9cf2f28507930ab8f64de9bd70d6d3c514e"
+      },
+      {
+        "path": "internal/feishu/runtime_test.go",
+        "sha256": "8b346eb9e1f478ed0e7b72fb489b0d3690ffe9d90f765e1d34355f3fa42de52e"
+      },
+      {
+        "path": "internal/feishu/types.go",
+        "sha256": "cf0d79400b8f031ec1c1eed6992b666fbf080428622528e0912c1afb625d5ef5"
+      },
+      {
+        "path": "internal/identity/service.go",
+        "sha256": "3f608971112243229a613283cd063065c6839c7e871e7f4b779a937da7d2d5f3"
+      },
+      {
+        "path": "internal/identity/service_test.go",
+        "sha256": "a3577b2b6077914e7e5207a2b4604a790a04039547ba6ea2731a69c5fa31dedf"
+      },
+      {
+        "path": "internal/instance/lock.go",
+        "sha256": "b57d6d79faa6f363e5be8f8e1d475d85d25d4fc2c7b780851c3b50eb13c8223d"
+      },
+      {
+        "path": "internal/instance/lock_test.go",
+        "sha256": "f1d2c980912b38cc6ae40a9ea1fe36301d32ca4b56fc1057efd6557e9e581cd8"
+      },
+      {
+        "path": "internal/server/gin_test.go",
+        "sha256": "1ac69cd12c14ec07e240c40876ca8d5682e719c3153ad373e5a1ac17227ce6bf"
+      },
+      {
+        "path": "internal/server/handlers.go",
+        "sha256": "ca7cb47092cc407ab0f9a28c0970270b6f1c79e54138e068b8c2e65517089d61"
+      },
+      {
+        "path": "internal/server/integration_test.go",
+        "sha256": "c4206768d584e5ee3a51971a9500535f7f534003868ea2b95058d816cce4011f"
+      },
+      {
+        "path": "internal/server/json.go",
+        "sha256": "14cb7795a826283933b83871037c487aa2c45710ace1876048f3551f89d71d6c"
+      },
+      {
+        "path": "internal/server/reject_test.go",
+        "sha256": "055a300c79f5b7d30da9afd263195c6ea991c29e0ba4d12273df7331cab98684"
+      },
+      {
+        "path": "internal/server/review_probe_test.go",
+        "sha256": "cae69279b4281fc19eb82a77860909ee9f4679d518c1003d3e15171d82ee667d"
+      },
+      {
+        "path": "internal/server/security.go",
+        "sha256": "3f10a4a986d3b1be4a365689aca4433dc03143ebe2d83dbecb3759b49c7f19e8"
+      },
+      {
+        "path": "internal/server/security_test.go",
+        "sha256": "6073e11cf63a3300e0691df38a103aa54c7d4298ee9e667b343d0247ebdffc66"
+      },
+      {
+        "path": "internal/server/server.go",
+        "sha256": "4f335a72087e03c8132fcab874b795e3d39f7585c7297778a8e82a672c227199"
+      },
+      {
+        "path": "internal/server/server_test.go",
+        "sha256": "50017535726e7674ae8a880290093a80af59a991ed942e635e5d6c5bed8c1426"
+      },
+      {
+        "path": "internal/server/types.go",
+        "sha256": "45166f14bdd368a6488f8cf346d62ee30165884de6e8a0ac32209d4a3a662c84"
+      },
+      {
+        "path": "internal/server/unknown.go",
+        "sha256": "923e70a483b0d85dd6e482d45412c1ad7f2bf3604bcfa8dcd8483ca598e7d589"
+      },
+      {
+        "path": "internal/server/unknown_test.go",
+        "sha256": "627541329e33778c40686e52e221d65935e925a4183364161612abc186e994ac"
+      },
+      {
+        "path": "internal/server/websocket.go",
+        "sha256": "a3322d5dc6bc6c9078ecc0ed08716cc2651f21695820d28de693f4e154dade22"
+      },
+      {
+        "path": "internal/server/websocket_test.go",
+        "sha256": "7676a6ab6ecb73bc8eaf0f4bb352c5a8000516b3f53e0b62ed4ebefb7106ec62"
+      },
+      {
+        "path": "internal/store/audits.go",
+        "sha256": "ae441b2cc6c5488dcf88bafdcbcdd130c41a423b0a0440ee41e2df1f712f0b66"
+      },
+      {
+        "path": "internal/store/audits_test.go",
+        "sha256": "04ed4611178f6a75e66dc0a0d23325305998dbb892b5331fbd12d88fb6b23e62"
+      },
+      {
+        "path": "internal/store/contracts.go",
+        "sha256": "41b0cf078466a1ab9bd18b26196e2d42d20f8ef995fc473b1bbef34dddab9086"
+      },
+      {
+        "path": "internal/store/deliveries.go",
+        "sha256": "c9b74bb0155c72747a78e32b3225fc0627c9a84d51157af7e26ea9669c319d9c"
+      },
+      {
+        "path": "internal/store/events.go",
+        "sha256": "8610cd5d268546dd7d91b1b65451bba4c2588ccc28ee82b2d4f8fba8cc413958"
+      },
+      {
+        "path": "internal/store/nodes.go",
+        "sha256": "252ba11b489ad6ef1576d8632441e3df2e33ded7c46165b7d5a5f66196eea484"
+      },
+      {
+        "path": "internal/store/outbounds.go",
+        "sha256": "2538d8e8f4ac7f2a314eb4d6fe4cf5c6a2061c56ceab9305092c91349bb6bb27"
+      },
+      {
+        "path": "internal/store/outbounds_test.go",
+        "sha256": "8f4abd1ebbcb9ab7e37333e72cd1f0484abebdaf5a63318231192e8296d20cbf"
+      },
+      {
+        "path": "internal/store/reject_deliveries_test.go",
+        "sha256": "71dadff61a69af5b39b9aa606021f37134040e4ee9ec558d0f13169fb53aaa56"
+      },
+      {
+        "path": "internal/store/reject_test.go",
+        "sha256": "c7e70fdc7b65ba4ef78a475343ed0d5ab97c8b835ef9ba2a1281f405f541e5a2"
+      },
+      {
+        "path": "internal/store/routes.go",
+        "sha256": "33dfe29791951189439f0836da4baf6c8cd4f330773436057be6590026c54215"
+      },
+      {
+        "path": "internal/store/security_test.go",
+        "sha256": "0036a0d10b023946b8ee61a9564376daf46225bf5564f464d9aced9644e91169"
+      },
+      {
+        "path": "internal/store/store.go",
+        "sha256": "bd3a3fb16266d6d3d9b6fbc7e6d8ac7fb411d8028053618d7d41c637b11d0c38"
+      },
+      {
+        "path": "internal/store/store_test.go",
+        "sha256": "873e88a565e926f6babcda639bb8b5cec9aae94ec682a0e31addc770fe71312f"
+      },
+      {
+        "path": "internal/store/topics.go",
+        "sha256": "b5b029faad22235e19356a16a6b40f842b6b7b1dff94c8e37bb8c6cce17752de"
+      },
+      {
+        "path": "internal/worker/feishu.go",
+        "sha256": "ef447987b0c8d7c1df3fe2d7cd70e76df0641bf63fdf0a2b2c62bbb0625e9c89"
+      },
+      {
+        "path": "internal/worker/receipt_review_test.go",
+        "sha256": "02cf43a3ccb58542b8c516612ec3ff7a37a00c52f9da3f1de47e7d15848b7783"
+      },
+      {
+        "path": "internal/worker/worker.go",
+        "sha256": "eda0149537c82f8d38ffbe6dce06a69425405fcf833217c57fd93f6faac21f50"
+      },
+      {
+        "path": "internal/worker/worker_test.go",
+        "sha256": "f349c1d945dcfeedb89fd99751e16025ea569e801ac63cae929f93c010dbd6f5"
+      },
+      {
+        "path": "tests/e2e/hub_test.go",
+        "sha256": "261ca310bfa0405a154dfdb76a64d6a91bd8590b8eb65f4d418cb17e7303ff7c"
+      }
+    ],
+    "copied_files": "only git-tracked *.go, go.mod and go.sum; no .git, config, credentials, binaries, databases or other artifacts",
+    "helper_go_sha256": "2f6d3b092caf98c887068839581e8e91a2112e1d9602eafc30c9011b6c88995c",
+    "helper_python_sha256": "8d234084281bd59be9a373ff34fd1ea9b751daf5fe0af167d3ccc945d4093056"
+  },
+  "execution": {
+    "go_version": "go version go1.27.3 darwin/arm64",
+    "commands": [
+      {
+        "command": "/opt/homebrew/bin/go test -count=1 ./internal/identity ./internal/server ./internal/store",
+        "cwd": "<isolated_temp>/module",
+        "exit_code": 0,
+        "stdout": "ok  \taionfeishuroute/internal/identity\t0.020s\nok  \taionfeishuroute/internal/server\t0.238s\nok  \taionfeishuroute/internal/store\t0.272s"
+      },
+      {
+        "command": "/opt/homebrew/bin/go test -count=1 -run TestCaptureIdentityHTTPContract -v ./cmd/contractcapture",
+        "cwd": "<isolated_temp>/module",
+        "exit_code": 0,
+        "stdout": "=== RUN   TestCaptureIdentityHTTPContract\nCaptured real oauth/h5 begin and exchange bodies; verified signatures, nonce/transaction binding, PKCE and replay rejection.\n--- PASS: TestCaptureIdentityHTTPContract (0.01s)\nPASS\nok  \taionfeishuroute/cmd/contractcapture\t0.025s"
+      }
+    ],
+    "reproduce_command": "python3 docs/superpowers/sdd/1.0.3/capture-feishu-identity-contract.py",
+    "environment_overrides": {
+      "GOWORK": "off",
+      "GOTOOLCHAIN": "local",
+      "GOPROXY": "off",
+      "GOSUMDB": "off",
+      "GOFLAGS": "-mod=readonly",
+      "GOCACHE": "<isolated_temp>/gocache",
+      "GOTMPDIR": "<isolated_temp>/gotmp",
+      "CONTRACT_CAPTURE_OUTPUT": "<isolated_temp>/http-capture.json"
+    },
+    "transaction_ids_and_pkce": "generated by unmodified Go crypto/rand; intentionally vary on recapture"
+  },
+  "isolation_cleanup": {
+    "temporary_directory_removed": true,
+    "go_checkout_unchanged": true,
+    "http_listener_closed": "httptest cleanup completed before successful go test exit",
+    "private_sqlite_and_ephemeral_credentials_removed": true,
+    "isolated_compile_cache_removed": true,
+    "external_services_contacted": false,
+    "retained_artifacts": [
+      "docs/superpowers/sdd/1.0.3/feishu-identity-contract-capture.json",
+      "docs/superpowers/sdd/1.0.3/capture-feishu-identity-contract.py"
+    ]
+  }
+}

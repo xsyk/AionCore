@@ -43,6 +43,45 @@ impl GatewayClient {
     pub fn tenant_key(&self) -> &str {
         &self.config.tenant_key
     }
+    pub fn identity_config(&self) -> Option<&super::GatewayIdentityConfig> {
+        self.config.identity.as_ref()
+    }
+
+    pub async fn begin_identity(
+        &self,
+        request: aionui_api_types::FeishuGatewayIdentityBeginRequest,
+    ) -> Result<aionui_api_types::FeishuGatewayIdentityTransaction, ChannelError> {
+        let response: aionui_api_types::FeishuGatewayIdentityBeginResponse = self
+            .request(
+                Method::POST,
+                "identity/transactions",
+                &[],
+                Some(serde_json::to_value(request).map_err(|_| failed("GATEWAY_IDENTITY_REQUEST_INVALID"))?),
+                StatusCode::CREATED,
+                false,
+            )
+            .await?
+            .ok_or_else(|| failed("GATEWAY_RESPONSE_INVALID"))?;
+        Ok(response.transaction)
+    }
+
+    pub async fn exchange_identity(
+        &self,
+        request: aionui_api_types::FeishuGatewayIdentityExchangeRequest,
+    ) -> Result<aionui_api_types::FeishuGatewayIdentityExchange, ChannelError> {
+        let response: aionui_api_types::FeishuGatewayIdentityExchangeResponse = self
+            .request(
+                Method::POST,
+                "identity/exchange",
+                &[],
+                Some(serde_json::to_value(request).map_err(|_| failed("GATEWAY_IDENTITY_REQUEST_INVALID"))?),
+                StatusCode::OK,
+                false,
+            )
+            .await?
+            .ok_or_else(|| failed("GATEWAY_RESPONSE_INVALID"))?;
+        Ok(response.identity)
+    }
 
     async fn request<T: DeserializeOwned>(
         &self,
