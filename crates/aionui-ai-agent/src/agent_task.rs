@@ -366,7 +366,7 @@ impl AgentInstance {
     }
 
     /// Answer a structured question card via the dedicated channel.
-    pub fn answer_ask(
+    pub async fn answer_ask(
         &self,
         request_id: &str,
         answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
@@ -377,7 +377,7 @@ impl AgentInstance {
             Self::Acp(_) | Self::Aionrs(_) => Err(AgentError::BadRequest(
                 "answer_ask is not supported by this agent".into(),
             )),
-            Self::Session(m) => m.answer_ask(request_id, answers),
+            Self::Session(m) => m.answer_ask(request_id, answers).await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.answer_ask(request_id, answers),
         }

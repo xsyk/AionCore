@@ -17,6 +17,7 @@ pub struct FeishuBridgeDependencies {
     pub conversation_repo: Arc<dyn IConversationRepository>,
     pub users: Arc<dyn IUserRepository>,
     pub login_config: Arc<dyn IFeishuLoginRepository>,
+    pub sender_names: Option<Arc<dyn aionui_auth::feishu::contacts::FeishuSenderNameResolver>>,
     pub tasks: Arc<dyn IWorkerTaskManager>,
     pub sender: Arc<dyn ChannelSender>,
     #[cfg(feature = "lark")]
@@ -43,6 +44,10 @@ pub struct FeishuBridge {
     pub(super) gateway_identity_checked: std::sync::atomic::AtomicBool,
     #[cfg(feature = "lark")]
     pub(super) gateway_reconcile_cursor: Mutex<usize>,
+    #[cfg(feature = "lark")]
+    pub(super) gateway_resource_cursor: Mutex<usize>,
+    #[cfg(feature = "lark")]
+    pub(super) gateway_delivery_cursor: Mutex<Option<String>>,
     #[cfg(feature = "lark")]
     pub(super) gateway_settled_routes: Mutex<std::collections::HashSet<String>>,
 }

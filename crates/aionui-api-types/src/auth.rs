@@ -91,6 +91,9 @@ pub struct UserInfoResponse {
 pub struct AdminUserView {
     pub id: String,
     pub username: String,
+    /// 同步的显示姓名，独立于已有登录名。
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// `active` or `disabled`.
     pub status: String,
     pub created_at: aionui_common::TimestampMs,
@@ -103,6 +106,28 @@ pub struct AdminUserView {
     /// Feishu avatar; `None` unless the stored value is an http(s) URL.
     pub avatar_url: Option<String>,
 }
+
+/// 通讯录同步的最近一次任务；不携带通讯录正文或上游身份。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeishuDirectorySyncView {
+    pub id: String,
+    pub status: String,
+    pub scanned: u64,
+    pub created: u64,
+    pub updated: u64,
+    pub unchanged: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub partial: bool,
+    pub error_code: Option<String>,
+    pub started_at: aionui_common::TimestampMs,
+    pub finished_at: Option<aionui_common::TimestampMs>,
+}
+
+/// 管理员主动启动同步，不接受凭据、身份或注册策略覆盖。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeishuDirectorySyncRequest {}
 
 /// `GET /api/auth/feishu/status` — whether the login page shows the Feishu
 /// button, and the site URL the login has to start from.

@@ -8,12 +8,20 @@ use super::{GatewayConfig, GatewayDelivery, GatewayIntent, GatewayOutbound, Gate
 use crate::error::ChannelError;
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_RESOURCE_BYTES: usize = 5 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct GatewayResource {
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+}
 
 /// Bounded node API client. Upstream payloads and credentials are never errors.
 #[derive(Clone)]
 pub struct GatewayClient {
     config: GatewayConfig,
     http: reqwest::Client,
+    resource_http: reqwest::Client,
     base: String,
 }
 
@@ -27,10 +35,18 @@ impl GatewayClient {
             .connect_timeout(Duration::from_secs(3))
             .build()
             .map_err(|_| failed("GATEWAY_CLIENT_INIT"))?;
+        let resource_http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|_| failed("GATEWAY_CLIENT_INIT"))?;
         Ok(Self {
             base: url.as_str().trim_end_matches('/').to_owned(),
             config,
             http,
+            resource_http,
         })
     }
 
@@ -208,6 +224,46 @@ impl GatewayClient {
             self.verify_route(&d.route)?;
         }
         Ok(response.deliveries)
+    }
+
+    /// Fetch only a delivery-scoped resource; never follow a credential-bearing redirect.
+    pub async fn fetch_resource(&self, delivery_id: &str, file_key: &str) -> Result<GatewayResource, ChannelError> {
+        validate_id(delivery_id)?;
+        validate_id(file_key)?;
+        let mut response = self
+            .resource_http
+            .get(format!(
+                "{}/api/node/deliveries/{delivery_id}/resources/{file_key}",
+                self.base
+            ))
+            .bearer_auth(&self.config.token)
+            .send()
+            .await
+            .map_err(|_| failed("GATEWAY_RESOURCE_TRANSPORT"))?;
+        if response.status() != StatusCode::OK {
+            return Err(failed(match response.status() {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "GATEWAY_AUTH_REJECTED",
+                StatusCode::GONE => "GATEWAY_EXPIRED",
+                _ => "GATEWAY_RESOURCE_UNAVAILABLE",
+            }));
+        }
+        if response.content_length().is_some_and(|n| n > MAX_RESOURCE_BYTES as u64) {
+            return Err(failed("GATEWAY_RESOURCE_TOO_LARGE"));
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|header| header.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| failed("GATEWAY_RESOURCE_READ"))? {
+            if chunk.len() > MAX_RESOURCE_BYTES.saturating_sub(bytes.len()) {
+                return Err(failed("GATEWAY_RESOURCE_TOO_LARGE"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(GatewayResource { bytes, content_type })
     }
 
     pub async fn ack(&self, delivery_id: &str, status: &str) -> Result<(), ChannelError> {

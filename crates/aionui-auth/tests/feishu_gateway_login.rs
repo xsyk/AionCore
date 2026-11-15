@@ -280,6 +280,7 @@ async fn setup(mode: Mode, policy: FeishuSignupPolicy) -> Context {
         local: false,
         aionpro_mode: false,
         feishu: Some(Arc::new(feishu)),
+        feishu_directory: None,
     };
     Context {
         app: auth_routes(state),

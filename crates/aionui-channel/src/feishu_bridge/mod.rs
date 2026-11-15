@@ -1,6 +1,8 @@
 #[cfg(feature = "lark")]
 mod gateway_binding;
 #[cfg(feature = "lark")]
+mod gateway_images;
+#[cfg(feature = "lark")]
 mod gateway_runtime;
 #[cfg(feature = "lark")]
 mod gateway_send;

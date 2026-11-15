@@ -3,6 +3,8 @@
 
 pub mod account;
 pub mod client;
+pub mod contacts;
+pub mod directory;
 pub mod gateway_identity;
 pub mod gateway_login;
 pub mod pkce;

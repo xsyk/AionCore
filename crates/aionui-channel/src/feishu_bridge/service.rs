@@ -104,8 +104,22 @@ impl FeishuBridge {
             #[cfg(feature = "lark")]
             gateway_reconcile_cursor: Mutex::new(0),
             #[cfg(feature = "lark")]
+            gateway_resource_cursor: Mutex::new(0),
+            #[cfg(feature = "lark")]
+            gateway_delivery_cursor: Mutex::new(None),
+            #[cfg(feature = "lark")]
             gateway_settled_routes: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    pub(super) async fn sender_display_name(&self, app_id: &str, tenant_key: &str, open_id: &str) -> String {
+        let name = match &self.deps.sender_names {
+            Some(resolver) => resolver.resolve(app_id, tenant_key, open_id).await,
+            None => None,
+        };
+        name.map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty() && name != open_id)
+            .unwrap_or_else(|| "外部用户".to_owned())
     }
 
     pub(super) async fn ensure_owner(&self, owner: &str, conversation: &str) -> Result<(), ChannelError> {
@@ -465,6 +479,9 @@ impl FeishuBridge {
                 .await?;
             return Ok(());
         }
+        let sender_name = self
+            .sender_display_name(&identity.app_id, &identity.tenant_key, &message.user.id)
+            .await;
         // Stable origin is persisted before the transport callback is acknowledged.
         // The conversation service also reuses it as the DB primary key, so a
         // retry after persistence cannot append another message or open a turn.
@@ -486,12 +503,11 @@ impl FeishuBridge {
             return Ok(());
         }
         let origin = format!("feishu:{}:{}", identity.app_id, message.id);
-        let text = format!(
-            "[飞书 · {}]\n{}",
-            message.user.display_name,
-            message.content.text.trim()
-        );
-        self.deps.bindings.enqueue_inbox(&origin, &binding.id, &text).await?;
+        let text = format!("[飞书 · {}]\n{}", sender_name, message.content.text.trim());
+        self.deps
+            .bindings
+            .enqueue_inbox(&origin, &binding.id, &text, &[])
+            .await?;
         Ok(())
     }
 

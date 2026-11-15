@@ -411,6 +411,8 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // Pure UI surface — the conversation projects it to the model/mode picker;
         // the FSM never reads a catalog. No-op here (like ConfigChanged).
         | SessionEvent::CatalogUpdated { .. }
+        | SessionEvent::CollaborationModeUpdated { .. }
+        | SessionEvent::EffortConfirmed { .. }
         | SessionEvent::ItemStarted { .. }
         | SessionEvent::ItemCompleted { .. }
         // Live tool-output / turn-diff streams: pure display liveness within a

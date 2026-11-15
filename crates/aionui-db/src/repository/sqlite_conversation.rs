@@ -413,16 +413,31 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        // ACP has no FK cascade. Delete it while its parent can still authorize
+        // the owner, in the same transaction as the parent and message cascade.
+        // This first write also serializes late ACP writes: they either finish
+        // before cleanup or see a missing parent after commit.
+        sqlx::query(
+            "DELETE FROM acp_session \
+             WHERE conversation_id = ? \
+               AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = acp_session.conversation_id AND c.user_id = ?)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
         let result = sqlx::query("DELETE FROM conversations WHERE user_id = ? AND id = ?")
             .bind(user_id)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("Conversation '{id}' not found")));
         }
 
+        tx.commit().await?;
         Ok(())
     }
 

@@ -6,6 +6,7 @@ use crate::factory::AgentFactoryDeps;
 use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
 use crate::factory::acp_launch_policy::{AcpLaunchPolicyInput, apply_acp_launch_policy};
 use crate::factory::context::FactoryContext;
+use crate::factory::qa_session_launch::QaLaunchEnvironment;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::registry::AgentRegistry;
 use crate::session_context::AcpSessionBuildContext;
@@ -114,6 +115,24 @@ pub(super) async fn build(
     if let Some(backend_label) = config.backend.as_deref()
         && matches!(route_for_backend(Some(backend_label)), BackendRoute::DirectCli)
     {
+        let qa_launch = match deps.qa_session_launch.as_ref() {
+            Some(policy) => {
+                policy
+                    .resolve(
+                        backend_label,
+                        &ctx.conversation_id,
+                        &ctx.user_id,
+                        deps.conversation_repo.as_deref(),
+                        QaLaunchEnvironment {
+                            metadata_env: &meta.env,
+                            runtime_env: &ctx.runtime_env,
+                        },
+                        config.fork.is_some(),
+                    )
+                    .await?
+            }
+            None => None,
+        };
         let delivery = crate::factory::resolve_skill_delivery(
             deps.as_ref(),
             &ctx.user_id,
@@ -155,6 +174,7 @@ pub(super) async fn build(
                 // claude/codex gate permissions through their own CLI flags, not
                 // through an installed hook file.
                 permission_hook_body: None,
+                qa_launch,
             },
             deps.session_spawner.clone(),
         )

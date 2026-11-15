@@ -1316,6 +1316,8 @@ impl BackendAdapter for ClaudeAdapter {
             // `!available_modes.is_empty()`); without this the mode picker had no data
             // even though the write path (SetMode) was fully wired.
             available_modes: claude_permission_modes(),
+            available_collaboration_modes: Vec::new(),
+            current_collaboration_mode: None,
             current_model: None,
             current_mode: None,
             current_effort: None,

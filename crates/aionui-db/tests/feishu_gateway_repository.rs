@@ -51,6 +51,40 @@ async fn insert_message(db: &aionui_db::Database, id: &str, created: i64) {
 }
 
 #[tokio::test]
+async fn pending_delivery_pages_keep_insertion_order_after_cursor_completion() {
+    let (_db, gateway, _legacy) = fixture().await;
+    for index in 0..205 {
+        // IDs deliberately sort in the opposite order to insertion.
+        gateway
+            .enqueue_delivery(&format!("d_{:03}", 205 - index), "r_a", "g_a", "message", "{}")
+            .await
+            .unwrap();
+    }
+    let first = gateway.pending_deliveries_after(None).await.unwrap();
+    assert_eq!(first.len(), 100);
+    assert_eq!(first[0].id, "d_205");
+    let cursor = first.last().unwrap().id.clone();
+    gateway.complete_delivery(&cursor, "enqueued").await.unwrap();
+    let second = gateway.pending_deliveries_after(Some(&cursor)).await.unwrap();
+    assert_eq!(second.len(), 100);
+    assert_eq!(second[0].id, "d_105");
+    assert_eq!(second.last().unwrap().id, "d_006");
+    let last = gateway.pending_deliveries_after(Some("d_006")).await.unwrap();
+    assert_eq!(
+        last.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["d_005", "d_004", "d_003", "d_002", "d_001"]
+    );
+    assert!(
+        gateway
+            .pending_deliveries_after(Some("d_001"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(gateway.pending_deliveries().await.unwrap()[0].id, "d_205");
+}
+
+#[tokio::test]
 async fn identity_is_immutable_and_prepared_routes_cannot_be_used_as_bindings() {
     let (_db, gateway, legacy) = fixture().await;
     gateway.ensure_identity("node", "app", "tenant").await.unwrap();

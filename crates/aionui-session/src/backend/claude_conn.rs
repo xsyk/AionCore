@@ -6044,10 +6044,12 @@ mod tests {
         };
         let answers = vec![
             QuestionAnswer {
+                question_id: None,
                 question: "Which language?".into(),
                 labels: vec!["Rust".into()],
             },
             QuestionAnswer {
+                question_id: None,
                 question: "Which features do you want?".into(),
                 labels: vec!["Auth".into(), "Logging".into()],
             },

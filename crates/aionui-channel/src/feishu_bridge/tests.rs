@@ -299,6 +299,11 @@ async fn fixture() -> Fixture {
         Arc::new(aionui_db::SqliteAgentMetadataRepository::new(db.pool().clone())),
         Arc::new(aionui_db::SqliteAcpSessionRepository::new(db.pool().clone())),
     ));
+    conversations.with_project_service(Arc::new(aionui_project::ProjectService::new(
+        Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone())),
+        std::env::temp_dir().join("conversations"),
+        Vec::new(),
+    )));
     let bindings = Arc::new(SqliteFeishuBindingRepository::new(db.pool().clone()));
     let sender = Arc::new(RecordingSender::default());
     let bridge = Arc::new(FeishuBridge::new(FeishuBridgeDependencies {
@@ -307,6 +312,7 @@ async fn fixture() -> Fixture {
         conversation_repo: repo,
         users,
         login_config: login,
+        sender_names: None,
         tasks,
         sender: sender.clone(),
         #[cfg(feature = "lark")]
@@ -438,6 +444,28 @@ async fn bind(fixture: &Fixture) -> aionui_db::models::FeishuBindingRow {
         .await
         .unwrap()
         .unwrap()
+}
+
+struct DirectSenderName;
+
+#[async_trait::async_trait]
+impl aionui_auth::feishu::contacts::FeishuSenderNameResolver for DirectSenderName {
+    async fn resolve(&self, app_id: &str, tenant_key: &str, open_id: &str) -> Option<String> {
+        assert_eq!((app_id, tenant_key, open_id), ("app", "tenant", "ou_on_other"));
+        Some("通讯录测试成员".into())
+    }
+}
+
+#[tokio::test]
+async fn direct_sender_label_uses_directory_name_instead_of_transport_display_id() {
+    let mut fixture = fixture().await;
+    Arc::get_mut(&mut fixture.bridge).unwrap().deps.sender_names = Some(Arc::new(DirectSenderName));
+    bind(&fixture).await;
+    let message = incoming(&fixture, "on_other", "直连姓名标签测试", "group");
+    assert!(fixture.bridge.handle_incoming(&message).await);
+    let inbox = fixture.bindings.pending_inbox().await.unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].content, "[飞书 · 通讯录测试成员]\n直连姓名标签测试");
 }
 
 #[tokio::test]
@@ -723,7 +751,8 @@ async fn inbound_retries_before_persist_and_after_persist_do_not_lose_or_duplica
         .await
         .unwrap()
         .unwrap();
-    assert!(accepted.content.contains("on_other"));
+    let accepted_content: Value = serde_json::from_str(&accepted.content).unwrap();
+    assert_eq!(accepted_content["content"], "[飞书 · 外部用户]\ngroup input");
     assert!(accepted.content.contains("group input"));
     sqlx::query("DROP TRIGGER reject_checkpoint")
         .execute(fixture._database.pool())
@@ -1389,7 +1418,7 @@ async fn previously_persisted_input_after_restart_surfaces_uncertainty_without_e
     let origin = "feishu:app:crash_before_dispatch";
     fixture
         .bindings
-        .enqueue_inbox(origin, &binding.id, "saved before process exit")
+        .enqueue_inbox(origin, &binding.id, "saved before process exit", &[])
         .await
         .unwrap();
     fixture

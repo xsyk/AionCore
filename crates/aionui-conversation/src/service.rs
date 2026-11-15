@@ -2684,15 +2684,6 @@ impl ConversationService {
         if !had_active_turn {
             self.runtime_state.clear_deleting(id);
         }
-        // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
-        // conversations that used to be ACP (shouldn't happen but is
-        // cheap to cover) still drop their orphaned session row.
-        if let Err(err) = self.acp_session_repo.delete_for_user(user_id, id).await {
-            warn!(
-                error = %ErrorChain(&err),
-                "Failed to delete acp_session row on conversation delete"
-            );
-        }
         if let Some(workspace) = auto_workspace_to_delete {
             let workspace_removed = match tokio::fs::remove_dir_all(&workspace).await {
                 Ok(()) => {
@@ -3562,7 +3553,7 @@ impl ConversationService {
             .find(|c| c.call_id == request_id)
             .map(|c| c.id.clone());
 
-        agent.answer_ask(request_id, answers)?;
+        agent.answer_ask(request_id, answers).await?;
 
         if let Some(conf_id) = conf_id {
             let payload = serde_json::json!({
@@ -3939,6 +3930,20 @@ impl ConversationService {
                 .await);
         }
 
+        // Reject queued uploads before resolving or copying them when the active
+        // turn cannot accept input. The claim below remains authoritative if a
+        // different sender starts a turn after this advisory check.
+        if !req.files.is_empty()
+            && self.runtime_state.active_turn_id_for(conversation_id).is_some()
+            && !task_manager
+                .get_task(conversation_id)
+                .is_some_and(|agent| agent.supports_midturn_delivery() && agent.get_confirmations().is_empty())
+        {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} is already running"),
+            });
+        }
+
         // `@@` references resolve at the same boundary and with the same
         // atomicity as file attachments. Sender workspace comes from the row so
         // the block can state `workspace: same` without the model comparing
@@ -3971,7 +3976,7 @@ impl ConversationService {
         let mut resolved = self
             .resolve_message_attachments(user_id, &content_with_sessions, &req.files)
             .await?;
-        crate::share::scope_upload_attachments(user_id, conversation_id, &req.files, &mut resolved).await?;
+        let mut uploads_scoped = false;
 
         // ── Mid-turn delivery (B5, spec §4.3) ────────────────────────────
         // An ACTIVE turn + a backend that supports mid-turn delivery → the
@@ -4008,6 +4013,8 @@ impl ConversationService {
                     );
                 }
             } else {
+                crate::share::scope_upload_attachments(user_id, conversation_id, &req.files, &mut resolved).await?;
+                uploads_scoped = true;
                 match self
                     .deliver_midturn_message(
                         user_id,
@@ -4037,6 +4044,13 @@ impl ConversationService {
             let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
             (turn_id, turn_claim)
         };
+
+        // Materialize uploads only after owning a new turn, or after selecting
+        // the eligible mid-turn path above. Losing a concurrent claim must not
+        // leave another copy on every transport retry.
+        if !uploads_scoped {
+            crate::share::scope_upload_attachments(user_id, conversation_id, &req.files, &mut resolved).await?;
+        }
 
         // Store user message. `msg_id` is server-generated so the WebSocket
         // stream, DB row, and client-side message index all agree on the same

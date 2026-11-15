@@ -45,6 +45,9 @@ pub struct User {
     pub user_type: UserType,
     pub external_user_id: Option<String>,
     pub username: Option<String>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub email: Option<String>,
     pub password_hash: Option<String>,
     pub avatar_path: Option<String>,

@@ -335,6 +335,13 @@ impl FeishuBridge {
                 self.deps.bindings.complete_inbox(&row.id).await?;
                 continue;
             }
+            let files: Vec<String> = match serde_json::from_str(&row.files) {
+                Ok(files) => files,
+                Err(_) => {
+                    warn!(delivery_id = %row.id, code = "FEISHU_INBOX_FILES_INVALID", "feishu: input files retained for review");
+                    continue;
+                }
+            };
             #[cfg(feature = "lark")]
             self.ensure_gateway_identity().await?;
             self.deps
@@ -349,7 +356,10 @@ impl FeishuBridge {
                     &binding.conversation_id,
                     SendMessageRequest {
                         content: row.content,
-                        files: vec![],
+                        files: files
+                            .into_iter()
+                            .map(|path| aionui_api_types::ChatFileRef::Upload { path })
+                            .collect(),
                         sessions: vec![],
                         inject_skills: vec![],
                         hidden: false,

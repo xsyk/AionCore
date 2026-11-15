@@ -69,6 +69,7 @@ async fn test_app_with_options_and_hook(
         local,
         aionpro_mode,
         feishu: None,
+        feishu_directory: None,
     };
 
     let app = auth_routes(state);

@@ -92,6 +92,8 @@ fn make_factory(
         acp_agent_service,
         data_dir: PathBuf::from("/tmp/aionrs-test"),
         dump_prompts: false,
+        qa_session_launch: None,
+        conversation_repo: None,
         broadcaster: Arc::new(BroadcastEventBus::new(16)),
         backend_binary_path: Arc::new(PathBuf::from("/tmp/aionrs-test/aioncore")),
         mcp_server_repo: None,

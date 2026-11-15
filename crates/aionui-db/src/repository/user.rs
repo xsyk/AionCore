@@ -138,6 +138,9 @@ pub trait IUserRepository: Send + Sync {
         avatar_path: Option<&str>,
     ) -> Result<(), DbError>;
 
+    /// 只更新显示姓名；不更改登录名、状态、会话或软删除标记。
+    async fn update_display_name(&self, user_id: &str, display_name: &str) -> Result<(), DbError>;
+
     /// Whether any row other than `except_user_id` (soft-deleted included) owns this email.
     async fn email_taken(&self, email: &str, except_user_id: &str) -> Result<bool, DbError>;
 }

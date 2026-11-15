@@ -107,18 +107,20 @@ impl IFeishuBindingRepository for SqliteFeishuBindingRepository {
     async fn list_bindings(&self) -> Result<Vec<FeishuBindingRow>, DbError> {
         Ok(sqlx::query_as("SELECT b.* FROM feishu_conversation_bindings b JOIN conversations c ON c.id=b.conversation_id AND c.user_id=b.owner_user_id JOIN users u ON u.id=b.owner_user_id WHERE u.status='active' AND u.deleted_at IS NULL").fetch_all(&self.pool).await?)
     }
-    async fn enqueue_inbox(&self, id: &str, binding: &str, content: &str) -> Result<(), DbError> {
-        sqlx::query("INSERT OR IGNORE INTO feishu_inbox(id,binding_id,content) VALUES(?,?,?)")
+    async fn enqueue_inbox(&self, id: &str, binding: &str, content: &str, files: &[String]) -> Result<(), DbError> {
+        let files = serde_json::to_string(files).map_err(|_| DbError::Init("Invalid Feishu inbox files".into()))?;
+        sqlx::query("INSERT OR IGNORE INTO feishu_inbox(id,binding_id,content,files) VALUES(?,?,?,?)")
             .bind(id)
             .bind(binding)
             .bind(content)
+            .bind(files)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
     async fn pending_inbox(&self) -> Result<Vec<FeishuInboxRow>, DbError> {
         Ok(sqlx::query_as(
-            "SELECT id,binding_id,content,attempt_epoch FROM feishu_inbox WHERE done=0 ORDER BY rowid LIMIT 100",
+            "SELECT id,binding_id,content,files,attempt_epoch FROM feishu_inbox WHERE done=0 ORDER BY rowid LIMIT 100",
         )
         .fetch_all(&self.pool)
         .await?)

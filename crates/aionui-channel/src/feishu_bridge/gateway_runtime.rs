@@ -45,6 +45,10 @@ pub(super) fn validate_gateway_delivery(
         ));
     }
     if let Some(event) = &delivery.event {
+        if delivery.kind == "message" && event.attachments.len() > 10 {
+            warn!(delivery_id = %delivery.id, attachment_count = event.attachments.len(), code = "GATEWAY_IMAGE_COUNT_INVALID", "feishu: delivery exceeds image count limit");
+            return Err(ChannelError::InvalidConfig("GATEWAY_IMAGE_COUNT_INVALID".into()));
+        }
         if event.id.is_empty()
             || event.app_id != app
             || event.tenant_key != tenant
@@ -55,7 +59,13 @@ pub(super) fn validate_gateway_delivery(
             || (!event.chat_type.is_empty() && event.chat_type != route.chat_type)
             || (delivery.kind == "message"
                 && (event.kind != "message"
-                    || event.text.is_empty()
+                    || (event.text.is_empty() && event.attachments.is_empty())
+                    || event.attachments.iter().any(|attachment| {
+                        attachment.kind != "image"
+                            || !resource_key_valid(&attachment.file_key)
+                            || attachment.message_id.is_empty()
+                            || attachment.message_id != event.platform_message_id
+                    })
                     || (route.chat_type == "group" && !event.mentioned_bot)))
             || (delivery.kind == "interaction"
                 && (event.kind != "interaction"
@@ -75,6 +85,14 @@ pub(super) fn validate_gateway_delivery(
         return Err(ChannelError::InvalidConfig("Gateway event is missing".into()));
     }
     Ok(())
+}
+
+fn resource_key_valid(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 512
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
 // Go recognizes the literal "/answer " prefix, then strings.Fields selects
@@ -449,16 +467,75 @@ impl FeishuBridge {
             .gateway
             .as_ref()
             .ok_or_else(|| ChannelError::InvalidConfig("Gateway is not configured".into()))?;
-        for row in repository.pending_deliveries().await? {
+        // Keyset pagination bounds each tick while letting healthy rows beyond
+        // an unavailable first page progress. Advance only after this page has
+        // been processed, so a transient DB error cannot reorder valid text.
+        let mut delivery_cursor = self.gateway_delivery_cursor.lock().await;
+        let mut rows = repository.pending_deliveries_after(delivery_cursor.as_deref()).await?;
+        if rows.is_empty() && delivery_cursor.is_some() {
+            rows = repository.pending_deliveries_after(None).await?;
+            *delivery_cursor = None;
+            let mut cursor = self.gateway_resource_cursor.lock().await;
+            *cursor = cursor.wrapping_add(1);
+        }
+        let advance_resource_cursor = !rows.is_empty() && rows.len() < 100;
+        let next_cursor = if rows.len() == 100 {
+            rows.last().map(|row| row.id.clone())
+        } else {
+            None
+        };
+        // One image delivery per tick. Rotate the image offset once per whole
+        // queue pass, not per page, so equal-sized pages cannot starve alternate
+        // images. Its at-most-ten requests share a single 10s budget.
+        // Text and interactions retain insertion order across pages.
+        let image_rows = rows
+            .iter()
+            .filter(|row| {
+                serde_json::from_str::<GatewayDelivery>(&row.payload)
+                    .ok()
+                    .and_then(|delivery| delivery.event)
+                    .is_some_and(|event| !event.attachments.is_empty())
+            })
+            .map(|row| row.id.clone())
+            .collect::<Vec<_>>();
+        let selected_image = if image_rows.is_empty() {
+            None
+        } else {
+            let cursor = self.gateway_resource_cursor.lock().await;
+            Some(image_rows[*cursor % image_rows.len()].clone())
+        };
+        for row in rows {
             self.ensure_gateway_identity().await?;
-            let delivery: GatewayDelivery = serde_json::from_str(&row.payload)?;
-            validate_gateway_delivery(gateway.node_id(), gateway.app_id(), gateway.tenant_key(), &delivery)?;
-            if row.route_id != delivery.route.id
+            let delivery: GatewayDelivery = match serde_json::from_str(&row.payload) {
+                Ok(delivery) => delivery,
+                Err(_) => {
+                    warn!(delivery_id = %row.id, code = "GATEWAY_DELIVERY_INVALID", "feishu: invalid durable delivery requires review");
+                    repository.complete_delivery(&row.id, "expired_or_invalid").await?;
+                    continue;
+                }
+            };
+            if validate_gateway_delivery(gateway.node_id(), gateway.app_id(), gateway.tenant_key(), &delivery).is_err()
+            {
+                repository.complete_delivery(&row.id, "expired_or_invalid").await?;
+                continue;
+            }
+            if row.id != delivery.id
+                || row.route_id != delivery.route.id
                 || row.generation != delivery.route.generation
                 || row.kind != delivery.kind
                 || (delivery.expires_at > 0 && delivery.expires_at <= now_ms())
             {
-                repository.complete_delivery(&row.id, "expired_or_invalid").await?;
+                let has_images = delivery
+                    .event
+                    .as_ref()
+                    .is_some_and(|event| !event.attachments.is_empty());
+                let outcome = if has_images && delivery.expires_at <= now_ms() {
+                    "attachment_expired"
+                } else {
+                    "expired_or_invalid"
+                };
+                warn!(delivery_id = %row.id, code = "GATEWAY_DELIVERY_EXPIRED_OR_INVALID", outcome, "feishu: durable delivery ended without sending incomplete content");
+                repository.complete_delivery(&row.id, outcome).await?;
                 continue;
             }
             let Some(local) = repository
@@ -484,6 +561,45 @@ impl FeishuBridge {
                 .as_ref()
                 .ok_or_else(|| ChannelError::InvalidConfig("Gateway event is missing".into()))?;
             if delivery.kind == "message" {
+                let files = if event.attachments.is_empty() {
+                    Vec::new()
+                } else {
+                    if selected_image.as_deref() != Some(row.id.as_str()) {
+                        continue;
+                    }
+                    let fetches = event
+                        .attachments
+                        .iter()
+                        .map(|attachment| gateway.fetch_resource(&delivery.id, &attachment.file_key));
+                    let resources = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        futures_util::future::try_join_all(fetches),
+                    )
+                    .await;
+                    let downloaded = match resources {
+                        Ok(Ok(resources)) => {
+                            super::gateway_images::stage_images(&binding.owner_user_id, &delivery, resources).await
+                        }
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => Err(ChannelError::MessageSendFailed("GATEWAY_RESOURCE_TIMEOUT".into())),
+                    };
+                    match downloaded {
+                        Ok(files) => files,
+                        Err(error) => {
+                            if self.note_gateway_auth_error(&error) {
+                                self.fence_gateway_routes().await?;
+                                return Err(error);
+                            }
+                            warn!(delivery_id = %row.id, code = "GATEWAY_IMAGE_RETRY", reason = %error, expires_at = delivery.expires_at, "feishu: complete image delivery retained for retry");
+                            continue;
+                        }
+                    }
+                };
+                let sender_name = self
+                    .sender_display_name(&event.app_id, &event.tenant_key, &event.actor_open_id)
+                    .await;
+                // Downloads and name synchronization happen before either management lock.
+                // A concurrent revoke/owner change must be checked again here.
                 let _management = self.binding_management_lock.lock().await;
                 let lock = self
                     .conversation_locks
@@ -503,9 +619,26 @@ impl FeishuBridge {
                     repository.complete_delivery(&row.id, "fenced").await?;
                     continue;
                 }
+                if delivery.expires_at <= now_ms() {
+                    let outcome = if event.attachments.is_empty() {
+                        "expired_or_invalid"
+                    } else {
+                        "attachment_expired"
+                    };
+                    warn!(delivery_id = %row.id, code = "GATEWAY_DELIVERY_EXPIRED", outcome, "feishu: delivery expired while preparing input");
+                    repository.complete_delivery(&row.id, outcome).await?;
+                    continue;
+                }
+                if !self.gateway_binding_active(&binding.id).await? {
+                    repository.complete_delivery(&row.id, "fenced").await?;
+                    continue;
+                }
                 let origin = format!("feishu:{}:{}", event.app_id, event.id);
-                let text = format!("[飞书 · {}]\n{}", event.actor_open_id, event.text.trim());
-                self.deps.bindings.enqueue_inbox(&origin, &binding.id, &text).await?;
+                let text = format!("[飞书 · {}]\n{}", sender_name, event.text.trim());
+                self.deps
+                    .bindings
+                    .enqueue_inbox(&origin, &binding.id, &text, &files)
+                    .await?;
                 repository.complete_delivery(&row.id, "enqueued").await?;
                 continue;
             }
@@ -555,6 +688,11 @@ impl FeishuBridge {
                 .insert(row.id.clone(), outcome.into());
             repository.complete_delivery(&row.id, outcome).await?;
             self.gateway_attempts.lock().await.remove(&row.id);
+        }
+        *delivery_cursor = next_cursor;
+        if advance_resource_cursor {
+            let mut cursor = self.gateway_resource_cursor.lock().await;
+            *cursor = cursor.wrapping_add(1);
         }
         Ok(())
     }

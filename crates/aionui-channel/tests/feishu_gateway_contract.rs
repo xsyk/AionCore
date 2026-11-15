@@ -61,6 +61,29 @@ async fn captured_deliveries(name: &str) -> (Vec<GatewayDelivery>, Value) {
     )
 }
 
+#[test]
+fn image_event_contract_keeps_only_remote_references_and_legacy_payload_stays_stable() {
+    let legacy = serde_json::json!({"id":"legacy","kind":"message","app_id":"app","tenant_key":"tenant","actor_union_id":"","actor_open_id":"actor","actor_type":"user","chat_id":"chat","chat_type":"p2p","mentioned_bot":false,"text":"hello","interaction_id":"","platform_message_id":"om_image","action":"","value":null,"occurred_at":1});
+    let event: aionui_channel::gateway::GatewayEvent = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&event).unwrap(),
+        legacy,
+        "new defaults must not conflict with already persisted delivery payloads"
+    );
+    let mut image = legacy;
+    image["text"] = "".into();
+    image["message_type"] = "image".into();
+    image["attachments"] =
+        serde_json::json!([{"kind":"image","file_key":"img_1","message_id":"om_image","local_path":"/etc/passwd"}]);
+    let event: aionui_channel::gateway::GatewayEvent = serde_json::from_value(image).unwrap();
+    let serialized = serde_json::to_value(event).unwrap();
+    assert_eq!(serialized["message_type"], "image");
+    assert_eq!(
+        serialized["attachments"][0],
+        serde_json::json!({"kind":"image","file_key":"img_1","file_name":"","message_id":"om_image"})
+    );
+}
+
 #[tokio::test]
 async fn go_control_deliveries_without_expiry_are_accepted() {
     for (name, kind, status) in [

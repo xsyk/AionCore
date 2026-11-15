@@ -55,6 +55,7 @@ fn to_view(user: User) -> AdminUserView {
         source: if from_feishu { "feishu" } else { "password" }.to_owned(),
         id: user.id,
         username: user.username.unwrap_or_default(),
+        display_name: user.display_name,
         status: user.status.as_str().to_owned(),
         created_at: user.created_at,
         last_login: user.last_login,

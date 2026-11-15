@@ -373,3 +373,169 @@ async fn super_admin_cannot_be_disabled_or_deleted() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(login(&ctx, "admin", ADMIN_PW).await.is_some());
 }
+
+async fn archived_act_as_seed(ctx: &Ctx, admin: &str, owner: &str, id: &str) {
+    seed_conversation(ctx, owner, id).await;
+    let target = (owner != ADMIN_ID).then_some(owner);
+    let (status, _) = send(
+        ctx,
+        "POST",
+        &format!("/api/sidebar/conversation/{id}/archive"),
+        Some(admin),
+        target,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn archived_act_as_admin_deletes_selected_units_under_distinct_owners_only() {
+    let (ctx, admin) = setup().await;
+    let alice = create_user(&ctx, &admin, "alice", "AliceP@ss123").await;
+    let bob = create_user(&ctx, &admin, "bob", "BobP@ss12345").await;
+    archived_act_as_seed(&ctx, &admin, &alice, "archive_alice_selected").await;
+    archived_act_as_seed(&ctx, &admin, &alice, "archive_alice_kept").await;
+    archived_act_as_seed(&ctx, &admin, &bob, "archive_bob_selected").await;
+    seed_conversation(&ctx, &alice, "active_alice_kept").await;
+
+    let (status, listing) = send(
+        &ctx,
+        "GET",
+        "/api/sidebar?archived=true&limit=5",
+        Some(&admin),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: Vec<&str> = listing["data"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["items"].as_array().unwrap())
+        .filter_map(|item| item["conversation"]["id"].as_str())
+        .collect();
+    assert!(listed.contains(&"archive_alice_selected"));
+    assert!(!listed.contains(&"archive_bob_selected"));
+    assert!(!listed.contains(&"active_alice_kept"));
+
+    for target in [None, Some(bob.as_str())] {
+        let (status, _) = send(
+            &ctx,
+            "DELETE",
+            "/api/sidebar/archived/conversation/archive_alice_selected",
+            Some(&admin),
+            target,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    let (alice_result, bob_result) = tokio::join!(
+        send(
+            &ctx,
+            "DELETE",
+            "/api/sidebar/archived/conversation/archive_alice_selected",
+            Some(&admin),
+            Some(&alice),
+            None,
+        ),
+        send(
+            &ctx,
+            "DELETE",
+            "/api/sidebar/archived/conversation/archive_bob_selected",
+            Some(&admin),
+            Some(&bob),
+            None,
+        )
+    );
+    assert_eq!(alice_result.0, StatusCode::OK);
+    assert_eq!(bob_result.0, StatusCode::OK);
+    for (id, owner) in [("archive_alice_selected", &alice), ("archive_bob_selected", &bob)] {
+        let (status, _) = send(
+            &ctx,
+            "GET",
+            &format!("/api/conversations/{id}"),
+            Some(&admin),
+            Some(owner),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    for id in ["archive_alice_kept", "active_alice_kept"] {
+        let (status, _) = send(
+            &ctx,
+            "GET",
+            &format!("/api/conversations/{id}"),
+            Some(&admin),
+            Some(&alice),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _) = send(
+        &ctx,
+        "DELETE",
+        "/api/sidebar/archived/conversation/active_alice_kept",
+        Some(&admin),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn archived_act_as_rejects_forged_anonymous_disabled_and_self_targets() {
+    let (ctx, admin) = setup().await;
+    create_user(&ctx, &admin, "alice", "AliceP@ss123").await;
+    let bob = create_user(&ctx, &admin, "bob", "BobP@ss12345").await;
+    archived_act_as_seed(&ctx, &admin, &bob, "archive_bob_protected").await;
+    let alice_token = login(&ctx, "alice", "AliceP@ss123").await.unwrap();
+    let uri = "/api/sidebar/archived/conversation/archive_bob_protected";
+    for (token, target, expected) in [
+        (Some(alice_token.as_str()), Some(bob.as_str()), StatusCode::FORBIDDEN),
+        (Some(alice_token.as_str()), None, StatusCode::NOT_FOUND),
+        (None, Some(bob.as_str()), StatusCode::UNAUTHORIZED),
+        (Some(admin.as_str()), Some("missing-owner"), StatusCode::NOT_FOUND),
+        (Some(admin.as_str()), Some(ADMIN_ID), StatusCode::BAD_REQUEST),
+    ] {
+        let (status, _) = send(&ctx, "DELETE", uri, token, target, None).await;
+        assert_eq!(status, expected);
+    }
+    let (status, _) = send(
+        &ctx,
+        "POST",
+        &format!("/api/admin/users/{bob}/disable"),
+        Some(&admin),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&ctx, "DELETE", uri, Some(&admin), Some(&bob), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(
+        &ctx,
+        "POST",
+        &format!("/api/admin/users/{bob}/enable"),
+        Some(&admin),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &ctx,
+        "GET",
+        "/api/conversations/archive_bob_protected",
+        Some(&admin),
+        Some(&bob),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rejected deletions must preserve the archive");
+}

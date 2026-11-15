@@ -59,6 +59,38 @@ use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
 
+/// 为主动通讯录同步装配独立凭据读取器，不使用网关登录的空secret配置。
+pub(crate) fn build_feishu_directory_state(
+    services: &AppServices,
+) -> Option<Arc<aionui_auth::feishu::directory::service::FeishuDirectorySync>> {
+    let http = match reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(http) => http,
+        Err(_) => {
+            tracing::warn!(
+                code = "FEISHU_DIRECTORY_CLIENT_UNAVAILABLE",
+                "feishu: directory sync unavailable"
+            );
+            return None;
+        }
+    };
+    Some(Arc::new(
+        aionui_auth::feishu::directory::service::FeishuDirectorySync::new(
+            Arc::new(aionui_db::SqliteFeishuLoginRepository::new(
+                services.database.pool().clone(),
+            )),
+            derive_encryption_key(&services.encryption_secret_raw),
+            services.user_repo.clone(),
+            http,
+        ),
+    ))
+}
+
 #[derive(Debug)]
 pub struct RouterBuildError {
     stage: &'static str,
@@ -871,6 +903,21 @@ pub async fn build_channel_state(
             login_config: Arc::new(aionui_db::SqliteFeishuLoginRepository::new(
                 services.database.pool().clone(),
             )),
+            sender_names: match aionui_auth::feishu::contacts::FeishuContacts::new(
+                Arc::new(aionui_db::SqliteFeishuLoginRepository::new(
+                    services.database.pool().clone(),
+                )),
+                encryption_key,
+            ) {
+                Ok(service) => Some(Arc::new(service)),
+                Err(_) => {
+                    tracing::warn!(
+                        code = "FEISHU_CONTACT_CLIENT_UNAVAILABLE",
+                        "feishu: sender name synchronization unavailable; external-user label used"
+                    );
+                    None
+                }
+            },
             tasks: services.worker_task_manager.clone(),
             sender: manager.clone(),
             #[cfg(feature = "lark")]

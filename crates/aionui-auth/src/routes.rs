@@ -93,6 +93,8 @@ pub struct AuthRouterState {
     pub aionpro_mode: bool,
     /// Feishu OAuth web login; `None` disables it (tests, embedded builds).
     pub feishu: Option<Arc<crate::feishu::FeishuLogin>>,
+    /// 管理员主动通讯录同步，实例内复用同一后台任务。
+    pub feishu_directory: Option<Arc<crate::feishu::directory::service::FeishuDirectorySync>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,6 +344,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let authenticated = Router::new()
         .merge(crate::admin_routes::admin_user_routes())
         .merge(crate::feishu::routes::feishu_admin_routes())
+        .merge(crate::feishu::directory::routes::directory_routes())
         .route("/logout", post(logout_handler))
         .route("/api/auth/user", get(user_handler))
         .route("/api/auth/change-password", post(change_password_handler))

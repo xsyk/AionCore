@@ -167,6 +167,10 @@ pub enum PermissionDecision {
 /// → `ConvCommand::Confirm`) directly into this type at the session bridge.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct QuestionAnswer {
+    /// Stable question identity when supplied by the backend. Legacy clients may
+    /// omit it and continue identifying questions through `question` text.
+    #[serde(default)]
+    pub question_id: Option<String>,
     pub question: String,
     pub labels: Vec<String>,
 }

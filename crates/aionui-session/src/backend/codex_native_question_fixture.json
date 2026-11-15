@@ -1,0 +1,65 @@
+{
+  "source_cli": "codex-cli 0.161.0",
+  "native_request": {
+    "method": "item/tool/requestUserInput",
+    "id": 0,
+    "params": {
+      "threadId": "01a1b68f-8be7-71b1-880d-5761f1d77df6",
+      "turnId": "01a1b68f-8c2f-7551-bdab-52bd90858b0f",
+      "itemId": "call_a9fbbffbed5a4764843d44a34a5cdf23",
+      "questions": [
+        {
+          "id": "color",
+          "header": "Color",
+          "question": "Choose Blue or Green.",
+          "isOther": true,
+          "isSecret": false,
+          "options": [
+            {
+              "label": "Blue",
+              "description": "Choose Blue."
+            },
+            {
+              "label": "Green",
+              "description": "Choose Green."
+            }
+          ]
+        }
+      ],
+      "isBlocking": true,
+      "autoResolutionMs": null
+    }
+  },
+  "native_response": {
+    "jsonrpc": "2.0",
+    "id": 0,
+    "result": {
+      "answers": {
+        "color": {
+          "answers": [
+            "Blue"
+          ]
+        }
+      }
+    }
+  },
+  "resolved": [
+    {
+      "method": "serverRequest/resolved",
+      "params": {
+        "threadId": "01a1b68f-8be7-71b1-880d-5761f1d77df6",
+        "requestId": 0
+      },
+      "emittedAtMs": 1794064230705
+    }
+  ],
+  "turn_completions": [
+    {
+      "method": "turn/completed",
+      "status": "completed"
+    }
+  ],
+  "raw_server_sha256": "0a32679ffbc9b4d7b39df223de529dcf1e712553d957fdc57c90958bb944b54c",
+  "raw_client_sha256": "f82625a554f20f13286c6d369c28b9686c0319462034e19fe1f66150b8cbf1b4",
+  "scope": "真实独立临时线程；仅保留测试问题帧及回答，不含提示词、模型文本响应、凭据或飞书事件"
+}

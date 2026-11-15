@@ -23,6 +23,7 @@ fn format_user_lines_never_leaks_secrets() {
         user_type: UserType::Local,
         external_user_id: None,
         username: Some("alice".to_owned()),
+        display_name: None,
         email: Some("a@example.com".to_owned()),
         password_hash: Some("$2b$12$SUPERSECRETHASHVALUE".to_owned()),
         avatar_path: None,

@@ -53,6 +53,28 @@ const PERM_REJECT: &str = "reject";
 /// control_request). The three accepted incoming option ids (`effort`/`reasoning_effort`/
 /// `thought_level`) all normalize to this one storage key.
 const EFFORT_CONFIG_KEY: &str = "effort";
+const COLLABORATION_CONFIG_KEY: &str = "collaboration_mode";
+
+fn collaboration_option(modes: &[ModeInfo], selected: Option<String>) -> Option<aionui_api_types::AcpConfigOptionDto> {
+    (!modes.is_empty()).then(|| aionui_api_types::AcpConfigOptionDto {
+        id: COLLABORATION_CONFIG_KEY.into(),
+        name: Some("Collaboration mode".into()),
+        label: None,
+        description: None,
+        category: Some(COLLABORATION_CONFIG_KEY.into()),
+        option_type: "select".into(),
+        current_value: selected,
+        options: modes
+            .iter()
+            .map(|mode| aionui_api_types::AcpConfigSelectOptionDto {
+                value: mode.id.clone(),
+                name: Some(mode.name.clone()),
+                label: None,
+                description: mode.description.clone(),
+            })
+            .collect(),
+    })
+}
 
 /// Resolve the reasoning-effort catalog to surface for the effort picker, mirroring the
 /// backend's `effort_is_supported` current-model precedence: the efforts of the resolved
@@ -130,6 +152,8 @@ struct SessionRuntime {
     /// place holding both the backend handle and the same fallback order.
     /// Order is `override → this`, identical to REST.
     caps_fallback: std::sync::Mutex<CapsFallback>,
+    /// Independent next-turn selection, never a permission-mode override.
+    collaboration: std::sync::Mutex<(Vec<ModeInfo>, Option<String>)>,
 }
 
 /// Backend-reported current values, mirrored out of `capabilities()` so the
@@ -142,6 +166,18 @@ struct CapsFallback {
 }
 
 impl SessionRuntime {
+    fn set_collaboration(&self, modes: Vec<ModeInfo>, selected: Option<String>) {
+        if let Ok(mut state) = self.collaboration.lock() {
+            *state = (modes, selected);
+        }
+    }
+    fn collaboration(&self) -> (Vec<ModeInfo>, Option<String>) {
+        self.collaboration
+            .lock()
+            .ok()
+            .map(|state| state.clone())
+            .unwrap_or_default()
+    }
     fn touch(&self) {
         self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
     }
@@ -390,6 +426,9 @@ pub struct SessionAgentTask {
     /// across a respawn/resume (unlike mode/model, which persist via ConfigChanged).
     /// `None` (tests) = no persistence. Shared with the pump (same Arc).
     session_repo: Option<Arc<dyn IAcpSessionRepository>>,
+    /// Serialize accepted config commands and their selection-map read/merge/write.
+    /// Effort and collaboration must share this boundary or one can drop the other's key.
+    config_selection_boundary: tokio::sync::Mutex<()>,
     /// Cold-start catalog preload parsed from the persisted `agent_metadata`
     /// handshake (what a PRIOR session discovered and `spawn_catalog_writeback`
     /// stored). The backend's live `capabilities()` is empty until the initialize
@@ -483,6 +522,7 @@ impl SessionAgentTask {
         broadcaster: Option<Arc<dyn EventBroadcaster>>,
     ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let caps = backend.capabilities();
         let runtime = Arc::new(SessionRuntime {
             tx,
             last_activity_ms: AtomicI64::new(now_ms()),
@@ -492,8 +532,13 @@ impl SessionAgentTask {
             mode_override: std::sync::Mutex::new(None),
             model_override: std::sync::Mutex::new(None),
             effort_override: std::sync::Mutex::new(None),
-            last_catalog: std::sync::Mutex::new(None),
-            caps_fallback: std::sync::Mutex::new(CapsFallback::default()),
+            last_catalog: std::sync::Mutex::new(Some((caps.available_modes.clone(), caps.available_models.clone()))),
+            caps_fallback: std::sync::Mutex::new(CapsFallback {
+                mode: caps.current_mode,
+                model: caps.current_model,
+                effort: caps.current_effort,
+            }),
+            collaboration: std::sync::Mutex::new((caps.available_collaboration_modes, caps.current_collaboration_mode)),
         });
         // Subscribe to the backend's event stream HERE (sync), then hand ONLY the
         // stream to the pump — never a backend Arc (see `spawn_event_pump` for why
@@ -515,6 +560,7 @@ impl SessionAgentTask {
             backend,
             runtime,
             session_repo,
+            config_selection_boundary: tokio::sync::Mutex::new(()),
             catalog_preload,
             command_seq: AtomicI64::new(0),
             prompt_dump,
@@ -708,7 +754,7 @@ impl SessionAgentTask {
             .pending_permission_requests()
             .into_iter()
             .map(|p| {
-                let is_ask = p.tool_name == "AskUserQuestion";
+                let is_ask = matches!(p.tool_name.as_str(), "AskUserQuestion" | "RequestUserInput");
                 let options = if is_ask {
                     // `p.questions` is the bare `questions[]` ARRAY, but the
                     // projector expects the whole tool input and does its own
@@ -765,47 +811,68 @@ impl SessionAgentTask {
     /// permission confirm endpoint). `answers: None` = the user dismissed the
     /// card; the claude adapter maps that to a deny (an allow with no answers
     /// is silent data loss — claude drops unanswered questions, live 2.1.178).
-    pub fn answer_ask(
+    pub async fn answer_ask(
         &self,
         request_id: &str,
         answers: Option<Vec<aionui_api_types::AskQuestionAnswer>>,
     ) -> Result<(), AgentError> {
-        // api-types is the conversation layer's currency; convert to the
-        // session command's own type at this boundary.
         let answers = answers.map(|list| {
             list.into_iter()
                 .map(|a| aionui_session::QuestionAnswer {
+                    question_id: a.question_id,
                     question: a.question,
                     labels: a.labels,
                 })
                 .collect::<Vec<_>>()
         });
-        let backend = self.backend.clone();
-        let request_id = request_id.to_string();
-        let conv_id = self.conversation_id.clone();
-        // Same fire-and-forget shape as confirm(): the REST reply has already
-        // returned by the time the dispatch runs, so a failure here MUST be
-        // surfaced in the log or a wedged ask is undiagnosable in production.
+        let command = aionui_session::Command::AnswerAsk {
+            request_id: request_id.to_owned(),
+            answers,
+        };
+        let backend = Arc::clone(&self.backend);
+        let conversation_id = self.conversation_id.clone();
+        let request_id = request_id.to_owned();
+        // Keep an admitted write alive if its HTTP caller disconnects, while
+        // still returning the actual admission result to a connected caller.
         tokio::spawn(async move {
-            let command = aionui_session::Command::AnswerAsk {
-                request_id: request_id.clone(),
-                answers,
-            };
             match backend.dispatch(command).await {
-                Ok(_) => tracing::info!(
-                    conv_id = %conv_id,
-                    request_id = %request_id,
-                    "ask answer delivered to backend (dedicated channel)"
-                ),
-                Err(e) => tracing::error!(
-                    conv_id = %conv_id,
-                    request_id = %request_id,
-                    error = %e,
-                    "ask answer FAILED after REST reply already returned success — claude stays blocked on can_use_tool"
-                ),
+                Ok(receipt) if receipt.accepted => {
+                    tracing::info!(
+                        conv_id = %conversation_id,
+                        request_id = %request_id,
+                        "ask answer delivered to backend (dedicated channel)"
+                    );
+                    Ok(())
+                }
+                Ok(_) => Err(AgentError::conflict("The agent did not accept this question answer")),
+                Err(aionui_session::BackendError::CommandNotSupported { .. }) => Err(AgentError::bad_request(
+                    "This agent does not support the requested question answer",
+                )),
+                Err(error) => {
+                    use aionui_session::BackendError;
+                    let error_kind = match error {
+                        BackendError::Transport(_) => "transport",
+                        BackendError::SessionNotFound(_) => "session_not_found",
+                        BackendError::WorkspaceUnavailable(_) => "workspace_unavailable",
+                        BackendError::SetupRejected(_) => "setup_rejected",
+                        BackendError::HandshakeTimeout(_) => "handshake_timeout",
+                        BackendError::CommandNotSupported { .. } => "unsupported",
+                    };
+                    tracing::warn!(
+                        conv_id = %conversation_id,
+                        request_id = %request_id,
+                        code = "ASK_ANSWER_DELIVERY_FAILED",
+                        error_kind,
+                        "ask answer was not acknowledged by the backend"
+                    );
+                    Err(AgentError::bad_gateway(
+                        "The agent could not receive this question answer",
+                    ))
+                }
             }
-        });
-        Ok(())
+        })
+        .await
+        .map_err(|_| AgentError::bad_gateway("The agent could not complete this question answer"))?
     }
 
     /// `always_allow` (legacy flag) forces AllowAlways regardless.
@@ -1058,6 +1125,14 @@ impl SessionAgentTask {
                     .collect(),
             });
         }
+        if !caps.available_collaboration_modes.is_empty() {
+            self.runtime
+                .set_collaboration(caps.available_collaboration_modes, caps.current_collaboration_mode);
+        }
+        let (collaboration_modes, selected) = self.runtime.collaboration();
+        if let Some(option) = collaboration_option(&collaboration_modes, selected) {
+            config_options.push(option);
+        }
         Ok(aionui_api_types::GetConfigOptionsResponse { config_options })
     }
 
@@ -1067,6 +1142,7 @@ impl SessionAgentTask {
         option_id: &str,
         value: &str,
     ) -> Result<aionui_api_types::SetConfigOptionResponse, AgentError> {
+        let _selection_guard = self.config_selection_boundary.lock().await;
         // Validate a runtime mode/model switch against the advertised catalog BEFORE
         // dispatch — the ACP `clear_invalid_desired_*` semantic, but as REJECT+report
         // (not silent-drop) since this is an explicit user action at the single runtime
@@ -1114,10 +1190,14 @@ impl SessionAgentTask {
                 value: value.to_string(),
             },
         };
-        self.backend
+        let receipt = self
+            .backend
             .dispatch(cmd)
             .await
             .map_err(|e| AgentError::bad_request(e.to_string()))?;
+        if !receipt.accepted {
+            return Err(AgentError::bad_request("config option command was not accepted"));
+        }
         // Where does this switch actually land? Asked of the LIVE backend rather than
         // assumed, because the answer moves: claude queues a control frame raised
         // mid-turn but writes an idle one straight out, so the same backend answers
@@ -1162,7 +1242,17 @@ impl SessionAgentTask {
                 // the ONLY place the choice is durably recorded. Backend already accepted
                 // + validated it (dispatch above); best-effort persist (a DB failure must
                 // not fail the switch the CLI already applied).
-                self.persist_effort(value).await;
+                self.persist_config_selection(EFFORT_CONFIG_KEY, value).await;
+            }
+            COLLABORATION_CONFIG_KEY => {
+                // Observed means the backend accepted the NEXT ordinary turn's token,
+                // not that an already running CLI turn changed modes. Never synthesize
+                // this value from the request: re-read the backend's accepted selection.
+                if self.backend.capabilities().current_collaboration_mode.as_deref() == Some(value) {
+                    self.persist_config_selection(COLLABORATION_CONFIG_KEY, value).await;
+                    tracing::info!(conversation_id = %self.conversation_id, collaboration_mode = value,
+                        "session-port: accepted next-turn collaboration selection");
+                }
             }
             _ => {
                 return Ok(aionui_api_types::SetConfigOptionResponse {
@@ -1203,13 +1293,10 @@ impl SessionAgentTask {
         })
     }
 
-    /// Persist the chosen effort level into `acp_session.config_selections` (under
-    /// [`EFFORT_CONFIG_KEY`]) so it survives a respawn/resume. Reads the existing
-    /// selections first and MERGES (rather than overwriting the whole map) so any other
-    /// future config key is preserved. Best-effort: a repo miss/failure is logged, not
-    /// propagated — the backend already applied the effort, and losing only the
-    /// persistence (not the live switch) is the safe degradation. No-op without a repo.
-    async fn persist_effort(&self, value: &str) {
+    /// Merge an accepted selection while holding `config_selection_boundary`.
+    /// Preserve existing best-effort semantics: a persistence failure cannot undo a
+    /// backend-accepted switch. Only the token is stored, never turn settings.
+    async fn persist_config_selection(&self, key: &str, value: &str) {
         let Some(repo) = self.session_repo.as_ref() else {
             return;
         };
@@ -1225,15 +1312,15 @@ impl SessionAgentTask {
                 .unwrap_or_default(),
             Ok(None) => std::collections::HashMap::new(),
             Err(err) => {
-                tracing::warn!(conversation_id = %self.conversation_id, error = %err, "persist_effort: load_runtime_state failed; skipping effort persist");
+                tracing::warn!(conversation_id = %self.conversation_id, config_key = key, error = %err, "session-port: load config selections failed; skipping persist");
                 return;
             }
         };
-        selections.insert(EFFORT_CONFIG_KEY.to_owned(), value.to_owned());
+        selections.insert(key.to_owned(), value.to_owned());
         let json = match serde_json::to_string(&selections) {
             Ok(j) => j,
             Err(err) => {
-                tracing::warn!(conversation_id = %self.conversation_id, error = %err, "persist_effort: encode config_selections failed");
+                tracing::warn!(conversation_id = %self.conversation_id, config_key = key, error = %err, "session-port: encode config selections failed");
                 return;
             }
         };
@@ -1241,11 +1328,15 @@ impl SessionAgentTask {
             config_selections_json: Some(Some(&json)),
             ..Default::default()
         };
-        if let Err(err) = repo
+        match repo
             .save_runtime_state_for_user(&self.user_id, &self.conversation_id, &params)
             .await
         {
-            tracing::warn!(conversation_id = %self.conversation_id, error = %err, "persist_effort: save_runtime_state failed");
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(conversation_id = %self.conversation_id, config_key = key,
+                error_code = "session_row_missing", "session-port: config selection was not saved"),
+            Err(err) => tracing::warn!(conversation_id = %self.conversation_id, config_key = key, error = %err,
+                "session-port: save config selections failed"),
         }
     }
 
@@ -1547,6 +1638,8 @@ pub struct SessionBuildInputs<'a> {
     /// Antigravity only: the prepared `.agents/hooks.json` body, so a session
     /// switched out of full auto can restore its approval gate.
     pub permission_hook_body: Option<String>,
+    /// Opaque authority created only by the exact-session startup policy.
+    pub qa_launch: Option<crate::factory::qa_session_launch::ValidatedQaLaunch>,
 }
 
 /// The mode a session actually starts on.
@@ -1582,6 +1675,75 @@ pub(crate) fn resolved_effort(
         })
         .or_else(|| config.thought_level.clone())
         .filter(|value| !value.is_empty())
+}
+
+/// Re-apply selections at the existing post-open restore point without opening a turn.
+async fn restore_persisted_config(
+    backend: &dyn SessionBackend,
+    backend_label: &str,
+    effort: Option<String>,
+    session_snapshot: Option<&PersistedSessionState>,
+    conversation_id: &str,
+) {
+    let collaboration = session_snapshot.and_then(|snapshot| {
+        snapshot
+            .config_selections
+            .iter()
+            .find(|(key, _)| key.as_str() == COLLABORATION_CONFIG_KEY)
+            .map(|(_, value)| value.as_str())
+            .filter(|value| matches!(*value, "plan" | "default"))
+    });
+    // Restore before effort: Codex rejects a collaboration selection while an
+    // effort/model settings confirmation is pending. Catalog/reconcile can still
+    // be arriving after open, so use the existing five-second discovery bound.
+    if backend_label == "codex"
+        && let Some(mode) = collaboration
+    {
+        let restored = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let caps = backend.capabilities();
+                if !caps.available_collaboration_modes.is_empty() {
+                    if !caps.available_collaboration_modes.iter().any(|entry| entry.id == mode) {
+                        return false;
+                    }
+                    if let Ok(receipt) = backend
+                        .dispatch(Command::SetConfigOption {
+                            option_id: COLLABORATION_CONFIG_KEY.to_owned(),
+                            value: mode.to_owned(),
+                        })
+                        .await
+                        && receipt.accepted
+                        && backend.capabilities().current_collaboration_mode.as_deref() == Some(mode)
+                    {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        if matches!(restored, Ok(true)) {
+            tracing::info!(conv_id = %conversation_id, collaboration_mode = mode,
+                "session-port: restored next-turn collaboration selection");
+        } else {
+            tracing::warn!(conv_id = %conversation_id, collaboration_mode = mode,
+                error_code = "collaboration_restore_unavailable",
+                "session-port: collaboration selection not restored; session remains usable");
+        }
+    }
+    if let Some(effort) = effort {
+        if let Err(e) = backend
+            .dispatch(Command::SetConfigOption {
+                option_id: EFFORT_CONFIG_KEY.to_owned(),
+                value: effort.clone(),
+            })
+            .await
+        {
+            tracing::warn!(conv_id = %conversation_id, effort = %effort, error = %e, "session-port: re-applying persisted effort failed (session usable, effort not restored)");
+        } else {
+            tracing::info!(conv_id = %conversation_id, effort = %effort, "session-port: re-applied persisted reasoning effort after open");
+        }
+    }
 }
 
 /// The persisted session-cumulative cost (USD) that seeds the claude backend's
@@ -1750,6 +1912,7 @@ pub async fn build_antigravity_instance(
         // claude/codex label); skip it rather than mislabel the dump.
         prompt_dump_dir: _,
         permission_hook_body,
+        qa_launch: _,
     } = inputs;
 
     let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
@@ -1872,9 +2035,10 @@ pub async fn build_session_instance(
         mcp_server_repo,
         runtime_env,
         broadcaster,
-        catalog_writeback,
+        mut catalog_writeback,
         acp_session_repo,
-        prompt_dump_dir,
+        mut prompt_dump_dir,
+        qa_launch,
         // claude/codex gate through CLI flags, not an installed hook file.
         permission_hook_body: _,
     } = inputs;
@@ -1997,7 +2161,7 @@ pub async fn build_session_instance(
 
     // Spawn env (legacy spawn-surface parity, claude AND codex).
     session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
-    if !session_config.spawn_env.is_empty() {
+    if qa_launch.is_none() && !session_config.spawn_env.is_empty() {
         let keys: Vec<&str> = session_config.spawn_env.iter().map(|e| e.name.as_str()).collect();
         tracing::info!(conv_id = %conversation_id, ?keys, "session spawn env: agent overrides + runtime context");
     }
@@ -2053,6 +2217,21 @@ pub async fn build_session_instance(
     // carried from the new-conversation screen all along and nothing ever read
     // it, so an effort chosen before the first turn was dropped.
     let persisted_effort = resolved_effort(config, session_snapshot);
+
+    // Apply only after normal model/mode/sandbox/env assembly, before either
+    // config dumping or open_session. The same None values also disable the
+    // subsequent catalog task and send-time dump context.
+    if let Some(qa_launch) = qa_launch {
+        qa_launch.apply(
+            backend_label,
+            &conversation_id,
+            &user_id,
+            &mut session_config,
+            &mut catalog_writeback,
+            &mut prompt_dump_dir,
+        )?;
+        tracing::info!(reason_code = "QA_LAUNCH_VALIDATED", "QA launch policy applied");
+    }
 
     // DEV (`--dump-prompts`): dump the resolved SessionConfig BEFORE it moves
     // into open_session. Best-effort — a failure only warns, never fails open.
@@ -2112,19 +2291,14 @@ pub async fn build_session_instance(
     // is discovered) and drops it if unsupported — the same clear_invalid_desired_*
     // semantics as the codex model/mode reconcile. Best-effort: a dispatch failure must
     // not fail the open (the session is usable; only the persisted effort is lost).
-    if let Some(effort) = persisted_effort {
-        if let Err(e) = backend
-            .dispatch(Command::SetConfigOption {
-                option_id: EFFORT_CONFIG_KEY.to_owned(),
-                value: effort.clone(),
-            })
-            .await
-        {
-            tracing::warn!(conv_id = %conversation_id, effort = %effort, error = %e, "session-port: re-applying persisted effort failed (session usable, effort not restored)");
-        } else {
-            tracing::info!(conv_id = %conversation_id, effort = %effort, "session-port: re-applied persisted reasoning effort after open");
-        }
-    }
+    restore_persisted_config(
+        backend.as_ref(),
+        backend_label,
+        persisted_effort,
+        session_snapshot,
+        &conversation_id,
+    )
+    .await;
 
     // GAP #7 (G5): project the backend's discovered catalog back into agent_metadata
     // so the cold-start picker stays fresh. Best-effort, detached, off the open path.
@@ -2678,6 +2852,10 @@ fn emit_config_options_snapshot(modes: &[ModeInfo], models: &[ModelInfo], runtim
                 .collect(),
         });
     }
+    let (collaboration_modes, selected) = runtime.collaboration();
+    if let Some(option) = collaboration_option(&collaboration_modes, selected) {
+        config_options.push(option);
+    }
     // No categories → nothing to re-project; a spurious empty-snapshot frame would only
     // clobber the frontend's picker.
     if !config_options.is_empty()
@@ -2933,6 +3111,27 @@ fn spawn_event_pump(
                     description: None,
                     parent_call_id: None,
                 }));
+                continue;
+            }
+
+            if let SessionEvent::EffortConfirmed { effort } = &env.event {
+                // A typed observation, including null, supersedes a stale optimistic
+                // choice. Update the mirrored capability before pushing all axes.
+                if let Ok(mut current) = runtime.effort_override.lock() {
+                    *current = None;
+                }
+                if let Ok(mut fallback) = runtime.caps_fallback.lock() {
+                    fallback.effort = effort.clone();
+                }
+                let (modes, models) = runtime.last_catalog().unwrap_or_default();
+                emit_config_options_snapshot(&modes, &models, &runtime);
+                continue;
+            }
+
+            if let SessionEvent::CollaborationModeUpdated { modes, selected_mode } = &env.event {
+                runtime.set_collaboration(modes.clone(), selected_mode.clone());
+                let (permissions, models) = runtime.last_catalog().unwrap_or_default();
+                emit_config_options_snapshot(&permissions, &models, &runtime);
                 continue;
             }
 
@@ -4590,6 +4789,10 @@ fn tool_result_text(content: &[ToolResultContent]) -> Option<String> {
 }
 
 #[cfg(test)]
+#[path = "session_agent_collaboration_tests.rs"]
+mod collaboration_tests;
+
+#[cfg(test)]
 mod build_mapping_tests {
     //! Ported from clean-slate `session_runtime::tests` (the `spec_and_config` +
     //! `catalog_partial_from_caps` + `codex_sandbox`/`approval` + `session_server_to_spec`
@@ -5024,6 +5227,7 @@ mod build_mapping_tests {
                 acp_session_repo: None,
                 prompt_dump_dir: None,
                 permission_hook_body: None,
+                qa_launch: None,
             },
             spawner.clone(),
         )
@@ -6400,6 +6604,135 @@ mod persist_tests {
             Some("high"),
             "the chosen effort must be persisted into config_selections"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_ask_propagates_dispatch_failure_to_the_caller() {
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            Arc::new(DeadSessionBackend),
+            None,
+        );
+        let error = task
+            .answer_ask("req-failed", None)
+            .await
+            .expect_err("a failed backend must not acknowledge the answer");
+        assert!(matches!(error, AgentError::BadGateway(_)));
+    }
+
+    struct AskAdmissionBackend {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+        accepted: bool,
+        completed: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionBackend for AskAdmissionBackend {
+        async fn dispatch(&self, command: Command) -> Result<CommandReceipt, BackendError> {
+            assert!(matches!(command, Command::AnswerAsk { .. }));
+            self.started.notify_one();
+            self.release.acquire().await.unwrap().forget();
+            self.completed.notify_one();
+            Ok(CommandReceipt {
+                accepted: self.accepted,
+                admission: Admission::NoTurn,
+                turn_gen: 0,
+            })
+        }
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::empty().boxed()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_ask_waits_for_backend_admission() {
+        let backend = Arc::new(AskAdmissionBackend {
+            started: tokio::sync::Notify::new(),
+            completed: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            accepted: true,
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone(),
+            None,
+        );
+        let answer = tokio::spawn(async move { task.answer_ask("req-wait", None).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), backend.started.notified())
+            .await
+            .unwrap();
+        assert!(
+            !answer.is_finished(),
+            "the caller must wait until the backend accepts the answer"
+        );
+        backend.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_ask_rejects_an_unaccepted_receipt() {
+        let backend = Arc::new(AskAdmissionBackend {
+            started: tokio::sync::Notify::new(),
+            completed: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(1),
+            accepted: false,
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let error = task
+            .answer_ask("req-rejected", None)
+            .await
+            .expect_err("an unaccepted receipt must not clear the card");
+        assert!(matches!(error, AgentError::Conflict(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_ask_finishes_dispatch_when_caller_is_cancelled() {
+        let backend = Arc::new(AskAdmissionBackend {
+            started: tokio::sync::Notify::new(),
+            completed: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            accepted: true,
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone(),
+            None,
+        );
+        let answer = tokio::spawn(async move { task.answer_ask("req-cancelled-caller", None).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), backend.started.notified())
+            .await
+            .unwrap();
+        answer.abort();
+        assert!(answer.await.unwrap_err().is_cancelled());
+        backend.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), backend.completed.notified())
+            .await
+            .expect("caller cancellation must not interrupt an admitted answer write");
     }
 
     /// A backend whose dispatch reports the session as gone (codex resume-poison:
@@ -9298,6 +9631,43 @@ mod pump_tests {
             vec!["A", "B"],
             "recovered as the question's options, not allow/deny"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_confirmations_recovers_pending_request_user_input() {
+        let questions = serde_json::json!([{
+            "id": "destination",
+            "header": "Destination",
+            "question": "Which environment?",
+            "options": [{"label": "QA"}, {"label": "Development"}],
+            "multiSelect": false,
+            "is_other": false,
+            "is_secret": false
+        }]);
+        let backend: Arc<dyn SessionBackend> = Arc::new(PendingPermBackend(aionui_session::PendingPermissionView {
+            request_id: "37".into(),
+            tool_name: "RequestUserInput".into(),
+            questions: Some(questions.clone()),
+        }));
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let confirmations = task.get_confirmations();
+        assert_eq!(confirmations.len(), 1);
+        let confirmation = &confirmations[0];
+        assert_eq!(confirmation.call_id, "37");
+        assert_eq!(confirmation.questions.as_ref(), Some(&questions));
+        let labels: Vec<&str> = confirmation
+            .options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["QA", "Development"]);
     }
 
     // A pending ordinary tool permission recovers as the generic allow/deny card.

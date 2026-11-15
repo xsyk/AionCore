@@ -16,6 +16,8 @@ dingtalk = ["aionui-channel/dingtalk"]
 weixin = ["aionui-channel/weixin"]
 slack = ["aionui-channel/slack"]
 discord = ["aionui-channel/discord"]
+# Never part of defaults; startup requires the independent root-owned scope file.
+qa-session-launch = ["aionui-ai-agent/qa-session-launch"]
 
 [dependencies]
 aionui-common.workspace = true

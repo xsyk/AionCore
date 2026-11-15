@@ -3,6 +3,6 @@ mod client;
 mod config;
 mod types;
 
-pub use client::GatewayClient;
+pub use client::{GatewayClient, GatewayResource, MAX_RESOURCE_BYTES};
 pub use config::{GatewayConfig, GatewayIdentityConfig};
 pub use types::*;

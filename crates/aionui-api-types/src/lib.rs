@@ -80,11 +80,11 @@ pub use auth::{
     AdminConversationOwner, AdminConversationView, AdminCreateUserRequest, AdminResetPasswordRequest, AdminUserView,
     AuthStatusResponse, ChangePasswordRequest, CurrentUserInfo, EnsureExternalSessionRequest,
     EnsureExternalSessionResponse, EnsureExternalUserRequest, EnsureExternalUserResponse, ExternalUserType,
-    FeishuInAppLoginRequest, FeishuInAppLoginResponse, FeishuLoginConfigUpdate, FeishuLoginConfigView,
-    FeishuLoginStatus, InternalAuthErrorCode, LoginRequest, LoginResponse, PublicUser, QrLoginRequest, RefreshResponse,
-    RefreshTokenRequest, RevokeExternalSessionRequest, RevokeExternalSessionResponse, UserInfoResponse,
-    WebuiChangePasswordRequest, WebuiChangeUsernameRequest, WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse,
-    WebuiResetPasswordResponse, WsTokenResponse,
+    FeishuDirectorySyncRequest, FeishuDirectorySyncView, FeishuInAppLoginRequest, FeishuInAppLoginResponse,
+    FeishuLoginConfigUpdate, FeishuLoginConfigView, FeishuLoginStatus, InternalAuthErrorCode, LoginRequest,
+    LoginResponse, PublicUser, QrLoginRequest, RefreshResponse, RefreshTokenRequest, RevokeExternalSessionRequest,
+    RevokeExternalSessionResponse, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
+    WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
 };
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelAssistantSettingResponse,

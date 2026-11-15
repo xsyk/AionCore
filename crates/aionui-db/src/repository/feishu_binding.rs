@@ -12,7 +12,7 @@ pub trait IFeishuBindingRepository: Send + Sync {
     async fn redeem_code(&self, params: RedeemFeishuBindingParams<'_>) -> Result<FeishuBindingRow, DbError>;
     async fn delete_binding(&self, owner: &str, conversation: &str) -> Result<bool, DbError>;
     async fn list_bindings(&self) -> Result<Vec<FeishuBindingRow>, DbError>;
-    async fn enqueue_inbox(&self, id: &str, binding: &str, content: &str) -> Result<(), DbError>;
+    async fn enqueue_inbox(&self, id: &str, binding: &str, content: &str, files: &[String]) -> Result<(), DbError>;
     async fn pending_inbox(&self) -> Result<Vec<FeishuInboxRow>, DbError>;
     async fn complete_inbox(&self, id: &str) -> Result<(), DbError>;
     async fn sync_candidates(&self, binding: &str) -> Result<Vec<MessageRow>, DbError>;

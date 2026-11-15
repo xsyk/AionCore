@@ -354,12 +354,22 @@ pub enum SessionEvent {
         model: Option<String>,
     },
 
+    /// Backend-confirmed effort, including an explicit unset value. Absence of
+    /// this event means no observation; `None` here means confirmed null.
+    EffortConfirmed { effort: Option<String> },
+
+    /// Independent collaboration catalog and explicit next-turn selection.
+    CollaborationModeUpdated {
+        modes: Vec<crate::capability::ModeInfo>,
+        selected_mode: Option<String>,
+    },
+
     /// The selectable model/mode/slash-command catalog became available. Unlike
     /// ACP (whose `session/new` RESPONSE carries the catalog synchronously, so the
     /// frontend picker is populated the instant `open_session` returns), the direct-
     /// CLI backends learn their catalog ASYNCHRONOUSLY, well after `open_session`:
     /// claude from the `control_request{initialize}` RESPONSE (~6s post-open on
-    /// Bedrock), codex from the `model/list` / `collaborationMode/list` RESPONSEs.
+    /// Bedrock), codex from the `model/list` / `permissionProfile/list` RESPONSEs.
     /// Before this event existed the adapters merely wrote the catalog into their
     /// private `discovered` cache with NO upward signal, so the frontend — which had
     /// already read an empty `config_options` on open — never re-fetched and the
@@ -374,8 +384,8 @@ pub enum SessionEvent {
         models: Vec<crate::capability::ModelInfo>,
         /// The selectable mode catalog. For codex (feature 012) this carries the three
         /// fixed permission-profile tiers (`default`/`full-access`/`read-only`) mapped
-        /// from `permissionProfile/list` — codex exposes NO separate collaborationMode
-        /// selector; its mode axis IS the permission axis. Other backends carry their
+        /// from `permissionProfile/list`; collaboration uses its independent event
+        /// above. This mode axis remains the permission axis. Other backends carry their
         /// own mode semantics (claude permission-mode, etc.).
         modes: Vec<crate::capability::ModeInfo>,
         slash_commands: Vec<crate::capability::SlashCommandInfo>,
@@ -972,6 +982,8 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | Rewound { .. }
         | ConfigChanged { .. }
         | CatalogUpdated { .. }
+        | CollaborationModeUpdated { .. }
+        | EffortConfirmed { .. }
         | SubagentUpdate { .. }
         | SubagentDetail { .. }
         | WorkflowPhase { .. }
@@ -1014,6 +1026,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             ToolOutputDelta { .. } | TurnDiffUpdated { .. } => PersistTier::Ephemeral,
             ItemStarted { .. } | ItemCompleted { .. } => PersistTier::Ephemeral, // lifecycle brackets
             CheckpointList { .. } => PersistTier::Ephemeral,                     // query response, not history
+            CollaborationModeUpdated { .. } | EffortConfirmed { .. } => PersistTier::Ephemeral,
             CatalogUpdated { .. } => PersistTier::Ephemeral, // async catalog discovery, re-discovered on open (not history)
             SessionInfo { .. } => PersistTier::Ephemeral, // on-demand query snapshot, re-queryable (not history)
             SessionTitle { .. } => PersistTier::Ephemeral, // applied to conversations.name by the conversation layer, not history

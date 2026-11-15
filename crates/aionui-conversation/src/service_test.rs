@@ -4440,6 +4440,47 @@ async fn midturn_send_during_pending_confirmation_stays_409() {
     );
 }
 
+#[tokio::test]
+async fn midturn_pending_confirmation_rejects_attachments_before_resolution() {
+    let (svc, _broadcaster, repo, _d) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _claim = svc.runtime_state().try_claim_turn(&conv.id, "turn_active").unwrap();
+    let agent = Arc::new(MidturnMockAgent::new(&conv.id));
+    agent.confirmations.lock().unwrap().push(Confirmation {
+        id: "pending".into(),
+        call_id: "pending".into(),
+        title: None,
+        action: None,
+        description: "Pending permission".into(),
+        command_type: None,
+        questions: None,
+        options: vec![],
+    });
+    let task_mgr = Arc::new(MockTaskManager::new());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = task_mgr;
+    for _ in 0..3 {
+        let mut request = make_send_req();
+        request.files = vec![aionui_api_types::ChatFileRef::Upload {
+            path: "/missing/never-materialize.png".into(),
+        }];
+        let error = svc
+            .send_transport_message("user_1", &conv.id, request, &task_mgr, "transport_pending")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ConversationError::Busy { .. }),
+            "attachment resolution ran before Busy: {error}"
+        );
+    }
+    assert!(agent.delivered.lock().unwrap().is_empty());
+    assert!(repo.messages.lock().unwrap().is_empty());
+    assert_eq!(
+        svc.runtime_state().active_turn_id_for(&conv.id).as_deref(),
+        Some("turn_active")
+    );
+}
+
 /// The §6甲.1 message-text classification is load-bearing — lock it so a codex
 /// wording change (or an error-mapping change that drops the text) fails here
 /// instead of silently degrading every turn-ended fallback into a hard error.

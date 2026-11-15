@@ -97,8 +97,9 @@ pub trait IAcpSessionRepository: Send + Sync {
     async fn clear_session_id_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError>;
 
     /// Delete the row when the owning conversation belongs to `user_id`.
-    /// Called by the conversation delete hook — no DB foreign key, so this
-    /// must be invoked explicitly.
+    /// Used for ACP-only cleanup while the conversation still exists.
+    /// Conversation deletion removes ACP state atomically through
+    /// [`IConversationRepository::delete`](crate::IConversationRepository::delete).
     async fn delete_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError>;
 
     /// Decode and return the `session_config.runtime` sub-object.

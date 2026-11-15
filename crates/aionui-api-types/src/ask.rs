@@ -24,6 +24,10 @@ pub struct AskAnswerRequest {
 /// single-select, one-or-more for multiSelect; free text rides as a label).
 #[derive(Debug, Deserialize)]
 pub struct AskQuestionAnswer {
+    /// Stable backend question identity, when supplied by the question card.
+    /// The text remains available for adapters whose wire uses question text.
+    #[serde(default)]
+    pub question_id: Option<String>,
     pub question: String,
     pub labels: Vec<String>,
 }
@@ -42,6 +46,22 @@ mod tests {
         assert!(!req.decline);
         assert_eq!(req.answers.len(), 1);
         assert_eq!(req.answers[0].labels, vec!["A", "B"]);
+        assert_eq!(req.answers[0].question_id, None);
+    }
+
+    #[test]
+    fn deserialize_answer_preserves_identity_independently_of_text() {
+        let req: AskAnswerRequest = serde_json::from_value(json!({
+            "answers": [
+                {"question_id": "q1", "question": "q2", "labels": ["A"]},
+                {"question_id": "q2", "question": "q1", "labels": ["B"]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(req.answers[0].question_id.as_deref(), Some("q1"));
+        assert_eq!(req.answers[0].question, "q2");
+        assert_eq!(req.answers[1].question_id.as_deref(), Some("q2"));
+        assert_eq!(req.answers[1].question, "q1");
     }
 
     #[test]

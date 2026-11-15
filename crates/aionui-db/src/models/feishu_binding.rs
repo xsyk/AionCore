@@ -40,6 +40,7 @@ pub struct FeishuInboxRow {
     pub id: String,
     pub binding_id: String,
     pub content: String,
+    pub files: String,
     pub attempt_epoch: Option<String>,
 }
 

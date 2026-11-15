@@ -5,6 +5,9 @@ mod acp_launch_policy;
 pub(crate) mod aionrs;
 mod antigravity;
 mod context;
+// Cross-crate composition wiring only; never a client/API configuration surface.
+#[doc(hidden)]
+pub mod qa_session_launch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,6 +35,10 @@ pub struct AgentFactoryDeps {
     pub acp_agent_service: Arc<AcpSessionSyncService>,
     pub data_dir: PathBuf,
     pub dump_prompts: bool,
+    /// Immutable startup authority; absent in every default build.
+    pub qa_session_launch: Option<Arc<qa_session_launch::QaSessionLaunchPolicy>>,
+    /// Repository trait used only after an exact QA scope match.
+    pub conversation_repo: Option<Arc<dyn aionui_db::IConversationRepository>>,
     pub broadcaster: Arc<dyn EventBroadcaster>,
     /// Absolute path to the backend binary, reused as the `command` of the
     /// stdio MCP bridge injected into ACP `session/new` for team sessions.

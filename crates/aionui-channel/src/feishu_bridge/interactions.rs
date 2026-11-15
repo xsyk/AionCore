@@ -14,6 +14,8 @@ const INTERACTION_TTL_MS: i64 = 30 * 60 * 1000;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct Question {
+    #[serde(default)]
+    question_id: Option<String>,
     text: String,
     options: Vec<String>,
     multiple: bool,
@@ -110,6 +112,7 @@ fn questions_from_value(value: &Value) -> Vec<Question> {
                 .filter_map(|option| option.get("label").and_then(Value::as_str).map(str::to_owned))
                 .collect();
             Some(Question {
+                question_id: question.get("id").and_then(Value::as_str).map(str::to_owned),
                 text,
                 options,
                 multiple: question
@@ -377,6 +380,7 @@ impl FeishuBridge {
                         questions
                             .iter()
                             .map(|question| AskQuestionAnswer {
+                                question_id: question.question_id.clone(),
                                 question: question.text.clone(),
                                 labels: question.selected.clone(),
                             })
@@ -433,6 +437,7 @@ impl FeishuBridge {
                 .iter()
                 .zip(values)
                 .map(|(question, value)| AskQuestionAnswer {
+                    question_id: question.question_id.clone(),
                     question: question.text.clone(),
                     labels: if question.multiple {
                         value
@@ -681,6 +686,24 @@ enum InteractionResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn questions_preserve_stable_ids_across_durable_card_recovery() {
+        let parsed = questions_from_value(&serde_json::json!([
+            {"id":"q1", "question":"q2", "options":[]},
+            {"id":"q2", "question":"q1", "options":[]}
+        ]));
+        let snapshot = serde_json::to_value(&parsed).unwrap();
+        let recovered: Vec<Question> = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(recovered[0].question_id.as_deref(), Some("q1"));
+        assert_eq!(recovered[0].text, "q2");
+        assert_eq!(recovered[1].question_id.as_deref(), Some("q2"));
+        let legacy: Question = serde_json::from_value(serde_json::json!({
+            "text":"Legacy", "options":[], "multiple":false, "selected":[]
+        }))
+        .unwrap();
+        assert_eq!(legacy.question_id, None);
+    }
 
     #[test]
     fn questions_preserve_text_and_multi_select_contract() {

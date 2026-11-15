@@ -123,6 +123,49 @@ async fn rebind_keeps_one_to_one_and_cascades_on_conversation_deletion() {
 }
 
 #[tokio::test]
+async fn inbox_files_and_text_are_atomic_and_duplicate_receipts_preserve_the_original() {
+    let (_db, repo) = fixture().await;
+    repo.save_code(&code("owner_a", "FILES")).await.unwrap();
+    let binding = repo
+        .redeem_code(redeem("FILES", "feishu:on_owner_a", "chat_a"))
+        .await
+        .unwrap();
+    let files = vec![
+        "/tmp/aionui/owner_a/one.png".to_owned(),
+        "/tmp/aionui/owner_a/two.jpg".to_owned(),
+    ];
+    repo.enqueue_inbox("image", &binding.id, "caption", &files)
+        .await
+        .unwrap();
+    repo.enqueue_inbox("image", &binding.id, "changed", &[]).await.unwrap();
+    let rows = repo.pending_inbox().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].content, "caption");
+    assert_eq!(serde_json::from_str::<Vec<String>>(&rows[0].files).unwrap(), files);
+}
+
+#[tokio::test]
+async fn legacy_inbox_rows_default_to_empty_files() {
+    let (db, repo) = fixture().await;
+    repo.save_code(&code("owner_a", "FILES")).await.unwrap();
+    let binding = repo
+        .redeem_code(redeem("FILES", "feishu:on_owner_a", "chat_a"))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO feishu_inbox(id,binding_id,content) VALUES('legacy',?,'old text')")
+        .bind(&binding.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let files: String = sqlx::query_scalar("SELECT files FROM feishu_inbox WHERE id='legacy'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(files, "[]");
+    assert_eq!(repo.pending_inbox().await.unwrap()[0].content, "old text");
+}
+
+#[tokio::test]
 async fn incoming_message_receipts_are_durable_and_app_scoped() {
     let (_db, repo) = fixture().await;
     assert!(repo.claim_message("app_a", "message_1", 100).await.unwrap());
@@ -144,7 +187,7 @@ async fn history_boundary_is_a_transactional_id_snapshot_and_rebind_cancels_old_
     let candidates = repo.sync_candidates(&binding.id).await.unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].id, "new");
-    repo.enqueue_inbox("feishu:app:input", &binding.id, "input")
+    repo.enqueue_inbox("feishu:app:input", &binding.id, "input", &[])
         .await
         .unwrap();
     let rows: Vec<_> = (0..2)

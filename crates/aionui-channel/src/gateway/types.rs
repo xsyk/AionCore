@@ -21,6 +21,15 @@ pub struct GatewayRoute {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GatewayAttachment {
+    pub kind: String,
+    pub file_key: String,
+    #[serde(default)]
+    pub file_name: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GatewayEvent {
     pub id: String,
     pub kind: String,
@@ -39,6 +48,10 @@ pub struct GatewayEvent {
     pub mentioned_bot: bool,
     #[serde(default)]
     pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message_type: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<GatewayAttachment>,
     #[serde(default)]
     pub interaction_id: String,
     #[serde(default)]

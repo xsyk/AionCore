@@ -6,7 +6,7 @@ edition.workspace = true
 [features]
 default = []
 telegram = ["dep:reqwest"]
-lark = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:prost", "dep:rustls", "dep:rustls-native-certs"]
+lark = ["dep:rustix", "dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:prost", "dep:rustls", "dep:rustls-native-certs"]
 dingtalk = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs"]
 weixin = ["dep:reqwest", "dep:futures-util", "dep:base64", "dep:uuid"]
 slack = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs"]
@@ -41,6 +41,10 @@ rustls-native-certs = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"], optional = true }
+
 [dev-dependencies]
+aionui-project.workspace = true
 sqlx.workspace = true
 aionui-ai-agent = { workspace = true, features = ["test-support"] }

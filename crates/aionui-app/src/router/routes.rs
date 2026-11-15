@@ -280,6 +280,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         },
         local: services.local,
         aionpro_mode: services.identity_mode == crate::config::IdentityMode::AionPro,
+        feishu_directory: super::state::build_feishu_directory_state(services),
         feishu: Some(Arc::new(
             aionui_auth::FeishuLogin::new(
                 Arc::new(aionui_db::SqliteFeishuLoginRepository::new(

@@ -104,6 +104,7 @@ impl IUserRepository for SqliteUserRepository {
             user_type: UserType::Local,
             external_user_id: None,
             username: Some(username.to_string()),
+            display_name: None,
             email: None,
             password_hash: Some(password_hash.to_string()),
             avatar_path: None,
@@ -663,6 +664,20 @@ impl IUserRepository for SqliteUserRepository {
         Ok(())
     }
 
+    async fn update_display_name(&self, user_id: &str, display_name: &str) -> Result<(), DbError> {
+        let result =
+            sqlx::query("UPDATE users SET display_name = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL")
+                .bind(display_name)
+                .bind(aionui_common::now_ms())
+                .bind(user_id)
+                .execute(&self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound("User not found".to_owned()));
+        }
+        Ok(())
+    }
+
     async fn email_taken(&self, email: &str, except_user_id: &str) -> Result<bool, DbError> {
         let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE email = ? AND id != ?")
             .bind(email)
@@ -764,6 +779,32 @@ mod tests {
         );
         let err = repo.update_profile(&b.id, Some("x@corp.com"), None).await.unwrap_err();
         assert!(matches!(err, DbError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn display_name_update_preserves_login_and_account_state() {
+        let (repo, _db) = setup().await;
+        let before = repo
+            .create_external_local_user("feishu:synthetic-display", "kept-login", "h", UserStatus::Disabled)
+            .await
+            .unwrap();
+        repo.update_display_name(&before.id, "合成显示姓名").await.unwrap();
+        let after = repo.find_by_id(&before.id).await.unwrap().unwrap();
+        assert_eq!(after.display_name.as_deref(), Some("合成显示姓名"));
+        assert_eq!(after.username, before.username);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.session_generation, before.session_generation);
+        assert_eq!(after.last_login, before.last_login);
+        assert_eq!(after.deleted_at, before.deleted_at);
+        repo.soft_delete(&before.id).await.unwrap();
+        assert!(matches!(
+            repo.update_display_name(&before.id, "不应写入").await,
+            Err(DbError::NotFound(_))
+        ));
+        assert_eq!(
+            repo.find_by_id(&before.id).await.unwrap().unwrap().display_name,
+            after.display_name
+        );
     }
 
     #[tokio::test]

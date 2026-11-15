@@ -53,10 +53,14 @@ pub struct Capabilities {
     /// (feature 012 "Plan B"); a user-custom `[permissions.<id>]` profile has no bare form
     /// and keeps its colon id. The colon↔bare pair `profile_id_to_legacy_value`↔
     /// `normalize_to_profile_id` is the sole translation, mirroring legacy ACP's
-    /// `apply_advertised_modes` + `normalize_requested_mode`. codex has no separately-exposed
-    /// collaborationMode selector; its mode axis IS the permission axis (see codex_conn
+    /// `apply_advertised_modes` + `normalize_requested_mode`. This remains the permission
+    /// axis; collaboration presets have their own catalog below (see codex_conn
     /// `fill_discovery` Permissions arm).
     pub available_modes: Vec<ModeInfo>,
+    /// Independent collaboration presets discovered by the backend.
+    pub available_collaboration_modes: Vec<ModeInfo>,
+    /// Explicit selection governing subsequent ordinary turns; None preserves CLI defaults.
+    pub current_collaboration_mode: Option<String>,
     /// NEW (007 §9.10): currently-selected model (persisted with the Node;
     /// preloaded on resume).
     pub current_model: Option<String>,

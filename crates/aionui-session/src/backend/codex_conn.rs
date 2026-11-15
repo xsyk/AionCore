@@ -22,6 +22,13 @@
 //! `emit`) are now production-reachable via `open_session`'s live spawn (R4) and
 //! independently contract-tested via the `build_with_io` seam.
 
+#[path = "codex_user_input.rs"]
+mod user_input;
+use user_input::UserInputs;
+#[path = "codex_collaboration.rs"]
+mod collaboration;
+use collaboration::Collaboration;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -718,6 +725,8 @@ pub fn codex_capabilities() -> Capabilities {
         prompt_accepted: PromptAcceptedSource::Native, // turn/started is a real wire ack
         available_models: Vec::new(),
         available_modes: Vec::new(),
+        available_collaboration_modes: Vec::new(),
+        current_collaboration_mode: None,
         current_model: None,
         current_mode: None,
         current_effort: None,
@@ -858,18 +867,19 @@ pub struct CodexSessionBackend {
     /// updated by `dispatch(SetModel)` + the `thread/settings/updated` notif. None
     /// until known → SetMode rejects (can't build a valid collaborationMode).
     current_model: Arc<Mutex<Option<String>>>,
-    /// REST-recovery (`GET /confirmations`) source: the currently-open (unanswered)
-    /// tool/file/elicitation approval requests, keyed by the SAME request_id the
-    /// backend surfaced on `SessionEvent::Permission` (so the recovered card's
-    /// id==call_id matches the live frame and de-dups). The value is a safe title
-    /// label derived from the reverse-RPC method (NOT the command body — TIO-13).
-    /// Lifecycle: the reader inserts on each `*/requestApproval` (+ elicitation)
-    /// reverse-RPC, removes on `serverRequest/resolved` (codex retracted/answered it)
-    /// and `dispatch(AnswerPermission)` (we answered it). `std::sync::Mutex` because
+    /// Tool/file/elicitation approvals, keyed by the SAME request_id surfaced on
+    /// `SessionEvent::Permission`. Only unanswered entries appear in REST recovery.
+    /// The safe title comes from the reverse-RPC method (NOT command bodies).
+    /// The reader inserts on requestApproval/elicitation and removes on resolved.
+    /// AnswerPermission marks an entry answered, retaining its identity until
+    /// resolved so unknown IDs cannot decrement another approval's counter.
+    /// `std::sync::Mutex` because
     /// the sync `pending_permission_requests()` trait method reads it without await —
     /// mirrors claude's `pending_perms`. Behind an Arc so the reader (cloned into
     /// every post-wake reader via `reader_state`) shares the one registry.
-    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, ToolApproval>>>,
+    pending_user_inputs: Arc<UserInputs>,
+    collaboration: Arc<std::sync::Mutex<Collaboration>>,
     /// GAP-A: rpc-id → [`PendingSend`] correlation for in-flight `turn/start`
     /// (and review/compact/logout) requests. codex IS a bidirectional JSON-RPC
     /// client: `turn/start` gets a synchronous response
@@ -912,6 +922,28 @@ pub struct CodexSessionBackend {
     /// How long dispatch(Steer) waits for the ack before degrading to
     /// fire-and-forget (Ok + warn). Milliseconds; injectable for tests.
     steer_ack_timeout_ms: AtomicU64,
+    /// Serializes next-turn assembly with all configuration writes.
+    dispatch_boundary: Mutex<()>,
+    /// Cancel invalidates a pre-wire Send here. The final writer holds this lock
+    /// through frame flush and turn_gen admission, but never while awaiting
+    /// settings or acquiring stdin, so Cancel can retire those waits promptly.
+    pending_turn_start: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+/// Owns one readback registration across awaits. Dropping a preparation future
+/// must invalidate its late response without discarding settings pending.
+struct SettingsReadbackGuard<'a> {
+    collaboration: &'a std::sync::Mutex<Collaboration>,
+    rpc_id: u64,
+}
+
+impl Drop for SettingsReadbackGuard<'_> {
+    fn drop(&mut self) {
+        self.collaboration
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget_readback(self.rpc_id);
+    }
 }
 
 /// One in-flight `turn/steer` awaiting its synchronous RPC ack (B5).
@@ -956,6 +988,7 @@ enum DiscoveryKind {
     /// codex's mode axis: filled from `permissionProfile/list` and mapped to the fixed
     /// permission-tier enum (feature 012). codex sends no `collaborationMode/list`.
     Permissions,
+    Collaboration,
     Checkpoints,
     Rewind,
 }
@@ -1000,7 +1033,9 @@ struct CodexReaderState {
     thread_binding: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
-    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, ToolApproval>>>,
+    pending_user_inputs: Arc<UserInputs>,
+    collaboration: Arc<std::sync::Mutex<Collaboration>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
@@ -1028,6 +1063,11 @@ fn start_codex_reader(
     io: Arc<dyn AgentIo>,
 ) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
+    let process_epoch = state
+        .collaboration
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .process_epoch;
     tokio::spawn(async move {
         reader_task(
             state.session_id,
@@ -1039,6 +1079,8 @@ fn start_codex_reader(
             state.active_turn_id,
             state.pending_auth_id,
             state.pending_tool_approvals,
+            state.pending_user_inputs,
+            state.collaboration,
             state.pending_sends,
             state.pending_discovery,
             state.pending_set,
@@ -1050,6 +1092,7 @@ fn start_codex_reader(
             state.stdin,
             state.turn_in_flight,
             state.title_gen,
+            process_epoch,
         )
         .await;
     })
@@ -1249,6 +1292,8 @@ impl CodexSessionBackend {
         let active_turn_id = Arc::new(Mutex::new(None));
         let pending_auth_id = Arc::new(Mutex::new(None));
         let pending_tool_approvals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pending_user_inputs = Arc::new(UserInputs::default());
+        let collaboration = Arc::new(std::sync::Mutex::new(Collaboration::default()));
         let current_model = Arc::new(Mutex::new(None));
         let pending_sends = Arc::new(Mutex::new(HashMap::new()));
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
@@ -1275,6 +1320,8 @@ impl CodexSessionBackend {
             active_turn_id: active_turn_id.clone(),
             pending_auth_id: pending_auth_id.clone(),
             pending_tool_approvals: pending_tool_approvals.clone(),
+            pending_user_inputs: pending_user_inputs.clone(),
+            collaboration: collaboration.clone(),
             pending_sends: pending_sends.clone(),
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
@@ -1333,6 +1380,8 @@ impl CodexSessionBackend {
             active_turn_id,
             pending_auth_id,
             pending_tool_approvals,
+            pending_user_inputs,
+            collaboration,
             current_model,
             pending_sends,
             pending_discovery,
@@ -1343,13 +1392,19 @@ impl CodexSessionBackend {
             pending_fork,
             discovered,
             steer_ack_timeout_ms: AtomicU64::new(STEER_ACK_TIMEOUT_MS),
+            dispatch_boundary: Mutex::new(()),
+            pending_turn_start: Mutex::new(None),
         }
     }
 
     /// Write one JSON-RPC frame (request or response) to stdin as a single line.
     async fn write_frame(&self, frame: Value) -> Result<(), BackendError> {
         let mut guard = self.stdin.lock().await;
-        let stdin = guard
+        Self::write_frame_to(&mut guard, frame).await
+    }
+
+    async fn write_frame_to(stdin: &mut Option<aionui_process::BoxedStdin>, frame: Value) -> Result<(), BackendError> {
+        let stdin = stdin
             .as_mut()
             .ok_or_else(|| BackendError::Transport("codex stdin unavailable".into()))?;
         let mut line = serde_json::to_vec(&frame).map_err(|e| BackendError::Transport(e.to_string()))?;
@@ -1392,6 +1447,16 @@ impl CodexSessionBackend {
     async fn bound_thread_within(&self, budget: std::time::Duration) -> Result<String, BackendError> {
         let polls = (budget.as_millis() / 50).max(1) as u64;
         for _ in 0..polls {
+            if let Some(code) = self
+                .collaboration
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .startup_error
+            {
+                return Err(BackendError::Transport(format!(
+                    "codex thread startup rejected (code {code})"
+                )));
+            }
             // Dead resume anchor (ELECTRON-3Q0): codex rejected the thread/resume,
             // so the binding this poll waits for will NEVER arrive. Fail fast with
             // the codex message as a SessionNotFound — the send-path maps it to the
@@ -1408,6 +1473,112 @@ impl CodexSessionBackend {
         Err(BackendError::HandshakeTimeout(format!(
             "codex threadId not bound (thread/started not received within {budget:?})"
         )))
+    }
+
+    /// Await settings receipts within the handshake budget, then resolve writes
+    /// whose notifications were omitted or coalesced. The caller holds
+    /// dispatch_boundary: no new settings write can race the wait or readback.
+    /// Every covered request must have its own receipt first.
+    async fn confirm_pending_settings(&self) -> Result<(), BackendError> {
+        if !self.collaboration.lock().unwrap_or_else(|e| e.into_inner()).pending() {
+            return Ok(());
+        }
+        let tid = self.bound_thread().await?;
+        let ack_deadline = tokio::time::Instant::now() + super::handshake_budget();
+        for _ in 0..2 {
+            let readback = loop {
+                let registration = {
+                    let mut state = self.collaboration.lock().unwrap_or_else(|e| e.into_inner());
+                    if !state.pending() {
+                        return Ok(());
+                    }
+                    if state.can_readback() {
+                        let id = self.next_rpc_id();
+                        // A confirming notification cannot clear pending between
+                        // the readiness check and registration under this lock.
+                        if !state.begin_readback(id, &tid) {
+                            return Err(BackendError::Transport("codex settings pending confirmation".into()));
+                        }
+                        Some(SettingsReadbackGuard {
+                            collaboration: self.collaboration.as_ref(),
+                            rpc_id: id,
+                        })
+                    } else {
+                        None
+                    }
+                };
+                if let Some(registration) = registration {
+                    break registration;
+                }
+                if tokio::time::Instant::now() >= ack_deadline {
+                    tracing::warn!(conversation_id = %self.session_id, reason = "ack_timeout", "codex settings receipt unconfirmed");
+                    return Err(BackendError::Transport(
+                        "codex settings pending confirmation (ack timeout)".into(),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            let id = readback.rpc_id;
+            let frame = json!({"jsonrpc":"2.0","id":id,"method":"thread/read",
+                "params":{"threadId":tid,"includeTurns":false}});
+            self.write_frame(frame).await?;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            let outcome = loop {
+                let outcome = self
+                    .collaboration
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .readback_outcome(id);
+                if outcome.is_some() || tokio::time::Instant::now() >= deadline {
+                    break outcome;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+            drop(readback);
+            if outcome == Some(true) {
+                tracing::info!(conversation_id = %self.session_id, rpc_id = id, "codex pending settings confirmed by readback");
+                return Ok(());
+            }
+            if outcome.is_none() {
+                tracing::warn!(conversation_id = %self.session_id, rpc_id = id, reason = "timeout", "codex settings readback unconfirmed");
+                return Err(BackendError::Transport(
+                    "codex settings pending confirmation (readback timeout)".into(),
+                ));
+            }
+        }
+        tracing::warn!(conversation_id = %self.session_id, reason = "unavailable_or_superseded", "codex settings readback unconfirmed");
+        Err(BackendError::Transport(
+            "codex settings pending confirmation (readback unavailable)".into(),
+        ))
+    }
+
+    /// Resume pre-binds the transport id before its actual settings arrive. A
+    /// selected collaboration mode must await that receipt, never reuse settings
+    /// from the previous process or fail an otherwise healthy wake immediately.
+    async fn collaboration_for_turn(&self) -> Result<Option<Value>, BackendError> {
+        let deadline = tokio::time::Instant::now() + super::handshake_budget();
+        loop {
+            self.bound_thread().await?;
+            let needs_readback = {
+                let state = self.collaboration.lock().unwrap_or_else(|e| e.into_inner());
+                state.selected.is_some() && state.pending()
+            };
+            if needs_readback {
+                self.confirm_pending_settings().await?;
+            }
+            {
+                let state = self.collaboration.lock().unwrap_or_else(|e| e.into_inner());
+                if state.pending() || !state.awaiting_thread() {
+                    return state.turn_value();
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(BackendError::HandshakeTimeout(
+                    "codex actual thread settings not confirmed".into(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Replay the JSON-RPC handshake over the (already-connected) stdin: an
@@ -1456,6 +1627,10 @@ impl CodexSessionBackend {
                 // in place made every turn/start hit the dead threadId and hang
                 // (ELECTRON-3Q0).
                 let resume_id = self.next_rpc_id();
+                self.collaboration
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .register_thread(resume_id, false);
                 *self.pending_resume.lock().await = Some(resume_id);
                 self.write_frame(thread_resume_params(&self.wake.config, tid).into_frame(resume_id, "thread/resume"))
                     .await?;
@@ -1474,6 +1649,10 @@ impl CodexSessionBackend {
                 // …) and poison the bound-thread wait — otherwise the first
                 // Send would poll for a binding that will never arrive.
                 let fork_id = self.next_rpc_id();
+                self.collaboration
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .register_thread(fork_id, false);
                 *self.pending_fork.lock().await = Some(fork_id);
                 self.write_frame(
                     thread_fork_params(&self.wake.config, parent_thread_id, last_turn_id)
@@ -1482,7 +1661,12 @@ impl CodexSessionBackend {
                 .await?;
             }
             HandshakeMode::Fresh => {
-                self.write_frame(thread_start_params(&self.wake.config).into_frame(self.next_rpc_id(), "thread/start"))
+                let start_id = self.next_rpc_id();
+                self.collaboration
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .register_thread(start_id, true);
+                self.write_frame(thread_start_params(&self.wake.config).into_frame(start_id, "thread/start"))
                     .await?;
             }
         }
@@ -1498,10 +1682,8 @@ impl CodexSessionBackend {
             "params": { "includeHidden": false }
         }))
         .await?;
-        // feature 012: codex's mode selector IS its permission axis, so we discover
-        // `permissionProfile/list` (mapped to the fixed mode enum in `fill_discovery`)
-        // and do NOT send `collaborationMode/list` (plan/default has no UI entry,
-        // matching legacy ACP). The reader claims the response and fills `disc.modes`.
+        // Permission profiles remain the mode axis. Discover collaboration
+        // separately below, without replacing `disc.modes` or its selected profile.
         // Backends without this list (older codex) simply never respond → modes stay
         // empty → no frontend mode selector.
         let perm_list_id = self.next_rpc_id();
@@ -1511,6 +1693,15 @@ impl CodexSessionBackend {
             .insert(perm_list_id, DiscoveryKind::Permissions);
         self.write_frame(json!({
             "jsonrpc": "2.0", "id": perm_list_id, "method": "permissionProfile/list", "params": {}
+        }))
+        .await?;
+        let collaboration_id = self.next_rpc_id();
+        self.pending_discovery
+            .lock()
+            .await
+            .insert(collaboration_id, DiscoveryKind::Collaboration);
+        self.write_frame(json!({
+            "jsonrpc":"2.0", "id":collaboration_id, "method":"collaborationMode/list", "params":{}
         }))
         .await?;
         Ok(())
@@ -1547,6 +1738,11 @@ impl CodexSessionBackend {
             Some((stdin, stdout)) => (Some(stdin), Some(stdout)),
             None => (None, None),
         };
+        self.pending_user_inputs.reset_process().await;
+        self.collaboration
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset_process();
         *self.stdin.lock().await = stdin;
         // The pre-suspend turn id is dead — a fresh process has no active turn yet.
         // Clearing it prevents a steer/interrupt right after wake from targeting a
@@ -1588,7 +1784,9 @@ async fn reader_task(
     thread_binding: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
-    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, ToolApproval>>>,
+    pending_user_inputs: Arc<UserInputs>,
+    collaboration: Arc<std::sync::Mutex<Collaboration>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
@@ -1600,10 +1798,12 @@ async fn reader_task(
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
     title_gen: Arc<TitleGen>,
+    process_epoch: u64,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let Some(stdout) = stdout else {
+        pending_user_inputs.retire("stdio unavailable").await;
         emit(
             &event_tx,
             &session_id,
@@ -1657,6 +1857,7 @@ async fn reader_task(
                         terminated = true;
                         system_error_pending = false;
                         system_error_deadline = None;
+                        pending_user_inputs.retire("turn ended").await;
                         *active_turn_id.lock().await = None;
                         turn_in_flight.store(false, Ordering::SeqCst);
                         emit(
@@ -1671,6 +1872,9 @@ async fn reader_task(
             }
             _ => lines.next_line().await,
         };
+        if collaboration.lock().unwrap_or_else(|e| e.into_inner()).process_epoch != process_epoch {
+            return;
+        }
         if !system_error_pending || terminated {
             system_error_deadline = None;
         }
@@ -1716,6 +1920,7 @@ async fn reader_task(
                             &event_tx,
                             &pending_auth_id,
                             &pending_tool_approvals,
+                            &pending_user_inputs,
                             &stdin,
                         )
                         .await;
@@ -1724,9 +1929,29 @@ async fn reader_task(
                         // server notification → SessionEvent(s)
                         let cur = turn_gen.load(Ordering::SeqCst);
                         let params = frame.get("params").unwrap_or(&Value::Null);
+                        if m == "thread/settings/updated" {
+                            // Settings notifications have no request id. Associate
+                            // them with this loaded thread before confirming or
+                            // projecting any axis (0.161.0 notification schema).
+                            let Some(tid) = params.get("threadId").and_then(Value::as_str) else {
+                                continue;
+                            };
+                            if thread_binding.lock().await.as_deref() != Some(tid) {
+                                continue;
+                            }
+                            let settings = params
+                                .get("threadSettings")
+                                .or_else(|| params.get("thread_settings"))
+                                .unwrap_or(&Value::Null);
+                            collaboration
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .notification(settings);
+                        }
                         if m == "thread/started" {
                             // bind threadId (backend transport key, kept private).
                             if let Some(tid) = params.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
+                                pending_user_inputs.bind_scope(tid, None, &turn_gen).await;
                                 *thread_binding.lock().await = Some(tid.to_string());
                                 // Addendum 9: lower the binding downstream so the
                                 // conversation persists backend_session_id (the
@@ -1750,6 +1975,9 @@ async fn reader_task(
                             // Capture the active turn id (optimistic token needed by
                             // turn/interrupt{turnId} + turn/steer{expectedTurnId}).
                             if let Some(tid) = params.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
+                                if let Some(thread_id) = params.get("threadId").and_then(Value::as_str) {
+                                    pending_user_inputs.bind_scope(thread_id, Some(tid), &turn_gen).await;
+                                }
                                 *active_turn_id.lock().await = Some(tid.to_string());
                                 // Fork anchoring: lower codex's OWN turn id so the
                                 // conversation layer stamps it onto this turn's
@@ -1779,6 +2007,7 @@ async fn reader_task(
                             ) {
                                 // Turn ended → clear the active turn id (a stale token
                                 // would make a later steer/interrupt target a dead turn).
+                                pending_user_inputs.retire("turn ended").await;
                                 *active_turn_id.lock().await = None;
                                 // F-4: turn terminal → clear the turn-active flag so the
                                 // idle timer may suspend the now-idle process.
@@ -1804,13 +2033,15 @@ async fn reader_task(
                             }
                             continue;
                         }
-                        // serverRequest/resolved: codex's confirmation that a
-                        // ServerRequest (approval or auth-refresh) was answered →
-                        // PermissionResolved so the reducer decrements the matching
-                        // counter (R9/R15). We can't know Tool-vs-Auth from this
-                        // bookkeeping notif alone, so resolve against the pending
-                        // auth id if it matches, else default Tool (the common case).
+                        // Ask identities are resolved independently and exactly once;
+                        // answered/rejected asks must never decrement Permission.
                         if m == "serverRequest/resolved" {
+                            if pending_user_inputs
+                                .resolve(params, &event_tx, &session_id, &turn_gen)
+                                .await
+                            {
+                                continue;
+                            }
                             let req_id = params.get("request_id").or_else(|| params.get("requestId")).cloned();
                             let kind = {
                                 let pending = pending_auth_id.lock().await;
@@ -1829,7 +2060,10 @@ async fn reader_task(
                             // by the surfaced request_id (raw for tool/file approvals,
                             // ELICIT_PREFIX-tagged for elicitation), matching the id shape
                             // stored on the requestApproval emit below.
-                            remove_pending_tool_approval(&pending_tool_approvals, &resolved_id);
+                            let known_approval = remove_pending_tool_approval(&pending_tool_approvals, &resolved_id);
+                            if !known_approval && matches!(kind, crate::event::PermissionKind::Tool) {
+                                continue;
+                            }
                             emit(
                                 &event_tx,
                                 &session_id,
@@ -1860,6 +2094,7 @@ async fn reader_task(
                                 terminated = true;
                                 system_error_pending = false; // the fatal error IS the rich follow-up
                                 system_error_deadline = None;
+                                pending_user_inputs.retire("turn ended").await;
                                 *active_turn_id.lock().await = None;
                                 turn_in_flight.store(false, Ordering::SeqCst);
                                 let message = params
@@ -1891,6 +2126,45 @@ async fn reader_task(
                         // never a silent drop. Other responses (settings/rollback/etc)
                         // flow via notifications; diagnostic only.
                         if let Some(rid) = frame.get("id").and_then(Value::as_u64) {
+                            let startup = {
+                                let mut state = collaboration.lock().unwrap_or_else(|e| e.into_inner());
+                                let startup = state.thread_response(rid, &frame);
+                                state.settings_response(rid, &frame);
+                                startup
+                            };
+                            let confirmed = {
+                                let mut state = collaboration.lock().unwrap_or_else(|e| e.into_inner());
+                                state
+                                    .readback_response(rid, &frame)
+                                    .then(|| (state.model.clone(), state.effort.clone()))
+                            };
+                            if let Some((model, effort)) = confirmed {
+                                let cur = turn_gen.load(Ordering::SeqCst);
+                                emit(&event_tx, &session_id, cur, SessionEvent::EffortConfirmed { effort });
+                                emit(
+                                    &event_tx,
+                                    &session_id,
+                                    cur,
+                                    SessionEvent::ConfigChanged { mode: None, model },
+                                );
+                            }
+                            if startup {
+                                if let Some(code) =
+                                    collaboration.lock().unwrap_or_else(|e| e.into_inner()).startup_error
+                                {
+                                    tracing::warn!(conversation_id = %session_id, rpc_id = rid, error_code = code, "codex thread startup rejected");
+                                } else if let Some(tid) = frame.pointer("/result/thread/id").and_then(Value::as_str) {
+                                    *thread_binding.lock().await = Some(tid.to_owned());
+                                    emit(
+                                        &event_tx,
+                                        &session_id,
+                                        turn_gen.load(Ordering::SeqCst),
+                                        SessionEvent::BackendBound {
+                                            backend_session_id: Some(tid.to_owned()),
+                                        },
+                                    );
+                                }
+                            }
                             let error_message = frame.get("error").map(|e| {
                                 e.get("message")
                                     .and_then(Value::as_str)
@@ -1917,7 +2191,8 @@ async fn reader_task(
                             if is_resume && let Some(msg) = error_message.as_deref() {
                                 tracing::warn!(
                                     conversation_id = %session_id,
-                                    error = %msg,
+                                    rpc_id = rid,
+                                    error_code = frame.pointer("/error/code").and_then(|code| code.as_i64()),
                                     "codex thread/resume rejected — clearing poisoned thread binding (dead resume anchor)"
                                 );
                                 *thread_binding.lock().await = None;
@@ -1946,7 +2221,8 @@ async fn reader_task(
                             if is_fork && let Some(msg) = error_message.as_deref() {
                                 tracing::warn!(
                                     conversation_id = %session_id,
-                                    error = %msg,
+                                    rpc_id = rid,
+                                    error_code = frame.pointer("/error/code").and_then(|code| code.as_i64()),
                                     "codex thread/fork rejected — poisoning bound-thread wait (no silent fallback)"
                                 );
                                 *resume_poison.lock().await = Some(format!("codex thread/fork failed: {msg}"));
@@ -1975,6 +2251,7 @@ async fn reader_task(
                                     if send.opens_turn {
                                         if !terminated {
                                             terminated = true;
+                                            pending_user_inputs.retire("turn ended").await;
                                             *active_turn_id.lock().await = None;
                                             turn_in_flight.store(false, Ordering::SeqCst);
                                             tracing::warn!(
@@ -2075,6 +2352,15 @@ async fn reader_task(
                                             },
                                         );
                                     }
+                                    DiscoveryKind::Collaboration => {
+                                        let event = {
+                                            let mut state = collaboration.lock().unwrap_or_else(|e| e.into_inner());
+                                            state.discover(result);
+                                            state.event()
+                                        };
+                                        tracing::info!(conversation_id = %session_id, rpc_id = rid, "codex collaboration catalog received");
+                                        emit(&event_tx, &session_id, turn_gen.load(Ordering::SeqCst), event);
+                                    }
                                     DiscoveryKind::Checkpoints => {
                                         emit(
                                             &event_tx,
@@ -2156,7 +2442,8 @@ async fn reader_task(
     }
 
     // F-4: the reader loop ended (process exited / stdout EOF) → the turn (if any)
-    // is terminal. Clear the turn-active flag so the idle timer is unblocked.
+    // is terminal. Clear questions before exposing the terminal/process exit.
+    pending_user_inputs.retire("stdout ended").await;
     turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
 
     // Deferred-systemError flush: the stream ended (EOF) before the rich follow-up
@@ -2164,6 +2451,7 @@ async fn reader_task(
     // this keeps the pre-defer behavior for the process-death path.
     if system_error_pending && !terminated {
         terminated = true;
+        pending_user_inputs.retire("turn ended").await;
         *active_turn_id.lock().await = None;
         emit(
             &event_tx,
@@ -2178,6 +2466,7 @@ async fn reader_task(
     // the §C5 R8 contract allows "one may be missing"). Emit a clean terminal so a
     // turn that reached idle isn't left hanging Running.
     if idle_pending && !terminated {
+        pending_user_inputs.retire("turn ended").await;
         *active_turn_id.lock().await = None;
         emit(
             &event_tx,
@@ -2502,7 +2791,7 @@ fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::syn
         }
         // Checkpoints → CheckpointList event, Rewind → Rewound event: both mapped at
         // the call site, not a cache fill — fill_discovery is never called for them.
-        DiscoveryKind::Checkpoints | DiscoveryKind::Rewind => {}
+        DiscoveryKind::Checkpoints | DiscoveryKind::Rewind | DiscoveryKind::Collaboration => {}
     }
 }
 
@@ -2557,16 +2846,25 @@ fn rollback_to_turn(result: &Value) -> u64 {
         .unwrap_or(0)
 }
 
-/// Remove a resolved/answered approval from the recovery registry. `serverRequest/
-/// resolved` carries the RAW wire id, but an elicitation was stored under the
-/// `ELICIT_PREFIX`-tagged key — so try the raw id first, then the prefixed form, so
-/// a resolved notification clears either entry shape. `dispatch(AnswerPermission)`
-/// passes the exact stored key (raw or prefixed), which the first lookup catches.
-fn remove_pending_tool_approval(pending: &Arc<std::sync::Mutex<HashMap<String, String>>>, request_id: &str) {
-    let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
-    if map.remove(request_id).is_none() {
-        map.remove(&format!("{ELICIT_PREFIX}{request_id}"));
+struct ToolApproval {
+    title: String,
+    answered: bool,
+}
+
+/// Retain answered approval identities until resolved: unknown/wrongly typed
+/// request IDs must not release an unrelated Permission counter.
+fn mark_tool_approval_answered(pending: &Arc<std::sync::Mutex<HashMap<String, ToolApproval>>>, request_id: &str) {
+    if let Some(entry) = pending.lock().unwrap_or_else(|e| e.into_inner()).get_mut(request_id) {
+        entry.answered = true;
     }
+}
+
+fn remove_pending_tool_approval(
+    pending: &Arc<std::sync::Mutex<HashMap<String, ToolApproval>>>,
+    request_id: &str,
+) -> bool {
+    let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
+    map.remove(request_id).is_some() || map.remove(&format!("{ELICIT_PREFIX}{request_id}")).is_some()
 }
 
 /// Reverse-RPC handler (A2/A3). The blocking ServerRequest MUST eventually get a
@@ -2588,12 +2886,18 @@ async fn handle_reverse_rpc(
     turn_gen: &Arc<AtomicU64>,
     event_tx: &broadcast::Sender<SessionEnvelope>,
     pending_auth_id: &Arc<Mutex<Option<Value>>>,
-    pending_tool_approvals: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pending_tool_approvals: &Arc<std::sync::Mutex<HashMap<String, ToolApproval>>>,
+    pending_user_inputs: &Arc<UserInputs>,
     stdin: &Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
 ) {
     let cur = turn_gen.load(Ordering::SeqCst);
     let id = frame.get("id").cloned().unwrap_or(Value::Null);
     match method {
+        "item/tool/requestUserInput" => {
+            pending_user_inputs
+                .register(frame, stdin, event_tx, session_id, turn_gen)
+                .await;
+        }
         // Mid-session re-auth (R6/R15): the server hit a 401 mid-turn and is asking
         // the client for fresh ChatGPT tokens. A human/credential source answers
         // this → surface Permission{Auth} (sets waiting_on_auth) and remember the
@@ -2659,10 +2963,13 @@ async fn handle_reverse_rpc(
             } else {
                 "CommandExecution"
             };
-            pending_tool_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(request_id.clone(), title.to_string());
+            pending_tool_approvals.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                request_id.clone(),
+                ToolApproval {
+                    title: title.to_string(),
+                    answered: false,
+                },
+            );
             emit(
                 event_tx,
                 session_id,
@@ -2708,10 +3015,13 @@ async fn handle_reverse_rpc(
             // Register for REST recovery, keyed by the ELICIT_PREFIX-tagged request_id
             // (the same id we surface + dispatch(AnswerPermission) answers). Title is
             // the safe approval class, not the elicitation message body (TIO-13).
-            pending_tool_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(request_id.clone(), "Elicitation".to_string());
+            pending_tool_approvals.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                request_id.clone(),
+                ToolApproval {
+                    title: "Elicitation".to_string(),
+                    answered: false,
+                },
+            );
             emit(
                 event_tx,
                 session_id,
@@ -2729,18 +3039,8 @@ async fn handle_reverse_rpc(
         // blocking request hang the turn) + opaque diagnostic. This matches the
         // ACP-audit finding: an unhandled reverse method should be clean-rejected,
         // not silently dropped (which deadlocks a blocking request).
-        //
-        // KNOWN deferred case: `item/tool/requestUserInput` (codex's native
-        // ask-the-user tool, the AskUserQuestion analog) currently falls here and is
-        // rejected, so the user never sees the question and the tool gets the empty
-        // fallback. Wiring it (surface Permission{questions} + answer
-        // {answers:{<id>:{answers}}} via ELICIT_PREFIX, claude AskUserQuestion is the
-        // template) is a reachable FOLLOW-UP — gap-reaudit confirmed the schema is fully
-        // defined. NOT wired yet because we could not capture a LIVE requestUserInput
-        // frame: it is mode-gated (`available_modes`, spec_plan.rs:729) and codex
-        // refused to invoke it in default OR plan mode in this env ("unavailable in the
-        // current mode"). Per the no-parser-for-an-unprobed-shape discipline, deferred
-        // until the trigger/mode is found and a real frame is captured.
+        // Native requestUserInput is handled separately as Ask above, using the
+        // 0.161.0 generated schema; live CLI acceptance remains unverified.
         _ => {
             write_reverse_error(stdin, &id, -32601, "method not handled by aionui-session").await;
             emit(
@@ -2863,7 +3163,18 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 // uses (`:workspace`→`auto`), so the picker highlights the matching entry;
                 // a custom profile keeps its colon (matches its verbatim catalog entry).
                 .map(codex_perm::profile_id_to_legacy_value);
-            vec![SessionEvent::ConfigChanged { mode, model }]
+            let mut events = Vec::new();
+            if let Some(effort) = settings
+                .get("effort")
+                .or_else(|| settings.pointer("/collaborationMode/settings/reasoning_effort"))
+                .filter(|effort| effort.is_null() || effort.is_string())
+            {
+                events.push(SessionEvent::EffortConfirmed {
+                    effort: effort.as_str().map(str::to_owned),
+                });
+            }
+            events.push(SessionEvent::ConfigChanged { mode, model });
+            events
         }
         // (No `item/userMessage/delta` arm: codex never emits that method — the user
         // echo arrives as an `item/*` with item.type=="userMessage", handled by the
@@ -3885,9 +4196,19 @@ impl SessionBackend for CodexSessionBackend {
     /// holds an `Arc` to this backend.
     async fn terminate(&self) {
         self.suspend.terminate().await;
+        self.pending_user_inputs.reset_process().await;
+        self.pending_user_inputs.retire("terminated").await;
     }
 
     async fn dispatch(&self, command: Command) -> Result<CommandReceipt, BackendError> {
+        let _boundary = if matches!(
+            &command,
+            Command::Send { .. } | Command::SetMode { .. } | Command::SetModel { .. } | Command::SetConfigOption { .. }
+        ) {
+            Some(self.dispatch_boundary.lock().await)
+        } else {
+            None
+        };
         match command {
             Command::Send { content, metadata } => {
                 // §C6 Layer-2: reject any block kind codex does not advertise
@@ -3987,20 +4308,34 @@ impl SessionBackend for CodexSessionBackend {
                 self.suspend
                     .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
                     .await?;
-                // F-4: mark the turn in flight so the idle timer won't suspend the
-                // app-server mid-turn (the reader clears it at the terminal).
-                self.turn_in_flight.store(true, Ordering::SeqCst);
-                // REAL codex 0.137.0 turn-driver: `turn/start{threadId, input}`
-                // (verified against the aion-probe transcripts). Needs the bound
-                // threadId (waits briefly for the async thread/started; fails FAST
-                // when the resume was rejected — see `resume_poison`).
-                let tid = match self.bound_thread().await {
-                    Ok(tid) => tid,
-                    Err(e) => {
-                        // The turn never reached the wire — undo the in-flight mark
-                        // so a failed dispatch doesn't pin the idle timer awake.
+                let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel();
+                {
+                    let mut pending = self.pending_turn_start.lock().await;
+                    *pending = Some(cancel_tx);
+                    // Keep the idle timer awake during preparation. Cancel clears
+                    // this only while retiring this same pre-wire reservation.
+                    self.turn_in_flight.store(true, Ordering::SeqCst);
+                }
+                let cancelled = || BackendError::Transport("codex send cancelled before turn start".into());
+                let prepared = tokio::select! {
+                    biased;
+                    _ = &mut cancel_rx => Err(cancelled()),
+                    result = async {
+                        let tid = self.bound_thread().await?;
+                        let collaboration_value = if matches!(route, None | Some(SlashRoute::Init)) {
+                            self.collaboration_for_turn().await?
+                        } else {
+                            None
+                        };
+                        Ok((tid, collaboration_value))
+                    } => result,
+                };
+                let (tid, collaboration_value) = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.pending_turn_start.lock().await.take();
                         self.turn_in_flight.store(false, Ordering::SeqCst);
-                        return Err(e);
+                        return Err(error);
                     }
                 };
                 let id = self.next_rpc_id();
@@ -4024,7 +4359,7 @@ impl SessionBackend for CodexSessionBackend {
                 // All three turn-flavored routes run a REAL wire turn on the thread
                 // (turn/started → items → turn/completed; verified live 0.144.1, files
                 // above), so the existing reader/FSM lifecycle applies unchanged.
-                let (method, params) = match route {
+                let (method, mut params) = match route {
                     None => ("turn/start", json!({ "threadId": tid, "input": build_input(&content) })),
                     // /init → the bridge's canned AGENTS.md prompt as a normal turn
                     // (bridge: Op::UserInput{INIT_COMMAND_PROMPT}).
@@ -4039,14 +4374,41 @@ impl SessionBackend for CodexSessionBackend {
                     Some(SlashRoute::Review(target)) => ("review/start", json!({ "threadId": tid, "target": target })),
                     Some(SlashRoute::Logout) => unreachable!("handled above"),
                 };
+                if let Some(value) = collaboration_value {
+                    params["collaborationMode"] = value;
+                }
                 let frame = json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "method": method,
                     "params": params
                 });
-                self.write_frame(frame).await?;
-                let cur_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                let written = tokio::select! {
+                    biased;
+                    _ = &mut cancel_rx => Err(cancelled()),
+                    mut stdin = self.stdin.lock() => {
+                        // Acquire the cancellation boundary AFTER stdin. A Send
+                        // waiting for stdin remains cancellable; once writing
+                        // begins, Cancel serializes after flush and admission.
+                        let mut pending = self.pending_turn_start.lock().await;
+                        if pending.is_none() {
+                            Err(cancelled())
+                        } else {
+                            let result = Self::write_frame_to(&mut stdin, frame).await;
+                            pending.take();
+                            result.map(|()| self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1)
+                        }
+                    }
+                };
+                let cur_gen = match written {
+                    Ok(cur_gen) => cur_gen,
+                    Err(error) => {
+                        self.pending_turn_start.lock().await.take();
+                        self.pending_sends.lock().await.remove(&id);
+                        self.turn_in_flight.store(false, Ordering::SeqCst);
+                        return Err(error);
+                    }
+                };
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::Started,
@@ -4056,6 +4418,26 @@ impl SessionBackend for CodexSessionBackend {
             Command::Cancel { target } => {
                 if let CancelTarget::Tool(_) = target {
                     return Err(BackendError::CommandNotSupported { command: "cancel_tool" });
+                }
+                let cancelled_start = {
+                    let mut pending = self.pending_turn_start.lock().await;
+                    if let Some(cancel) = pending.take() {
+                        let _ = cancel.send(());
+                        self.turn_in_flight.store(false, Ordering::SeqCst);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if cancelled_start {
+                    // Nothing was written: no native interrupt is needed. Keep
+                    // settings pending for confirmation by the next Send.
+                    self.pending_user_inputs.retire("cancelled").await;
+                    return Ok(CommandReceipt {
+                        accepted: true,
+                        admission: Admission::NoTurn,
+                        turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                    });
                 }
                 // REAL codex: `turn/interrupt{threadId, turnId}` (hard cancel).
                 // `turnId` is REQUIRED (non-Option on the wire). bound_thread first
@@ -4083,6 +4465,7 @@ impl SessionBackend for CodexSessionBackend {
                     }
                 }
                 let Some(turn_id) = active else {
+                    self.pending_user_inputs.retire("cancelled").await;
                     return Ok(CommandReceipt {
                         accepted: true,
                         admission: Admission::NoTurn,
@@ -4095,6 +4478,7 @@ impl SessionBackend for CodexSessionBackend {
                     "params": { "threadId": tid, "turnId": turn_id }
                 });
                 self.write_frame(frame).await?;
+                self.pending_user_inputs.retire("cancelled").await;
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -4250,6 +4634,10 @@ impl SessionBackend for CodexSessionBackend {
                     .lock()
                     .await
                     .insert(id, format!("mode\u{2192}{profile_id}"));
+                self.collaboration
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .register_settings(id, json!({"permissions":profile_id}));
                 let frame = json!({
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
                     "params": {
@@ -4257,7 +4645,14 @@ impl SessionBackend for CodexSessionBackend {
                         "permissions": profile_id
                     }
                 });
-                self.write_frame(frame).await?;
+                if let Err(error) = self.write_frame(frame).await {
+                    self.collaboration
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .forget_settings(id);
+                    self.pending_set.lock().await.remove(&id);
+                    return Err(error);
+                }
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -4286,20 +4681,29 @@ impl SessionBackend for CodexSessionBackend {
                     .lock()
                     .await
                     .insert(id, format!("model\u{2192}{model}"));
+                self.collaboration
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .register_settings(id, json!({"model":model}));
                 let frame = json!({
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
                     "params": { "threadId": tid, "model": model }
                 });
-                self.write_frame(frame).await?;
+                if let Err(error) = self.write_frame(frame).await {
+                    self.collaboration
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .forget_settings(id);
+                    self.pending_set.lock().await.remove(&id);
+                    return Err(error);
+                }
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
                     turn_gen: self.turn_gen.load(Ordering::SeqCst),
                 })
             }
-            // codex has no AskUserQuestion (its MCP elicitation degrades to a
-            // Permission with ELICIT_PREFIX); Ask is never raised here.
-            Command::AnswerAsk { .. } => Err(BackendError::CommandNotSupported { command: "answer_ask" }),
+            Command::AnswerAsk { request_id, answers } => self.answer_user_input(&request_id, answers).await,
             Command::AnswerAuth { method_id, credentials } => {
                 // Mid-session re-auth (R6/R15): the server raised
                 // `account/chatgptAuthTokens/refresh` (a blocking ServerRequest the
@@ -4415,7 +4819,7 @@ impl SessionBackend for CodexSessionBackend {
                 request_id,
                 decision,
                 selected: _, // codex approval is accept/decline; no pick-one label
-                answers: _,  // codex has no AskUserQuestion; per-question answers N/A
+                answers: _,  // Native questions use the separate AnswerAsk command.
             } => {
                 let approved = matches!(
                     decision,
@@ -4458,7 +4862,7 @@ impl SessionBackend for CodexSessionBackend {
                 // subsequent GET /confirmations no longer resurfaces a card the user
                 // already resolved. `request_id` is the exact stored key (raw for
                 // tool/file, ELICIT_PREFIX-tagged for elicitation).
-                remove_pending_tool_approval(&self.pending_tool_approvals, &request_id);
+                mark_tool_approval_answered(&self.pending_tool_approvals, &request_id);
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -4504,11 +4908,48 @@ impl SessionBackend for CodexSessionBackend {
                     .lock()
                     .await
                     .insert(id, format!("effort\u{2192}{value}"));
+                self.collaboration
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .register_settings(id, json!({"effort":value}));
                 let frame = json!({
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
                     "params": { "threadId": tid, "effort": value }
                 });
-                self.write_frame(frame).await?;
+                if let Err(error) = self.write_frame(frame).await {
+                    self.collaboration
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .forget_settings(id);
+                    self.pending_set.lock().await.remove(&id);
+                    return Err(error);
+                }
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                })
+            }
+            Command::SetConfigOption { option_id, value } if option_id == "collaboration_mode" => {
+                if self.turn_in_flight.load(Ordering::SeqCst) || self.active_turn_id.lock().await.is_some() {
+                    return Err(BackendError::Transport("codex collaboration_mode busy".into()));
+                }
+                self.confirm_pending_settings().await?;
+                let event = {
+                    let mut state = self.collaboration.lock().unwrap_or_else(|e| e.into_inner());
+                    if state.pending() {
+                        return Err(BackendError::Transport("codex settings pending confirmation".into()));
+                    }
+                    state.select(value.clone())?;
+                    state.event()
+                };
+                tracing::info!(conversation_id = %self.session_id, mode = %value, "codex collaboration selection updated");
+                emit(
+                    &self.event_tx,
+                    &self.session_id,
+                    self.turn_gen.load(Ordering::SeqCst),
+                    event,
+                );
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -4578,6 +5019,13 @@ impl SessionBackend for CodexSessionBackend {
         if !disc.modes.is_empty() {
             caps.available_modes = disc.modes.clone();
         }
+        let collaboration = self.collaboration.lock().unwrap_or_else(|e| e.into_inner());
+        caps.available_collaboration_modes = collaboration.modes.clone();
+        caps.current_collaboration_mode = collaboration.selected.clone();
+        if collaboration.model.is_some() {
+            caps.current_model = collaboration.model.clone();
+        }
+        caps.current_effort = collaboration.effort.clone();
         caps
     }
 
@@ -4590,20 +5038,24 @@ impl SessionBackend for CodexSessionBackend {
     /// before the client subscribed — or lost on a page reload — could never be
     /// rebuilt, and the turn hung forever waiting for an answer. The recovered
     /// card's id==call_id==request_id, matching the live `Permission` frame so a
-    /// duplicate live+recovered pair de-dups. codex approvals carry no question
-    /// payload (AskUserQuestion is claude-only), so `questions` is always `None`;
-    /// the raw command body is NOT exposed (TIO-13) — only the approval-class title.
+    /// duplicate live+recovered pair de-dups. Native questions are appended with
+    /// their stable identities for Ask recovery. Approval command bodies are not
+    /// exposed (TIO-13), only the approval-class title.
     fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
-        self.pending_tool_approvals
+        let mut pending: Vec<_> = self
+            .pending_tool_approvals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(request_id, title)| PendingPermissionView {
+            .filter(|(_, approval)| !approval.answered)
+            .map(|(request_id, approval)| PendingPermissionView {
                 request_id: request_id.clone(),
-                tool_name: title.clone(),
+                tool_name: approval.title.clone(),
                 questions: None,
             })
-            .collect()
+            .collect();
+        pending.extend(self.pending_user_inputs.pending());
+        pending
     }
 }
 
@@ -4763,6 +5215,10 @@ impl Drop for CodexSessionBackend {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "codex_collaboration_tests.rs"]
+mod collaboration_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4963,6 +5419,845 @@ mod tests {
             }
         }
         out
+    }
+
+    // Schema fixtures, not a claim of live CLI acceptance. Verified contract:
+    // docs/superpowers/sdd/1.0.3/protocol-captures/codex-0.161.0-214-20261106/schema-full/
+    fn user_input_frame(id: Value) -> Value {
+        json!({"id": id, "method":"item/tool/requestUserInput", "params": {
+            "isBlocking":true, "threadId":"th1", "turnId":"turn1", "itemId":"item1",
+            "questions":[{"id":"q1", "header":"Choice", "question":"Pick?",
+                "isOther":true, "options":[{"label":"A", "description":"First"}]}]
+        }})
+    }
+
+    async fn register_user_input(backend: &CodexSessionBackend, frame: &Value) {
+        handle_reverse_rpc(
+            "item/tool/requestUserInput",
+            frame,
+            &backend.session_id,
+            &backend.turn_gen,
+            &backend.event_tx,
+            &backend.pending_auth_id,
+            &backend.pending_tool_approvals,
+            &backend.pending_user_inputs,
+            &backend.stdin,
+        )
+        .await;
+    }
+
+    fn ask_answer(request_id: &str, pairs: &[(&str, &str)]) -> Command {
+        Command::AnswerAsk {
+            request_id: request_id.into(),
+            answers: Some(
+                pairs
+                    .iter()
+                    .map(|(question, label)| super::super::types::QuestionAnswer {
+                        question_id: None,
+                        question: (*question).into(),
+                        labels: vec![(*label).into()],
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_input_frame_and_recovery_preserve_question_identity() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut events = backend.events();
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        let event = events.next().await.unwrap().event;
+        let SessionEvent::Ask { request_id, questions } = event else {
+            panic!("expected Ask event");
+        };
+        assert_ne!(request_id, "9", "public identity must not be the bare wire id");
+        assert_eq!(questions[0]["id"], "q1");
+        assert_eq!(questions[0]["is_other"], true);
+        assert_eq!(questions[0]["multiSelect"], false);
+        let pending = backend.pending_permission_requests();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id, request_id);
+        assert_eq!(pending[0].tool_name, "RequestUserInput");
+        assert_eq!(pending[0].questions.as_ref().unwrap()[0]["id"], "q1");
+        assert!(captured.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_input_answer_writes_schema_response_and_resolves_once() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        let request_id = backend.pending_permission_requests()[0].request_id.clone();
+        let mut events = backend.events();
+        let (a, b) = tokio::join!(
+            backend.dispatch(ask_answer(&request_id, &[("q1", "A")])),
+            backend.dispatch(ask_answer(&request_id, &[("q1", "A")]))
+        );
+        assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+        let written = captured_str(&captured).await;
+        let frames: Vec<Value> = written
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            frames,
+            vec![json!({"jsonrpc":"2.0", "id":9,
+            "result":{"answers":{"q1":{"answers":["A"]}}}})]
+        );
+        assert!(matches!(
+            events.next().await.unwrap().event,
+            SessionEvent::AskResolved { .. }
+        ));
+        assert!(backend.pending_permission_requests().is_empty());
+        assert!(
+            matches!(backend.dispatch(ask_answer(&request_id, &[("q1", "A")])).await,
+            Err(BackendError::Transport(message)) if message.contains("no pending user input"))
+        );
+    }
+
+    #[tokio::test]
+    async fn user_input_failed_write_and_cancel_keep_pending_for_retry() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        let request_id = backend.pending_permission_requests()[0].request_id.clone();
+        let stdin = backend.stdin.lock().await.take();
+        assert!(
+            matches!(backend.dispatch(ask_answer(&request_id, &[("Pick?", "A")])).await,
+            Err(BackendError::Transport(message)) if message.contains("stdin unavailable"))
+        );
+        assert_eq!(backend.pending_permission_requests().len(), 1);
+        *backend.stdin.lock().await = stdin;
+        assert!(
+            matches!(backend.dispatch(Command::AnswerAsk {request_id:request_id.clone(), answers:None}).await,
+            Err(BackendError::Transport(message)) if message.contains("cancellation is unsupported"))
+        );
+        assert_eq!(backend.pending_permission_requests().len(), 1);
+        assert!(captured.lock().await.is_empty());
+        backend
+            .dispatch(ask_answer(&request_id, &[("Pick?", "A")]))
+            .await
+            .unwrap();
+        assert!(backend.pending_permission_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_input_duplicate_text_uses_original_order_and_validates_entire_submission() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut frame = user_input_frame(json!(9));
+        let mut second = frame["params"]["questions"][0].clone();
+        second["id"] = json!("q2");
+        frame["params"]["questions"].as_array_mut().unwrap().push(second);
+        register_user_input(&backend, &frame).await;
+        let request_id = backend.pending_permission_requests()[0].request_id.clone();
+        for pairs in [
+            vec![("Pick?", "A")],
+            vec![("q1", "A"), ("q1", "B")],
+            vec![("unknown", "A"), ("q2", "B")],
+            vec![("q1", "A"), ("q2", "B"), ("q2", "C")],
+        ] {
+            assert!(matches!(backend.dispatch(ask_answer(&request_id, &pairs)).await,
+                Err(BackendError::Transport(message)) if message.contains("invalid user input answers")));
+            assert_eq!(backend.pending_permission_requests().len(), 1);
+            assert!(captured.lock().await.is_empty());
+        }
+        backend
+            .dispatch(ask_answer(&request_id, &[("Pick?", "A"), ("Pick?", "B")]))
+            .await
+            .unwrap();
+        let written: Value = serde_json::from_str(captured_str(&captured).await.trim()).unwrap();
+        assert_eq!(
+            written["result"]["answers"],
+            json!({"q1":{"answers":["A"]}, "q2":{"answers":["B"]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn user_input_string_and_numeric_wire_ids_remain_distinct() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        let numeric_id = backend.pending_permission_requests()[0].request_id.clone();
+        register_user_input(&backend, &user_input_frame(json!("9"))).await;
+        let pending = backend.pending_permission_requests();
+        assert_eq!(pending.len(), 2);
+        let string_id = &pending.iter().find(|p| p.request_id != numeric_id).unwrap().request_id;
+        backend.dispatch(ask_answer(string_id, &[("q1", "B")])).await.unwrap();
+        backend.dispatch(ask_answer(&numeric_id, &[("q1", "A")])).await.unwrap();
+        let written = captured_str(&captured).await;
+        let frames: Vec<Value> = written
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(frames[0]["id"], json!("9"));
+        assert_eq!(frames[1]["id"], json!(9));
+    }
+
+    #[tokio::test]
+    async fn user_input_resolved_is_thread_scoped_and_never_resolves_permission() {
+        let frame = user_input_frame(json!(9)).to_string();
+        let events = drive_codex(&[
+            &frame,
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"other","requestId":9}}"#,
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"th1","requestId":9}}"#,
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"th1","requestId":9}}"#,
+        ])
+        .await;
+        assert_eq!(
+            events.iter().filter(|e| matches!(e, SessionEvent::Ask { .. })).count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, SessionEvent::AskResolved { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::PermissionResolved { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn user_input_resolved_wrong_thread_does_not_release_ask() {
+        let frame = user_input_frame(json!(9)).to_string();
+        let events = drive_codex(&[
+            &frame,
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"other","requestId":9}}"#,
+        ])
+        .await;
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            SessionEvent::AskResolved { .. } | SessionEvent::PermissionResolved { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn user_input_resolved_after_local_answer_never_decrements_permission() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        let request_id = backend.pending_permission_requests()[0].request_id.clone();
+        backend.dispatch(ask_answer(&request_id, &[("q1", "A")])).await.unwrap();
+        let mut events = backend.events();
+        let io = Arc::new(FakeAgentIo::new(
+            b"{\"method\":\"serverRequest/resolved\",\"params\":{\"threadId\":\"th1\",\"requestId\":9}}\n".to_vec(),
+            None,
+        ));
+        let (_, stdout) = io.take_stdio().await.unwrap();
+        io.release_exit();
+        start_codex_reader(&backend.reader_state, Some(stdout), io)
+            .await
+            .unwrap();
+        while let Some(env) = events.next().await {
+            assert!(!matches!(
+                env.event,
+                SessionEvent::AskResolved { .. } | SessionEvent::PermissionResolved { .. }
+            ));
+            if matches!(env.event, SessionEvent::Detached { .. }) {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn user_input_repeated_request_does_not_replace_pending_questions() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        let request_id = backend.pending_permission_requests()[0].request_id.clone();
+        let mut replacement = user_input_frame(json!(9));
+        replacement["params"]["threadId"] = json!("other");
+        replacement["params"]["questions"][0]["question"] = json!("Replacement?");
+        register_user_input(&backend, &replacement).await;
+        let pending = backend.pending_permission_requests();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].questions.as_ref().unwrap()[0]["question"], "Pick?");
+        backend.dispatch(ask_answer(&request_id, &[("q1", "A")])).await.unwrap();
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        assert!(backend.pending_permission_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_input_late_resolved_after_answer_does_not_release_twice() {
+        let backend = CodexSessionBackend::build_with_io(
+            "codex-1",
+            Box::new(FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new())),
+        )
+        .await;
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        let request_id = backend.pending_permission_requests()[0].request_id.clone();
+        backend.dispatch(ask_answer(&request_id, &[("q1", "A")])).await.unwrap();
+        let mut events = backend.events();
+        let fake = Arc::new(FakeAgentIo::new(
+            b"{\"method\":\"serverRequest/resolved\",\"params\":{\"threadId\":\"th1\",\"requestId\":9}}\n".to_vec(),
+            Some(crate::event::ExitStatusLite {
+                code: Some(0),
+                signal: None,
+            }),
+        ));
+        fake.release_exit();
+        let (_, stdout) = fake.take_stdio().await.unwrap();
+        start_codex_reader(&backend.reader_state, Some(stdout), fake)
+            .await
+            .unwrap();
+        while let Ok(Some(env)) = tokio::time::timeout(std::time::Duration::from_millis(20), events.next()).await {
+            assert!(!matches!(
+                env.event,
+                SessionEvent::AskResolved { .. } | SessionEvent::PermissionResolved { .. }
+            ));
+            if matches!(env.event, SessionEvent::Detached { .. }) {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn user_input_duplicate_requests_do_not_replace_pending_or_increment_twice() {
+        let backend = CodexSessionBackend::build_with_io(
+            "codex-1",
+            Box::new(FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new())),
+        )
+        .await;
+        let mut events = backend.events();
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        assert_eq!(backend.pending_permission_requests().len(), 1);
+        assert!(matches!(events.next().await.unwrap().event, SessionEvent::Ask { .. }));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), events.next())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn user_input_resolved_wrong_id_type_does_not_decrement_another_permission() {
+        let ask = user_input_frame(json!(9)).to_string();
+        let events = drive_codex(&[
+            r#"{"id":42,"method":"item/commandExecution/requestApproval","params":{"threadId":"th1"}}"#,
+            &ask,
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"th1","requestId":"9"}}"#,
+        ])
+        .await;
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            SessionEvent::AskResolved { .. } | SessionEvent::PermissionResolved { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn user_input_answered_permission_still_resolves_once_after_identity_guard() {
+        let backend = CodexSessionBackend::build_with_io(
+            "codex-1",
+            Box::new(FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new())),
+        )
+        .await;
+        handle_reverse_rpc(
+            "item/commandExecution/requestApproval",
+            &json!({"id":42}),
+            &backend.session_id,
+            &backend.turn_gen,
+            &backend.event_tx,
+            &backend.pending_auth_id,
+            &backend.pending_tool_approvals,
+            &backend.pending_user_inputs,
+            &backend.stdin,
+        )
+        .await;
+        backend
+            .dispatch(Command::AnswerPermission {
+                request_id: "42".into(),
+                decision: crate::PermissionDecision::Approved,
+                selected: None,
+                answers: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert!(backend.pending_permission_requests().is_empty());
+        let mut events = backend.events();
+        let notification =
+            "{\"method\":\"serverRequest/resolved\",\"params\":{\"threadId\":\"th1\",\"requestId\":42}}\n";
+        let fake = Arc::new(FakeAgentIo::new(notification.repeat(2).into_bytes(), None));
+        fake.release_exit();
+        let (_, stdout) = fake.take_stdio().await.unwrap();
+        start_codex_reader(&backend.reader_state, Some(stdout), fake)
+            .await
+            .unwrap();
+        let mut resolved = 0;
+        while let Some(env) = events.next().await {
+            if matches!(env.event, SessionEvent::PermissionResolved { .. }) {
+                resolved += 1;
+            }
+            if matches!(env.event, SessionEvent::Detached { .. }) {
+                break;
+            }
+        }
+        assert_eq!(resolved, 1);
+    }
+
+    #[tokio::test]
+    async fn user_input_broken_pipe_keeps_pending_and_can_retry() {
+        struct BrokenPipe;
+        impl tokio::io::AsyncWrite for BrokenPipe {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected broken pipe",
+                )))
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        let request_id = backend.pending_permission_requests()[0].request_id.clone();
+        let original = backend.stdin.lock().await.replace(Box::new(BrokenPipe));
+        assert!(
+            matches!(backend.dispatch(ask_answer(&request_id, &[("q1", "A")])).await,
+            Err(BackendError::Transport(message)) if message.contains("injected broken pipe"))
+        );
+        assert_eq!(backend.pending_permission_requests().len(), 1);
+        assert!(captured.lock().await.is_empty());
+        *backend.stdin.lock().await = original;
+        backend.dispatch(ask_answer(&request_id, &[("q1", "A")])).await.unwrap();
+        assert!(backend.pending_permission_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_input_text_colliding_with_another_stable_id_is_rejected_without_swapping_answers() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut frame = user_input_frame(json!(9));
+        frame["params"]["questions"][0]["question"] = json!("q2");
+        let mut second = frame["params"]["questions"][0].clone();
+        second["id"] = json!("q2");
+        second["question"] = json!("q1");
+        frame["params"]["questions"].as_array_mut().unwrap().push(second);
+        register_user_input(&backend, &frame).await;
+        let request_id = backend.pending_permission_requests()[0].request_id.clone();
+        assert!(
+            matches!(backend.dispatch(ask_answer(&request_id, &[("q2", "A"), ("q1", "B")])).await,
+            Err(BackendError::Transport(message)) if message.contains("ambiguous user input question identity"))
+        );
+        assert_eq!(backend.pending_permission_requests().len(), 1);
+        assert!(captured.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_input_secret_and_nonblocking_requests_are_explicitly_rejected() {
+        for (field, value) in [("isSecret", true), ("isBlocking", false)] {
+            let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+            let captured = fake.captured_stdin();
+            let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+            let mut frame = user_input_frame(json!(9));
+            if field == "isSecret" {
+                frame["params"]["questions"][0][field] = json!(value);
+            } else {
+                frame["params"][field] = json!(value);
+            }
+            register_user_input(&backend, &frame).await;
+            assert!(backend.pending_permission_requests().is_empty());
+            let written: Value = serde_json::from_str(captured_str(&captured).await.trim()).unwrap();
+            assert_eq!(written["error"]["code"], -32602);
+            assert!(written["error"]["message"].as_str().unwrap().contains("unsupported"));
+            assert!(!written.to_string().contains("Pick?"));
+        }
+    }
+
+    // Regression fixtures exercise adapter lifecycles, not live CLI timing.
+    async fn next_user_input_event(
+        rx: &mut broadcast::Receiver<SessionEnvelope>,
+        matches: fn(&SessionEvent) -> bool,
+    ) -> SessionEnvelope {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let env = rx.recv().await.unwrap();
+                if matches(&env.event) {
+                    return env;
+                }
+            }
+        })
+        .await
+        .expect("reader reached expected event")
+    }
+
+    #[tokio::test]
+    async fn user_input_lifecycle_terminal_and_late_resolved_do_not_release_next_turn() {
+        let ask = user_input_frame(json!(9));
+        let mut next_ask = user_input_frame(json!(10));
+        next_ask["params"]["turnId"] = json!("turn2");
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_segments(vec![
+            format!("{{\"method\":\"turn/started\",\"params\":{{\"threadId\":\"th1\",\"turn\":{{\"id\":\"turn1\"}}}}}}\n{ask}\n").into_bytes(),
+            b"{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"th1\",\"turn\":{\"id\":\"turn1\",\"status\":\"interrupted\"}}}\n".to_vec(),
+            format!("{{\"method\":\"turn/started\",\"params\":{{\"threadId\":\"th1\",\"turn\":{{\"id\":\"turn2\"}}}}}}\n{next_ask}\n").into_bytes(),
+            b"{\"method\":\"serverRequest/resolved\",\"params\":{\"threadId\":\"th1\",\"requestId\":9}}\n{\"method\":\"item/agentMessage/delta\",\"params\":{\"delta\":\"barrier\"}}\n".to_vec(),
+            Vec::new(),
+        ]);
+        let release = fake.segment_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut rx = backend.event_tx.subscribe();
+        backend.turn_gen.store(1, Ordering::SeqCst);
+        release();
+        next_user_input_event(&mut rx, |e| matches!(e, SessionEvent::Ask { .. })).await;
+        let old_request_id = backend.pending_permission_requests()[0].request_id.clone();
+        release();
+        next_user_input_event(&mut rx, |e| matches!(e, SessionEvent::TurnResult { .. })).await;
+        assert!(
+            backend.pending_permission_requests().is_empty(),
+            "terminal must retire old Ask"
+        );
+
+        backend.turn_gen.store(2, Ordering::SeqCst);
+        release();
+        let opened = next_user_input_event(&mut rx, |e| matches!(e, SessionEvent::Ask { .. })).await;
+        let request_id = backend.pending_permission_requests()[0].request_id.clone();
+        assert_eq!(opened.turn_gen, 2);
+        let (running, _) = crate::reducer::step(
+            &crate::state::SessionState::Idle,
+            SessionEvent::TurnStarted { epoch: 2 },
+        );
+        let (mut running, _) = crate::reducer::step(&running, opened.event);
+        assert!(
+            matches!(backend.dispatch(ask_answer(&old_request_id, &[("q1", "A")])).await,
+            Err(BackendError::Transport(message)) if message.contains("no pending user input"))
+        );
+        release();
+        loop {
+            let env = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !matches!(
+                    env.event,
+                    SessionEvent::AskResolved { .. } | SessionEvent::PermissionResolved { .. }
+                ),
+                "old resolution must not touch turn 2"
+            );
+            let barrier = matches!(env.event, SessionEvent::MessageDelta { .. });
+            running = crate::reducer::step(&running, env.event).0;
+            if barrier {
+                break;
+            }
+        }
+        assert!(
+            matches!(&running, crate::state::SessionState::Running { requires_action, .. } if requires_action.waiting_on_question == 1)
+        );
+        backend.dispatch(ask_answer(&request_id, &[("q1", "A")])).await.unwrap();
+        let resolved = next_user_input_event(&mut rx, |e| matches!(e, SessionEvent::AskResolved { .. })).await;
+        assert_eq!(resolved.turn_gen, 2);
+        let (running, _) = crate::reducer::step(&running, resolved.event);
+        assert!(
+            matches!(running, crate::state::SessionState::Running { requires_action, .. } if requires_action.waiting_on_question == 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn user_input_lifecycle_generation_guard_rejects_stale_answer_and_resolved() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        backend.turn_gen.store(1, Ordering::SeqCst);
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        let request_id = backend.pending_permission_requests()[0].request_id.clone();
+        backend.turn_gen.store(2, Ordering::SeqCst);
+        register_user_input(&backend, &user_input_frame(json!(10))).await;
+        let mut rx = backend.event_tx.subscribe();
+        assert!(
+            matches!(backend.dispatch(ask_answer(&request_id, &[("q1", "A")])).await,
+            Err(BackendError::Transport(message)) if message.contains("pending user input"))
+        );
+        assert!(captured.lock().await.is_empty());
+        assert!(
+            backend
+                .pending_user_inputs
+                .resolve(
+                    &json!({"threadId":"th1", "requestId":9}),
+                    &backend.event_tx,
+                    &backend.session_id,
+                    &backend.turn_gen
+                )
+                .await
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "stale answer/resolved must not emit a decrement"
+        );
+        assert_eq!(backend.pending_permission_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn user_input_lifecycle_cancel_and_terminate_retire_pending() {
+        for terminate in [false, true] {
+            let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+            let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+            backend.seed_thread_binding_for_test("th1").await;
+            backend.bind_active_turn_for_test("turn1").await;
+            register_user_input(&backend, &user_input_frame(json!(9))).await;
+            let request_id = backend.pending_permission_requests()[0].request_id.clone();
+            if terminate {
+                backend.terminate().await;
+            } else {
+                backend
+                    .dispatch(Command::Cancel {
+                        target: super::super::types::CancelTarget::Turn,
+                    })
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                backend.pending_permission_requests().is_empty(),
+                "cancel/terminate must retire pending Ask"
+            );
+            assert!(
+                matches!(backend.dispatch(ask_answer(&request_id, &[("q1", "A")])).await,
+                Err(BackendError::Transport(message)) if message.contains("no pending user input"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_input_lifecycle_eof_retires_pending() {
+        let fake = FakeAgentIo::new(Vec::new(), None)
+            .with_gated_tail(format!("{}\n", user_input_frame(json!(9))).into_bytes());
+        let release = fake.stdout_releaser();
+        fake.release_exit();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut rx = backend.event_tx.subscribe();
+        release();
+        next_user_input_event(&mut rx, |e| matches!(e, SessionEvent::Detached { .. })).await;
+        assert!(
+            backend.pending_permission_requests().is_empty(),
+            "dead process must not leave a recoverable Ask"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_input_lifecycle_turn_and_thread_switch_reject_stale_scope() {
+        let mut next = user_input_frame(json!(10));
+        next["params"]["turnId"] = json!("turn2");
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_segments(vec![
+            format!("{{\"method\":\"turn/started\",\"params\":{{\"threadId\":\"th1\",\"turn\":{{\"id\":\"turn1\"}}}}}}\n{}\n", user_input_frame(json!(9))).into_bytes(),
+            format!("{{\"method\":\"turn/started\",\"params\":{{\"threadId\":\"th1\",\"turn\":{{\"id\":\"turn2\"}}}}}}\n{next}\n").into_bytes(),
+            format!("{}\n{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"delta\":\"barrier\"}}}}\n", user_input_frame(json!(11))).into_bytes(),
+            b"{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"th2\"}}}\n".to_vec(),
+            Vec::new(),
+        ]);
+        let captured = fake.captured_stdin();
+        let release = fake.segment_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut rx = backend.event_tx.subscribe();
+        backend.turn_gen.store(1, Ordering::SeqCst);
+        release();
+        next_user_input_event(&mut rx, |e| matches!(e, SessionEvent::Ask { .. })).await;
+        backend.turn_gen.store(2, Ordering::SeqCst);
+        release();
+        let opened = next_user_input_event(&mut rx, |e| matches!(e, SessionEvent::Ask { .. })).await;
+        let pending = backend.pending_permission_requests();
+        assert_eq!(pending.len(), 1, "turn switch must retire old pending");
+        assert!(matches!(opened.event, SessionEvent::Ask { request_id, .. } if request_id == pending[0].request_id));
+        release();
+        loop {
+            let env = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !matches!(env.event, SessionEvent::Ask { .. }),
+                "old turn request must not be registered on new turn"
+            );
+            if matches!(env.event, SessionEvent::MessageDelta { .. }) {
+                break;
+            }
+        }
+        let response: Value = serde_json::from_str(captured_str(&captured).await.trim()).unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        release();
+        next_user_input_event(&mut rx, |e| matches!(e, SessionEvent::BackendBound { .. })).await;
+        assert!(
+            backend.pending_permission_requests().is_empty(),
+            "thread switch must retire pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_input_lifecycle_new_process_reusing_wire_id_cannot_accept_old_card() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        let old_request_id = backend.pending_permission_requests()[0].request_id.clone();
+        backend.terminate().await;
+        let mut rx = backend.event_tx.subscribe();
+        let io = Arc::new(FakeAgentIo::new(Vec::new(), None).with_gated_segments(vec![
+            format!("{{\"method\":\"turn/started\",\"params\":{{\"threadId\":\"th1\",\"turn\":{{\"id\":\"turn1\"}}}}}}\n{}\n", user_input_frame(json!(9))).into_bytes(),
+            Vec::new(),
+        ]));
+        let (stdin, stdout) = io.take_stdio().await.unwrap();
+        *backend.stdin.lock().await = Some(stdin);
+        let reader = start_codex_reader(&backend.reader_state, Some(stdout), io.clone());
+        io.release_next();
+        let opened = next_user_input_event(&mut rx, |e| matches!(e, SessionEvent::Ask { .. })).await;
+        let SessionEvent::Ask { request_id, .. } = opened.event else {
+            unreachable!()
+        };
+        assert_ne!(
+            request_id, old_request_id,
+            "old process card must not address a reused wire id"
+        );
+        assert!(
+            matches!(backend.dispatch(ask_answer(&old_request_id, &[("q1", "A")])).await,
+            Err(BackendError::Transport(message)) if message.contains("no pending user input"))
+        );
+        backend.dispatch(ask_answer(&request_id, &[("q1", "A")])).await.unwrap();
+        reader.abort();
+    }
+
+    #[tokio::test]
+    async fn user_input_independent_backends_reject_old_answer_for_reused_wire_identity() {
+        let old = CodexSessionBackend::build_with_io(
+            "same-session",
+            Box::new(FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new())),
+        )
+        .await;
+        let mut frame = user_input_frame(json!(0));
+        frame["params"]["questions"][0]["id"] = json!("color");
+        register_user_input(&old, &frame).await;
+        let old_request_id = old.pending_permission_requests()[0].request_id.clone();
+        let answers = || {
+            serde_json::from_value(json!([
+                {"question_id":"color", "question":"Pick?", "labels":["A"]}
+            ]))
+            .unwrap()
+        };
+        old.terminate().await;
+        drop(old);
+
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("same-session", Box::new(fake)).await;
+        let mut rx = backend.event_tx.subscribe();
+        register_user_input(&backend, &frame).await;
+        let opened = next_user_input_event(&mut rx, |e| matches!(e, SessionEvent::Ask { .. })).await;
+        let SessionEvent::Ask { request_id, .. } = opened.event else {
+            unreachable!()
+        };
+        for stale_id in [&old_request_id, "0"] {
+            let replay = backend
+                .dispatch(Command::AnswerAsk {
+                    request_id: stale_id.into(),
+                    answers: Some(answers()),
+                })
+                .await;
+            assert!(
+                matches!(replay, Err(BackendError::Transport(ref message))
+                    if message == "no pending user input for request id"),
+                "a previous backend's answer must be rejected, got {replay:?}"
+            );
+            let pending = backend.pending_permission_requests();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].request_id, request_id);
+            assert_eq!(pending[0].questions.as_ref().unwrap()[0]["id"], "color");
+            assert!(captured.lock().await.is_empty());
+            assert!(rx.try_recv().is_err(), "stale answer must not resolve the new Ask");
+        }
+        assert_ne!(old_request_id, request_id);
+        backend
+            .dispatch(Command::AnswerAsk {
+                request_id: request_id.clone(),
+                answers: Some(answers()),
+            })
+            .await
+            .unwrap();
+        assert!(backend.pending_permission_requests().is_empty());
+        let response: Value = serde_json::from_str(captured_str(&captured).await.trim()).unwrap();
+        assert_eq!(
+            response,
+            json!({"jsonrpc":"2.0", "id":0,
+            "result":{"answers":{"color":{"answers":["A"]}}}})
+        );
+        let resolved = next_user_input_event(&mut rx, |e| matches!(e, SessionEvent::AskResolved { .. })).await;
+        assert!(matches!(resolved.event, SessionEvent::AskResolved { request_id: id } if id == request_id));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn user_input_explicit_question_id_answers_crossed_text_and_id() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut frame = user_input_frame(json!(9));
+        frame["params"]["questions"][0]["question"] = json!("q2");
+        let mut second = frame["params"]["questions"][0].clone();
+        second["id"] = json!("q2");
+        second["question"] = json!("q1");
+        frame["params"]["questions"].as_array_mut().unwrap().push(second);
+        register_user_input(&backend, &frame).await;
+        let request_id = backend.pending_permission_requests()[0].request_id.clone();
+        let answers = serde_json::from_value(json!([
+            {"question_id":"q2", "question":"q1", "labels":["B"]},
+            {"question_id":"q1", "question":"q2", "labels":["A"]}
+        ]))
+        .unwrap();
+        backend
+            .dispatch(Command::AnswerAsk {
+                request_id: request_id.clone(),
+                answers: Some(answers),
+            })
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_str(captured_str(&captured).await.trim()).unwrap();
+        assert_eq!(
+            response["result"]["answers"],
+            json!({"q1":{"answers":["A"]}, "q2":{"answers":["B"]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn user_input_explicit_question_id_never_falls_back_to_text() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        register_user_input(&backend, &user_input_frame(json!(9))).await;
+        let request_id = backend.pending_permission_requests()[0].request_id.clone();
+        let answers = serde_json::from_value(json!([
+            {"question_id":"missing", "question":"Pick?", "labels":["A"]}
+        ]))
+        .unwrap();
+        assert!(
+            matches!(backend.dispatch(Command::AnswerAsk { request_id:request_id.clone(), answers:Some(answers) }).await,
+            Err(BackendError::Transport(message)) if message.contains("invalid user input answers"))
+        );
+        assert_eq!(backend.pending_permission_requests().len(), 1);
+        assert!(captured.lock().await.is_empty());
     }
 
     // ===== build_input multimodal lowering =====
@@ -7143,6 +8438,7 @@ mod tests {
         // legacy ACP path presented. Verbatim 0.139.0 shape (the frame ALSO carries
         // collaborationMode, which we must ignore).
         let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th1"}}}"#,
             r#"{"jsonrpc":"2.0","method":"thread/settings/updated","params":{"threadId":"th1","threadSettings":{"model":"gpt-5.5","activePermissionProfile":{"id":":danger-full-access","extends":null},"collaborationMode":{"mode":"default","settings":{"model":"gpt-5.5"}}}}}"#,
         ])
         .await;
@@ -7162,6 +8458,7 @@ mod tests {
         // last-known selection) rather than clobber it. We must NOT fall back to
         // collaborationMode.mode.
         let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th1"}}}"#,
             r#"{"jsonrpc":"2.0","method":"thread/settings/updated","params":{"threadId":"th1","threadSettings":{"model":"gpt-5.5","activePermissionProfile":null,"collaborationMode":{"mode":"default","settings":{"model":"gpt-5.5"}}}}}"#,
         ])
         .await;
@@ -7688,10 +8985,10 @@ mod tests {
 
     #[tokio::test]
     async fn server_request_resolved_maps_to_permission_resolved() {
-        // serverRequest/resolved → PermissionResolved so the reducer decrements the
-        // matching waiting_on_* counter (R9/R15). Default kind=Tool (the common
-        // approval case) when no pending auth id matches.
+        // Only a known approval may release the Tool counter; unknown or
+        // differently typed request IDs must not release another request.
         let events = drive_codex(&[
+            r#"{"id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"th1"}}"#,
             r#"{"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"threadId":"th1","request_id":7}}"#,
         ])
         .await;
@@ -8272,12 +9569,10 @@ mod tests {
 
     // ===== B-CODEX-MODEL-LIST: discovery (model/list + permissionProfile/list) =====
 
-    /// feature 012 (R1): the handshake MUST discover `permissionProfile/list` (codex's
-    /// mode axis IS its permission axis) and MUST NOT send `collaborationMode/list`
-    /// (plan/default has no UI entry — matches legacy ACP). Drives a real `run_handshake`
-    /// against captured stdin and asserts the wire.
+    /// Both independent catalogs must be discovered; collaboration never replaces
+    /// the permission selector (0.161.0 CollaborationModeListResponse schema).
     #[tokio::test]
-    async fn handshake_discovers_permission_profiles_not_collaboration_mode() {
+    async fn handshake_discovers_permission_profiles_and_collaboration_mode() {
         let fake = FakeAgentIo::never_exits(Vec::new());
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-hs", Box::new(fake)).await;
@@ -8295,8 +9590,8 @@ mod tests {
             "feature 012: handshake discovers permissionProfile/list, got: {written}"
         );
         assert!(
-            !written.contains(r#""method":"collaborationMode/list""#),
-            "feature 012: handshake must NOT send collaborationMode/list, got: {written}"
+            written.contains(r#""method":"collaborationMode/list""#),
+            "handshake independently discovers collaborationMode/list, got: {written}"
         );
     }
 

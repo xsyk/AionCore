@@ -308,8 +308,12 @@ impl IFeishuGatewayRepository for SqliteFeishuGatewayRepository {
     }
 
     async fn pending_deliveries(&self) -> Result<Vec<FeishuGatewayDeliveryRow>, DbError> {
-        Ok(sqlx::query_as("SELECT id,route_id,generation,kind,payload,attempt_epoch FROM feishu_gateway_deliveries WHERE done=0 ORDER BY rowid LIMIT 100")
-            .fetch_all(&self.pool).await?)
+        self.pending_deliveries_after(None).await
+    }
+
+    async fn pending_deliveries_after(&self, after: Option<&str>) -> Result<Vec<FeishuGatewayDeliveryRow>, DbError> {
+        Ok(sqlx::query_as("SELECT id,route_id,generation,kind,payload,attempt_epoch FROM feishu_gateway_deliveries WHERE done=0 AND rowid>COALESCE((SELECT rowid FROM feishu_gateway_deliveries WHERE id=?),0) ORDER BY rowid LIMIT 100")
+            .bind(after).fetch_all(&self.pool).await?)
     }
 
     async fn start_delivery(&self, id: &str, epoch: &str) -> Result<bool, DbError> {

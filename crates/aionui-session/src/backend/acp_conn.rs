@@ -283,6 +283,8 @@ pub fn acp_capabilities() -> Capabilities {
         prompt_accepted: PromptAcceptedSource::Synthesized,
         available_models: Vec::new(),
         available_modes: Vec::new(),
+        available_collaboration_modes: Vec::new(),
+        current_collaboration_mode: None,
         current_model: None,
         current_mode: None,
         current_effort: None,

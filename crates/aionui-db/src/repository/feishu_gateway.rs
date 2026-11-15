@@ -18,6 +18,9 @@ pub trait IFeishuGatewayRepository: Send + Sync {
         payload: &str,
     ) -> Result<(), DbError>;
     async fn pending_deliveries(&self) -> Result<Vec<FeishuGatewayDeliveryRow>, DbError>;
+    /// Up to 100 pending rows in insertion order, strictly after the given
+    /// durable receipt (which may already be complete). None starts a pass.
+    async fn pending_deliveries_after(&self, after: Option<&str>) -> Result<Vec<FeishuGatewayDeliveryRow>, DbError>;
     /// False means the receipt is already complete or was attempted by another
     /// process epoch; neither case grants permission to execute it again.
     async fn start_delivery(&self, id: &str, epoch: &str) -> Result<bool, DbError>;

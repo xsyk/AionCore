@@ -162,6 +162,7 @@ pub(super) async fn build(
             acp_session_repo: Some(deps.acp_agent_service.repo()),
             prompt_dump_dir: None,
             permission_hook_body,
+            qa_launch: None,
         },
         deps.session_spawner.clone(),
     )

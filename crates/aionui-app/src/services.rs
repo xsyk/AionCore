@@ -223,6 +223,9 @@ impl AppServices {
         config: &AppConfig,
         backend_binary_path: PathBuf,
     ) -> anyhow::Result<Self> {
+        // Explicit diagnostic builds fail before creating any session services.
+        // Default builds return None here without consulting the filesystem.
+        let qa_session_launch = aionui_ai_agent::factory::qa_session_launch::QaSessionLaunchPolicy::from_startup()?;
         // `dunce`, not `std::fs`: this path is embedded into agent-facing config
         // files (e.g. antigravity's `.agents/hooks.json` command line, executed
         // through cmd.exe on Windows), and `std::fs::canonicalize` on Windows
@@ -478,6 +481,8 @@ impl AppServices {
             acp_agent_service: acp_agent_service.clone(),
             data_dir: data_dir.clone(),
             dump_prompts,
+            qa_session_launch,
+            conversation_repo: Some(conversation_repo.clone()),
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),

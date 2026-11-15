@@ -1,7 +1,8 @@
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, DbError, IConversationRepository, MessagePageCursor,
-    MessagePageDirection, MessagePageParams, MessageRowUpdate, SqliteConversationRepository, init_database_memory,
-    models::ConversationRow, models::MessageRow,
+    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
+    IConversationRepository, MessagePageCursor, MessagePageDirection, MessagePageParams, MessageRowUpdate,
+    SaveRuntimeStateParams, SqliteAcpSessionRepository, SqliteConversationRepository, init_database_memory,
+    models::AcpSessionRow, models::ConversationRow, models::MessageRow,
 };
 
 const USER_ID: &str = "system_default_user";
@@ -153,6 +154,207 @@ async fn delete_conversation_cascades_messages() {
         .await
         .unwrap();
     assert_eq!(remaining, 0);
+}
+
+async fn seed_delete_acp_state(db: &aionui_db::Database, conv: &ConversationRow) -> serde_json::Value {
+    let acp = SqliteAcpSessionRepository::new(db.pool().clone());
+    acp.create(&CreateAcpSessionParams {
+        user_id: &conv.user_id,
+        conversation_id: &conv.id,
+        agent_source: "builtin",
+        agent_id: "delete-test-agent",
+    })
+    .await
+    .unwrap();
+    acp.update_session_id_for_user(&conv.user_id, &conv.id, "delete-test-session")
+        .await
+        .unwrap();
+    acp.save_runtime_state_for_user(
+        &conv.user_id,
+        &conv.id,
+        &SaveRuntimeStateParams {
+            current_mode_id: Some(Some("delete-test-mode")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    raw_delete_acp_state(db, &conv.id).await.unwrap()
+}
+
+// An ownership-filtered read would hide the orphan that this regression must catch.
+async fn raw_delete_acp_state(db: &aionui_db::Database, id: &str) -> Option<serde_json::Value> {
+    let row = sqlx::query_as::<_, AcpSessionRow>("SELECT * FROM acp_session WHERE conversation_id = ?")
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await
+        .unwrap();
+    row.map(|row| serde_json::to_value(row).unwrap())
+}
+
+async fn delete_persistent_counts(db: &aionui_db::Database, id: &str) -> (i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM conversations WHERE id = ?1), \
+                (SELECT COUNT(*) FROM messages WHERE conversation_id = ?1), \
+                (SELECT COUNT(*) FROM acp_session WHERE conversation_id = ?1)",
+    )
+    .bind(id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn delete_conversation_removes_acp_state_without_touching_other_sessions_or_orphans() {
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+    let target = make_conversation("delete-acp");
+    let same_owner = make_conversation("keep-same-owner");
+    let mut other_owner = make_conversation("keep-other-owner");
+    other_owner.user_id = "user_2".to_owned();
+    let mut retained = Vec::new();
+    for conv in [&target, &same_owner, &other_owner] {
+        repo.create(conv).await.unwrap();
+        repo.insert_message(&conv.user_id, &make_message(&conv.id, "delete-test"))
+            .await
+            .unwrap();
+        let state = seed_delete_acp_state(&db, conv).await;
+        if conv.id != target.id {
+            retained.push((conv.id.clone(), state));
+        }
+    }
+    // A synthetic historical orphan must remain untouched by an ordinary delete.
+    sqlx::query(
+        "INSERT INTO acp_session (conversation_id, agent_source, agent_id, session_status, session_config, last_active_at) \
+         VALUES ('delete-test-historical-orphan', 'builtin', 'delete-test-agent', 'idle', '{}', 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let orphan = raw_delete_acp_state(&db, "delete-test-historical-orphan").await;
+
+    repo.delete(&target.user_id, &target.id).await.unwrap();
+
+    assert_eq!(delete_persistent_counts(&db, &target.id).await, (0, 0, 0));
+    for (id, state) in retained {
+        assert_eq!(delete_persistent_counts(&db, &id).await, (1, 1, 1));
+        assert_eq!(raw_delete_acp_state(&db, &id).await, Some(state));
+    }
+    assert_eq!(raw_delete_acp_state(&db, "delete-test-historical-orphan").await, orphan);
+}
+
+#[tokio::test]
+async fn delete_conversation_acp_cleanup_rejects_foreign_owner() {
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+    let conv = make_conversation("delete-owner-guard");
+    repo.create(&conv).await.unwrap();
+    repo.insert_message(&conv.user_id, &make_message(&conv.id, "delete-test"))
+        .await
+        .unwrap();
+    let before = seed_delete_acp_state(&db, &conv).await;
+
+    let error = repo.delete("user_2", &conv.id).await.unwrap_err();
+
+    assert!(matches!(error, DbError::NotFound(message) if message == format!("Conversation '{}' not found", conv.id)));
+    assert_eq!(delete_persistent_counts(&db, &conv.id).await, (1, 1, 1));
+    assert_eq!(raw_delete_acp_state(&db, &conv.id).await, Some(before));
+}
+
+async fn assert_delete_acp_transaction_rollback(failing_table: &str) {
+    let (repo, db) = setup().await;
+    let conv = make_conversation("delete-rollback");
+    repo.create(&conv).await.unwrap();
+    repo.insert_message(&conv.user_id, &make_message(&conv.id, "delete-test"))
+        .await
+        .unwrap();
+    let before = seed_delete_acp_state(&db, &conv).await;
+    sqlx::query(&format!(
+        "CREATE TRIGGER reject_delete BEFORE DELETE ON {failing_table} \
+         BEGIN SELECT RAISE(ABORT, 'delete-test-forced-failure'); END"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let error = repo.delete(&conv.user_id, &conv.id).await.unwrap_err();
+
+    assert!(matches!(error, DbError::Query(error) if error.to_string().contains("delete-test-forced-failure")));
+    assert_eq!(delete_persistent_counts(&db, &conv.id).await, (1, 1, 1));
+    assert_eq!(raw_delete_acp_state(&db, &conv.id).await, Some(before));
+    sqlx::query("DROP TRIGGER reject_delete")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    repo.delete(&conv.user_id, &conv.id).await.unwrap();
+    assert_eq!(delete_persistent_counts(&db, &conv.id).await, (0, 0, 0));
+}
+
+#[tokio::test]
+async fn delete_conversation_rolls_back_when_acp_cleanup_fails() {
+    assert_delete_acp_transaction_rollback("acp_session").await;
+}
+
+#[tokio::test]
+async fn delete_conversation_rolls_back_acp_cleanup_when_parent_delete_fails() {
+    assert_delete_acp_transaction_rollback("conversations").await;
+}
+
+#[tokio::test]
+async fn delete_conversation_prevents_late_acp_persistence_from_recreating_state() {
+    let (repo, db) = setup().await;
+    let conv = make_conversation("delete-late-writes");
+    repo.create(&conv).await.unwrap();
+    seed_delete_acp_state(&db, &conv).await;
+    let acp = SqliteAcpSessionRepository::new(db.pool().clone());
+    // Capture the state before delete, as a runtime writer may have done already.
+    assert!(
+        acp.load_runtime_state_for_user(&conv.user_id, &conv.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    repo.delete(&conv.user_id, &conv.id).await.unwrap();
+
+    assert!(
+        !acp.update_session_id_for_user(&conv.user_id, &conv.id, "late-session")
+            .await
+            .unwrap()
+    );
+    assert!(!acp.clear_session_id_for_user(&conv.user_id, &conv.id).await.unwrap());
+    assert!(
+        !acp.save_runtime_state_for_user(
+            &conv.user_id,
+            &conv.id,
+            &SaveRuntimeStateParams {
+                current_mode_id: Some(Some("late-mode")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    );
+    let error = acp
+        .create(&CreateAcpSessionParams {
+            user_id: &conv.user_id,
+            conversation_id: &conv.id,
+            agent_source: "builtin",
+            agent_id: "delete-test-agent",
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, DbError::NotFound(message) if message == format!("conversation '{}' for user '{}'", conv.id, conv.user_id))
+    );
+    assert!(acp.get_for_user(&conv.user_id, &conv.id).await.unwrap().is_none());
+    assert!(
+        acp.load_runtime_state_for_user(&conv.user_id, &conv.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(delete_persistent_counts(&db, &conv.id).await, (0, 0, 0));
 }
 
 // ── Cursor pagination ───────────────────────────────────────────────

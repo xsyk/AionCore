@@ -53,6 +53,126 @@ async fn server(router: Router) -> (String, tokio::task::JoinHandle<()>) {
 }
 
 #[tokio::test]
+async fn resource_download_is_binary_bounded_and_uses_the_node_bearer() {
+    let router = Router::new().route(
+        "/prefix/api/node/deliveries/d_image/resources/img_one",
+        get(|headers: HeaderMap| async move {
+            assert_eq!(
+                headers["authorization"],
+                "Bearer private-node-test-token-with-32-characters"
+            );
+            (
+                [("content-type", "image/png"), ("cache-control", "no-store")],
+                vec![137u8, 80, 78, 71, 0, 255],
+            )
+        }),
+    );
+    let (url, task) = server(router).await;
+    let client = GatewayClient::new(config(&format!("{url}/prefix"))).unwrap();
+    let resource = client.fetch_resource("d_image", "img_one").await.unwrap();
+    assert_eq!(resource.bytes, vec![137u8, 80, 78, 71, 0, 255]);
+    assert_eq!(resource.content_type, "image/png");
+    for key in ["", "../img", "img/other", "%2e%2e", "img?token=x", "."] {
+        assert!(
+            client
+                .fetch_resource("d_image", key)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("GATEWAY_IDENTIFIER_INVALID")
+        );
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn resource_download_rejects_chunked_oversize_without_a_content_length() {
+    let router = Router::new().route(
+        "/api/node/deliveries/d_image/resources/img_one",
+        get(|| async {
+            let chunks =
+                futures_util::stream::iter((0..2).map(|_| Ok::<_, std::io::Error>(vec![0u8; 3 * 1024 * 1024])));
+            ([("content-type", "image/png")], axum::body::Body::from_stream(chunks))
+        }),
+    );
+    let (url, task) = server(router).await;
+    let error = GatewayClient::new(config(&url))
+        .unwrap()
+        .fetch_resource("d_image", "img_one")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("GATEWAY_RESOURCE_TOO_LARGE"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn resource_download_has_an_independent_finite_timeout() {
+    let (url, task) = server(Router::new().route(
+        "/api/node/deliveries/d_image/resources/img_one",
+        get(|| async { std::future::pending::<&'static str>().await }),
+    ))
+    .await;
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        GatewayClient::new(config(&url))
+            .unwrap()
+            .fetch_resource("d_image", "img_one"),
+    )
+    .await
+    .expect("resource download did not time out")
+    .unwrap_err();
+    assert!(error.to_string().contains("GATEWAY_RESOURCE_TRANSPORT"));
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(9),
+        "resource incorrectly reused the 5 second JSON client"
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn resource_redirect_never_forwards_bearer_and_errors_are_sanitized() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let captured = calls.clone();
+    let (other, other_task) = server(Router::new().route(
+        "/capture",
+        get(move || {
+            let count = captured.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                "unexpected"
+            }
+        }),
+    ))
+    .await;
+    let destination = format!("{other}/capture");
+    let (url, task) = server(Router::new().route(
+        "/api/node/deliveries/d_image/resources/img_one",
+        get(move || {
+            let location = destination.clone();
+            async move {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [("location", location)],
+                    "private-node-test-token-with-32-characters prompt-content",
+                )
+            }
+        }),
+    ))
+    .await;
+    let error = GatewayClient::new(config(&url))
+        .unwrap()
+        .fetch_resource("d_image", "img_one")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("GATEWAY_RESOURCE_UNAVAILABLE"));
+    assert!(!error.to_string().contains("private-node") && !error.to_string().contains("prompt-content"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    task.abort();
+    other_task.abort();
+}
+
+#[tokio::test]
 async fn queued_receipt_is_polled_until_platform_delivery() {
     async fn enqueue(headers: HeaderMap, Json(body): Json<serde_json::Value>) -> (StatusCode, Json<serde_json::Value>) {
         assert_eq!(
